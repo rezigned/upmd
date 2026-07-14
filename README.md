@@ -271,7 +271,7 @@ after execution.
 Switch themes with `t` or choose one at startup:
 
 ```bash
-upmd --theme "Tokyo Night" README.md
+upmd --theme tokyo-night README.md
 ```
 
 Custom `.tmTheme` files under `~/.config/upmd/themes/` are discovered automatically.
@@ -281,7 +281,7 @@ Custom `.tmTheme` files under `~/.config/upmd/themes/` are discovered automatica
 Persistent settings live at `~/.config/upmd/config.toml`:
 
 ```toml
-theme = "Catppuccin Mocha"
+theme = "catppuccin-mocha"
 transparent = true
 tick_rate = 66
 

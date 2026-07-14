@@ -157,7 +157,7 @@ While this file is open in the TUI:
 
 ## 9. Themes and help
 
-- Press `t` to search and select a theme (Tokyo Night, Catppuccin Mocha, Dracula, Rose Pine, and more).
+- Press `t` to search and select a theme (tokyo-night, catppuccin-mocha, dracula, rose-pine, and more).
 - Press `ctrl-t` to toggle the terminal background.
 - Press `?` to open the searchable, sectioned keymap reference.
 
