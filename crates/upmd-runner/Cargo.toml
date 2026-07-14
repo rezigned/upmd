@@ -1,0 +1,19 @@
+[package]
+name = "upmd-runner"
+version = "0.1.0"
+edition = "2021"
+description = "Language runners for running code blocks from various programming languages"
+license = "MIT"
+
+[dependencies]
+anyhow = "1.0"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2.0"
+tracing = "0.1"
+which = "8.0"
+tempfile = { version = "3.27", optional = true }
+
+[features]
+default = ["temp-workspace"]
+temp-workspace = ["dep:tempfile"]
+memory-workspace = []

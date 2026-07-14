@@ -1,0 +1,9 @@
+[package]
+name = "upmd-parser"
+version = "0.1.0"
+edition = "2021"
+description = "Typed Markdown AST and fenced-code attribute parser"
+
+[dependencies]
+regex = { version = "1.12.3", default-features = false, features = ["std", "unicode-perl"] }
+pulldown-cmark = { version = "0.13.4", default-features = false }

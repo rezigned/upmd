@@ -1,0 +1,12 @@
+---
+source: src/apps/tui/markdown.rs
+assertion_line: 1464
+expression: viewline_summary(&lines)
+---
+ 0: [Table] ┌───────┬─────┐
+ 1: [Table] │ Name  │ Age │
+ 2: [Table] ├───────┼─────┤
+ 3: [Table] │ Alice │ 30  │
+ 4: [Table] │ Bob   │ 25  │
+ 5: [Table] └───────┴─────┘
+ 6: [Newline]

@@ -1,0 +1,18 @@
+---
+source: src/apps/tui/markdown.rs
+assertion_line: 1717
+expression: result
+---
+ 0: [CodeInfo] 1 Bash
+ 1: [CodeBody] echo test
+ 2: [Output]                     This is output line 
+ 3: [Output] number 30
+ 4: [Output]          This is output line number 31
+ 5: [Output]                                       Th
+ 6: [Output] is is output line number 32
+ 7: [Output]                            This is outpu
+ 8: [Output] t line number 33
+ 9: [Output]                 This is output line numb
+10: [Output] er 34
+11: [Output]      This is output line number 35
+12: [Newline]

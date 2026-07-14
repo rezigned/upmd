@@ -1,0 +1,15 @@
+---
+source: src/apps/tui/markdown.rs
+assertion_line: 1746
+expression: result
+---
+ 0: [CodeInfo] 1 Bash
+ 1: [CodeBody] echo test
+ 2: [Output] short line 0
+ 3: [Output]             short line 1
+ 4: [Output]                         short line 2
+ 5: [Output]                                     shor
+ 6: [Output] t line 3
+ 7: [Output]         short line 4
+ 8: [Output]                      
+ 9: [Newline]

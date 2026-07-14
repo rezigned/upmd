@@ -1,0 +1,7 @@
+---
+source: src/apps/tui/wrap.rs
+assertion_line: 177
+expression: "summary.join(\"\\n\")"
+---
+[off=0 len=14] 'red ' Some(Red) | 'blue' Some(Blue)
+[off=8 len=14] ' ' Some(Blue) | 'green' Some(Green)

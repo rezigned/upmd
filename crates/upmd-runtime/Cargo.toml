@@ -1,0 +1,16 @@
+[package]
+name = "upmd-runtime"
+version = "0.1.0"
+edition = "2021"
+description = "Universal component runtime"
+license = "MIT OR Apache-2.0"
+keywords = ["component", "runtime", "ui", "tui", "terminal", "wasm"]
+
+[features]
+cli = ["dep:crossterm"]
+tui = ["dep:ratatui", "dep:crossterm"]
+
+[dependencies]
+flume = "0.11"
+crossterm = { version = "0.29", optional = true }
+ratatui = { version = "0.30", optional = true }

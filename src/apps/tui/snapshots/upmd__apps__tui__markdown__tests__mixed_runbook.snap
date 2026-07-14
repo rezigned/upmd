@@ -1,0 +1,17 @@
+---
+source: src/apps/tui/markdown.rs
+assertion_line: 1486
+expression: viewline_summary(&lines)
+---
+ 0: [Heading(1)] # Setup
+ 1: [Text] Install dependencies.
+ 2: [Newline] 
+ 3: [CodeInfo] 1 Bash
+ 4: [CodeBody] npm install
+ 5: [Newline] 
+ 6: [Heading(2)] ## Test
+ 7: [Text] Run the test suite.
+ 8: [Newline] 
+ 9: [CodeInfo] 2 Python
+10: [CodeBody] pytest tests/
+11: [Newline]

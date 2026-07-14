@@ -1,0 +1,8 @@
+---
+source: src/apps/tui/preview/mod.rs
+assertion_line: 1099
+expression: summary
+---
+ 0: [0] ▎ 1        Bash 
+ 1: [0] ▎ echo hello
+ 2: [0]

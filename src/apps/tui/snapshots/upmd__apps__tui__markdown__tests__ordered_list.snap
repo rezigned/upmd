@@ -1,0 +1,9 @@
+---
+source: src/apps/tui/markdown.rs
+assertion_line: 1445
+expression: viewline_summary(&lines)
+---
+ 0: [ListItem] first
+ 1: [ListItem] second
+ 2: [ListItem] third
+ 3: [Newline]

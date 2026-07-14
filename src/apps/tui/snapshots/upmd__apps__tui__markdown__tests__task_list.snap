@@ -1,0 +1,9 @@
+---
+source: src/apps/tui/markdown.rs
+assertion_line: 1451
+expression: viewline_summary(&lines)
+---
+ 0: [ListItem] unchecked
+ 1: [ListItem] checked
+ 2: [ListItem] [-] in progress
+ 3: [Newline]

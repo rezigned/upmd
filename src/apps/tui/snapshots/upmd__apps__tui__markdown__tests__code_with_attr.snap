@@ -1,0 +1,8 @@
+---
+source: src/apps/tui/markdown.rs
+assertion_line: 1433
+expression: viewline_summary(&lines)
+---
+ 0: [CodeInfo] 1 Python
+ 1: [CodeBody] print('hi')
+ 2: [Newline]

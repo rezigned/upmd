@@ -1,0 +1,734 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>upmd &mdash; run markdown interactively</title>
+  <meta name="description" content="Run code blocks directly from Markdown in a terminal UI or an automation-friendly CLI.">
+  <meta property="og:title" content="upmd">
+  <meta property="og:description" content="Run code blocks directly from Markdown in a terminal UI or an automation-friendly CLI.">
+  <meta property="og:image" content="https://upmd.rezigned.com/cover.png">
+  <meta property="og:image:width" content="2106">
+  <meta property="og:image:height" content="1372">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://upmd.rezigned.com/">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="upmd">
+  <meta name="twitter:description" content="Run code blocks directly from Markdown in a terminal UI or an automation-friendly CLI.">
+  <meta name="twitter:image" content="https://upmd.rezigned.com/cover.png">
+  <link rel="canonical" href="https://upmd.rezigned.com/">
+  <link rel="icon" type="image/png" href="upmd.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700;800&family=Geist+Mono:wght@400;500;600;700&family=Poppins:wght@400;500&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #f3f5f7;
+      --panel: #eef1f5;
+      --ink: #1b2a38;
+      --muted: #607180;
+      --line: #d2d9e1;
+      --line-soft: #e4e8ee;
+      --accent: #00B8D4;
+      --accent-dark: #078c9b;
+      --code: #101923;
+      --mono: "Geist Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      --brand: "Outfit", -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif;
+      --body: "Poppins", -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: var(--body);
+      line-height: 1.5;
+      letter-spacing: 0.015em;
+    }
+
+    a { color: inherit; text-decoration: none; }
+    img { display: block; max-width: 100%; }
+    code, pre { font-family: var(--mono); }
+
+    .nav {
+      height: 56px;
+      display: flex;
+      align-items: center;
+      background: rgba(243, 245, 247, 0.92);
+      backdrop-filter: blur(10px);
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .brand {
+      flex-shrink: 0;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 0 clamp(32px, 5vw, 64px);
+      font-family: var(--brand);
+      font-size: 2rem;
+      font-weight: 500;
+      letter-spacing: 0.02rem;
+      line-height: 1;
+    }
+    .nav-logo {
+      width: clamp(50px, 10vw, 80px);
+      height: auto;
+    }
+    .brand-name {
+      display: flex;
+      align-items: center;
+      line-height: 1;
+      margin-top: -2px;
+    }
+    .nav-links {
+      flex: 1;
+      text-align: center;
+      color: var(--muted);
+      font-family: var(--brand);
+      font-size: 0.9375rem;
+    }
+    .nav-links a { margin: 0 12px; }
+    .nav-actions {
+      flex-shrink: 0;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 0 24px;
+    }
+    .nav-actions a { display: flex; align-items: center; }
+
+    .hero {
+      min-height: auto;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      border-bottom: 1px solid var(--line);
+    }
+
+    .hero-copy {
+      padding: clamp(48px, 6vw, 72px) clamp(32px, 5vw, 64px) clamp(40px, 5vw, 64px);
+      display: flex;
+      flex-direction: column;
+      justify-content: flex-start;
+      gap: 0;
+    }
+
+    h1 {
+      margin: 0;
+      max-width: 680px;
+      font-family: var(--brand);
+      font-size: clamp(56px, 7vw, 96px);
+      line-height: 0.94;
+      font-weight: 600;
+    }
+
+    .accent { color: var(--accent); }
+
+    .lead {
+      margin: 22px 0 0;
+      max-width: 580px;
+      color: #445667;
+      font-size: clamp(17px, 1.8vw, 20px);
+    }
+    .lead strong {
+      color: var(--ink);
+      font-weight: 600;
+    }
+
+    .actions {
+      display: flex;
+      gap: 10px;
+      margin-top: 26px;
+    }
+
+    .button {
+      min-height: 46px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 0 18px;
+      border: 1px solid var(--line);
+      background: transparent;
+      color: var(--ink);
+      font-family: var(--mono);
+      font-size: 0.875rem;
+      font-weight: 700;
+    }
+
+    .button.primary {
+      border-color: var(--ink);
+      background: var(--ink);
+      color: white;
+    }
+
+    .button:hover { background: white; }
+    .button.primary:hover { background: var(--accent-dark); border-color: var(--accent-dark); }
+
+    .install-label {
+      margin-top: 22px;
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 0.75rem;
+    }
+
+    .install-tabs {
+      display: flex;
+      margin-top: 10px;
+    }
+
+    .install-tabs button {
+      margin: 0;
+      padding: 8px 14px;
+      border: 1px solid var(--line);
+      border-right: 0;
+      border-radius: 0;
+      color: var(--muted);
+      background: var(--panel);
+      font-family: var(--mono);
+      font-size: 0.8125rem;
+      cursor: pointer;
+      transition: background 120ms, color 120ms;
+    }
+    .install-tabs button:last-child { border-right: 1px solid var(--line); }
+    .install-tabs button:hover:not(.active) { background: white; color: var(--ink); }
+    .install-tabs button.active {
+      color: var(--accent-dark);
+      background: white;
+      border: 1px solid var(--accent);
+    }
+    .install-tabs button.active:hover { background: white; }
+
+    .install {
+      margin-top: 8px;
+      max-width: 560px;
+      display: grid;
+      grid-template-columns: 1fr auto;
+      border: 1px solid var(--line);
+      background: white;
+      overflow: hidden;
+    }
+
+    .install code {
+      min-width: 0;
+      padding: 14px 16px;
+      color: #2f4354;
+      font-size: 0.8125rem;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .copy {
+      margin: 0;
+      border: 0;
+      border-left: 1px solid var(--line);
+      border-radius: 0;
+      padding: 0 16px;
+      display: flex;
+      align-items: center;
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 0.8125rem;
+      background: var(--panel);
+      cursor: pointer;
+      transition: background 120ms, color 120ms;
+      user-select: none;
+    }
+    .copy:hover { background: white; color: var(--ink); }
+    .copy.copied { color: #28a745; background: white; }
+
+    .hero-visual {
+      border-left: 1px solid var(--line);
+      background-color: var(--panel);
+      background-image:
+        linear-gradient(var(--line-soft) 1px, transparent 1px),
+        linear-gradient(90deg, var(--line-soft) 1px, transparent 1px);
+      background-size: 48px 48px;
+      background-position: center;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: clamp(36px, 5vw, 64px);
+      position: relative;
+      overflow: hidden;
+    }
+
+    .hero-visual::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      background: radial-gradient(ellipse 80% 70% at center, rgba(243, 245, 247, 0.7), rgba(238, 241, 245, 0.3) 50%, transparent 80%);
+      pointer-events: none;
+    }
+
+    .hero-visual::after {
+      content: "";
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      width: 340px;
+      height: 340px;
+      background: radial-gradient(circle, rgba(8, 173, 191, 0.06), transparent 70%);
+      transform: translate(-50%, -50%);
+      pointer-events: none;
+    }
+
+    .visual-stack {
+      width: min(760px, 100%);
+      position: relative;
+      z-index: 1;
+    }
+
+    .shot {
+      border: 1px solid #1c232e;
+      background: #2d3340;
+      box-shadow: 0 24px 80px rgba(16, 25, 35, 0.22), 0 2px 8px rgba(16, 25, 35, 0.12);
+      border-radius: 10px;
+      overflow: hidden;
+    }
+
+    .term-chrome {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      height: 38px;
+      padding: 0 14px;
+      background: #222932;
+      border-bottom: 1px solid #1a1f27;
+    }
+
+    .term-lights {
+      display: flex;
+      gap: 7px;
+      align-items: center;
+    }
+
+    .term-lights span {
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+      display: block;
+    }
+
+    .term-lights span:nth-child(1) { background: #ff5f57; }
+    .term-lights span:nth-child(2) { background: #febc2e; }
+    .term-lights span:nth-child(3) { background: #28c840; }
+
+    .term-title-bar {
+      flex: 1;
+      text-align: center;
+      color: #7a8794;
+      font-family: var(--mono);
+      font-size: 0.75rem;
+    }
+
+    .term-spacer { width: 42px; }
+
+    .shot img {
+      border: 0;
+    }
+
+    .caption {
+      margin: 16px auto 0;
+      max-width: 520px;
+      text-align: center;
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 0.8125rem;
+    }
+
+    .strip {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      border-bottom: 1px solid var(--line);
+      background: white;
+    }
+
+    .metric {
+      padding: 18px 24px;
+      border-right: 1px solid var(--line);
+    }
+
+    .metric:last-child { border-right: 0; }
+    .metric strong { display: block; font-size: 1.0625rem; }
+    .metric span { color: var(--muted); font-size: 0.8125rem; }
+
+    .wrap {
+      width: min(1180px, calc(100% - 48px));
+      margin: 0 auto;
+    }
+
+    section.block {
+      padding: 64px 0 0;
+    }
+
+    .section-head {
+      display: grid;
+      grid-template-columns: minmax(280px, 0.85fr) minmax(0, 1.15fr);
+      gap: 56px;
+      margin-bottom: 44px;
+    }
+
+    h2 {
+      margin: 0;
+      font-family: var(--brand);
+      font-size: clamp(36px, 4.6vw, 62px);
+      line-height: 1.02;
+      font-weight: 600;
+    }
+
+    .section-copy {
+      margin: 0;
+      max-width: 680px;
+      color: var(--muted);
+      font-size: 1.125rem;
+    }
+
+    .feature-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      border-top: 1px solid var(--line);
+      border-left: 1px solid var(--line);
+      background: white;
+    }
+
+    .feature {
+      min-height: 182px;
+      padding: 24px;
+      border-right: 1px solid var(--line);
+      border-bottom: 1px solid var(--line);
+    }
+
+    .feature-index {
+      color: var(--accent-dark);
+      font-family: var(--mono);
+      font-size: 1rem;
+      margin-bottom: 20px;
+    }
+
+    .feature h3 {
+      margin: 0 0 8px;
+      font-size: 1.0625rem;
+      font-family: var(--brand);
+    }
+
+    .feature p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 0.875rem;
+    }
+
+    .workflow {
+      display: grid;
+      grid-template-columns: 0.9fr 1.1fr;
+      gap: 56px;
+      align-items: start;
+    }
+
+    .terminal {
+      background: var(--code);
+      color: #dce5ec;
+      border: 1px solid #101923;
+    }
+
+    .terminal-title {
+      padding: 12px 16px;
+      border-bottom: 1px solid #25313c;
+      color: #8da0ae;
+      font-family: var(--mono);
+      font-size: 0.75rem;
+    }
+
+    pre {
+      margin: 0;
+      padding: 20px 16px;
+      overflow: auto;
+      font-size: 0.8125rem;
+      line-height: 1.8;
+    }
+
+    .dim { color: #82919d; }
+    .cyan { color: #27cad9; }
+    .green { color: #9fd28b; }
+    .orange { color: #e7a16d; }
+
+    .steps { border-top: 1px solid var(--line); }
+
+    .step {
+      display: grid;
+      grid-template-columns: 48px 1fr;
+      gap: 18px;
+      padding: 20px 0;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .step-num {
+      color: var(--accent);
+      font-family: var(--mono);
+      font-size: 0.875rem;
+      padding-top: 3px;
+    }
+
+    .step strong {
+      display: block;
+      margin-bottom: 4px;
+      font-size: 1.0625rem;
+      letter-spacing: -0.02em;
+      font-family: var(--brand);
+    }
+
+    .step span {
+      color: var(--muted);
+      font-size: 0.9375rem;
+    }
+
+    .languages {
+      display: flex;
+      flex-wrap: wrap;
+      margin-top: 40px;
+      border-top: 1px solid var(--line);
+      border-left: 1px solid var(--line);
+      background: white;
+    }
+
+    .languages span {
+      padding: 9px 13px;
+      border-right: 1px solid var(--line);
+      border-bottom: 1px solid var(--line);
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 0.75rem;
+    }
+
+    .cta {
+      border-top: 1px solid var(--line);
+      border-bottom: 1px solid var(--line);
+      background: white;
+      padding: 54px 0;
+      margin-top: 64px;
+    }
+
+    .cta-inner {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 30px;
+      align-items: center;
+    }
+
+    .cta h2 { font-size: clamp(34px, 4vw, 54px); }
+    .cta p { margin: 10px 0 0; max-width: 620px; color: var(--muted); }
+
+    footer {
+      display: flex;
+      justify-content: space-between;
+      gap: 24px;
+      padding: 32px 0 48px;
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 0.75rem;
+    }
+
+    @media (max-width: 980px) {
+      .nav-actions { display: none; }
+      .nav-links { text-align: right; padding-right: clamp(32px, 5vw, 64px); }
+      .nav-links a { margin: 0 9px; }
+      .hero { grid-template-columns: 1fr; }
+      .hero-visual { border-left: 0; border-top: 1px solid var(--line); min-height: 520px; }
+      .strip { grid-template-columns: repeat(2, 1fr); }
+      .metric:nth-child(2) { border-right: 0; }
+      .section-head, .workflow, .cta-inner { grid-template-columns: 1fr; }
+      .feature-grid { grid-template-columns: 1fr 1fr; }
+    }
+
+    @media (max-width: 640px) {
+      .nav { height: 56px; }
+      .brand { padding: 0 24px; font-size: 1.5rem; }
+      .nav-logo { width: clamp(56px, 16vw, 80px); }
+      .nav-links { text-align: right; padding-right: 24px; }
+      .nav-links a { margin: 0 8px; font-size: 0.8125rem; }
+      .hero-copy { padding: 46px 24px; }
+      h1 { font-size: clamp(44px, 13vw, 66px); }
+      .lead { font-size: 1.0625rem; }
+      .hero-visual { padding: 28px 24px; min-height: 420px; }
+      .strip, .feature-grid { grid-template-columns: 1fr; }
+      .metric { border-right: 0; }
+      .wrap { width: min(100% - 32px, 1180px); }
+      section.block { padding: 62px 0 0; }
+      .actions { flex-wrap: wrap; }
+      .install { grid-template-columns: 1fr; }
+      .copy { display: none; }
+      footer { flex-direction: column; }
+    }
+  </style>
+</head>
+<body>
+  <nav class="nav" aria-label="Primary navigation">
+    <a class="brand" href="#top" aria-label="upmd home">
+      <img class="nav-logo" src="upmd.png" alt="upmd logo">
+      <span class="brand-name"><span class="accent">up</span><span style="color:var(--ink)">md</span></span>
+    </a>
+    <div class="nav-links">
+      <a href="#top">Home</a>
+      <a href="#features">Features</a>
+      <a href="#workflow">Workflow</a>
+    </div>
+    <div class="nav-actions">
+      <a href="https://github.com/rezigned/upmd"><img src="https://img.shields.io/github/stars/rezigned/upmd?style=social" alt="GitHub stars"></a>
+      <a href="https://github.com/rezigned"><img src="https://img.shields.io/badge/-grey?style=social&label=%40rezigned&link=https%3A%2F%2Fgithub.com%2Frezigned" alt="@rezigned"></a>
+    </div>
+  </nav>
+
+  <main id="top">
+    <section class="hero" aria-labelledby="hero-title">
+      <div class="hero-copy">
+        <h1 id="hero-title">Run code<br><span class="accent">inside Markdown</span></h1>
+        <p class="lead">Run code blocks directly from Markdown in a terminal UI or an automation-friendly CLI.</p>
+        <div class="actions">
+          <a class="button primary" href="https://github.com/rezigned/upmd/releases/latest">Quick start</a>
+          <a class="button" href="https://github.com/rezigned/upmd#quick-start">Read docs</a>
+        </div>
+        <p style="margin:14px 0 0;color:#607180;font-size:0.8125rem;font-family:var(--mono)">
+          macOS · Linux · Windows · x86_64 · ARM64
+        </p>
+        <div class="install-label">Stable install</div>
+        <div class="install-tabs" role="tablist" aria-label="Install options">
+          <button type="button" class="active" role="tab" aria-selected="true" data-cmd="curl --proto '=https' --tlsv1.2 -LsSf https://github.com/rezigned/upmd/releases/latest/download/upmd-installer.sh | sh">Script</button>
+          <button type="button" role="tab" aria-selected="false" data-cmd="brew install rezigned/tap/upmd">Homebrew</button>
+          <button type="button" role="tab" aria-selected="false" data-cmd="cargo install --path .">Source</button>
+        </div>
+        <div class="install" role="group" aria-label="Install command">
+          <code id="install-cmd">$ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/rezigned/upmd/releases/latest/download/upmd-installer.sh | sh</code>
+          <button type="button" class="copy" id="copy-btn">Copy</button>
+        </div>
+      </div>
+
+      <div class="hero-visual">
+        <div class="visual-stack">
+          <div class="shot">
+            <div class="term-chrome">
+              <div class="term-lights"><span></span><span></span><span></span></div>
+              <div class="term-title-bar">upmd - README.md</div>
+              <div class="term-spacer"></div>
+            </div>
+            <img src="demos/overview.gif" alt="upmd terminal interface running Python, Ruby, PHP, and shell code blocks from a markdown document">
+          </div>
+          <p class="caption">Select a markdown code block, run it, then keep the result inline.</p>
+        </div>
+      </div>
+    </section>
+
+    <div class="strip">
+      <div class="metric"><strong>TUI + CLI</strong><span>Interactive or scriptable</span></div>
+      <div class="metric"><strong>Terminal</strong><span>Real terminal execution</span></div>
+      <div class="metric"><strong>10+ languages</strong><span>Shell, Python, Rust, Go, PHP, more</span></div>
+      <div class="metric"><strong>Zero config</strong><span>Plain markdown works</span></div>
+    </div>
+
+    <section id="features" class="block wrap" aria-labelledby="features-title">
+      <div class="section-head">
+        <h2 id="features-title">A README that can run itself.</h2>
+        <p class="section-copy">Keep setup steps, experiments, deployment commands, and debugging notes in one markdown file. upmd parses fenced code blocks, chooses the right runner, streams output inline, and can carry state between blocks.</p>
+      </div>
+
+      <div class="feature-grid">
+        <article class="feature"><h3>Interactive terminal UI</h3><p>Move through blocks, search the document, run the selected block, view output, paste into processes, and switch themes.</p></article>
+        <article class="feature"><h3>Automation mode</h3><p>Run all blocks in CI with <code>upmd --cli --all --yes README.md</code>, or jump to a named block with <code>--block</code>.</p></article>
+        <article class="feature"><h3>Live terminal execution</h3><p>Interactive prompts, pagers, editors, colors, and ANSI output behave like they do in your terminal.</p></article>
+        <article class="feature"><h3>State capture</h3><p>Shell blocks keep exported variables and working-directory changes for later blocks. Non-shell blocks can opt in.</p></article>
+        <article class="feature"><h3>Language runners</h3><p>Bash, sh, zsh, fish, Python, JavaScript, TypeScript, Ruby, PHP, Go, Rust, C, Zig, Cmd, and PowerShell.</p></article>
+        <article class="feature"><h3>Plain markdown</h3><p>No notebook format. No front matter. Add optional code block attributes only when you need names or binary overrides.</p></article>
+      </div>
+    </section>
+
+    <section id="workflow" class="block wrap" aria-labelledby="workflow-title">
+      <div class="section-head">
+        <h2 id="workflow-title">One file. Many executable blocks.</h2>
+        <p class="section-copy">Use it for examples, runbooks, release checklists, repro scripts, local ops, and docs that should prove they still work.</p>
+      </div>
+
+      <div class="workflow">
+        <div class="terminal" aria-label="upmd command examples">
+          <div class="terminal-title">terminal</div>
+          <pre><code><span class="dim"># Open a markdown file in the TUI</span>
+<span class="cyan">upmd</span> README.md
+
+<span class="dim"># Run every block headlessly</span>
+<span class="cyan">upmd</span> --cli --all --yes README.md
+
+<span class="dim"># Jump to one named block</span>
+<span class="cyan">upmd</span> deploy.md --block setup --yes
+
+<span class="green">✓</span> Python block <span class="orange">4</span> passed
+<span class="green">✓</span> Ruby block <span class="orange">5</span> streamed output</code></pre>
+        </div>
+
+        <div class="steps">
+          <div class="step"><div class="step-num">01</div><div><strong>Write normal markdown</strong><span>Use standard fenced code blocks. Keep prose and commands together.</span></div></div>
+          <div class="step"><div class="step-num">02</div><div><strong>Select or automate</strong><span>Navigate in the TUI, run one named block, or execute every block in order.</span></div></div>
+          <div class="step"><div class="step-num">03</div><div><strong>Run inside a terminal</strong><span>Each block gets a real terminal, so interactive tools work correctly.</span></div></div>
+          <div class="step"><div class="step-num">04</div><div><strong>Keep useful output</strong><span>Results appear inline, with exit state and captured environment available for later blocks.</span></div></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="cta" aria-labelledby="cta-title">
+      <div class="wrap cta-inner">
+        <div>
+          <h2 id="cta-title">Docs should execute.</h2>
+          <p>Install upmd, open a markdown file, and run the code blocks exactly where they are documented.</p>
+        </div>
+        <div class="actions">
+          <a class="button primary" href="https://github.com/rezigned/upmd/releases/latest">Install</a>
+          <a class="button" href="https://github.com/rezigned/upmd#quick-start">Quick start</a>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="wrap">
+    <span>upmd __UPMD_VERSION__</span>
+    <span>MIT licensed</span>
+  </footer>
+<script>
+  (function() {
+    var tabs = document.querySelectorAll('.install-tabs button');
+    var cmd = document.getElementById('install-cmd');
+    var copyBtn = document.getElementById('copy-btn');
+
+    tabs.forEach(function(tab) {
+      tab.addEventListener('click', function() {
+        tabs.forEach(function(t) {
+          t.classList.remove('active');
+          t.setAttribute('aria-selected', 'false');
+        });
+        tab.classList.add('active');
+        tab.setAttribute('aria-selected', 'true');
+        cmd.textContent = '$ ' + tab.dataset.cmd;
+      });
+    });
+
+    copyBtn.addEventListener('click', function() {
+      var text = cmd.textContent.replace(/^\$\s*/, '');
+      navigator.clipboard.writeText(text).then(function() {
+        copyBtn.textContent = 'Copied';
+        copyBtn.classList.add('copied');
+        setTimeout(function() {
+          copyBtn.textContent = 'Copy';
+          copyBtn.classList.remove('copied');
+        }, 1600);
+      }).catch(function() {
+        copyBtn.textContent = 'Failed';
+        setTimeout(function() {
+          copyBtn.textContent = 'Copy';
+        }, 1600);
+      });
+    });
+  })();
+</script>
+</body>
+</html>

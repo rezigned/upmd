@@ -1,0 +1,9 @@
+---
+source: src/apps/tui/wrap.rs
+assertion_line: 154
+expression: "summary.join(\"\\n\")"
+---
+[off=0 len=40] This is a 
+[off=10 len=40] long line 
+[off=20 len=40] that needs
+[off=30 len=40]  wrapping.

@@ -1,0 +1,527 @@
+theme = "catppuccin-mocha"
+transparent = false
+tick_rate = 66
+
+[tui]
+inline_max_lines = 20
+
+[cli]
+preview_lines = 8
+
+[keymap.home.DecreaseTocWidth]
+description = "Decrease TOC panel width"
+help = "toc narrower"
+keys = ["<"]
+symbol = "<"
+
+[keymap.home.Envs]
+description = "View environment variables"
+help = "envs"
+keys = ["e"]
+symbol = "e"
+
+[keymap.home.Execute]
+description = "Execute code block"
+help = "run"
+keys = ["enter"]
+symbol = "↵"
+
+[keymap.home.ExitInput]
+description = "Exit input mode"
+help = "exit input"
+keys = ["ctrl-o"]
+symbol = "ctrl-o"
+
+[keymap.home.Goto]
+description = "Go to block by ID"
+help = "goto"
+keys = ["ctrl-g"]
+symbol = "ctrl-g"
+
+[keymap.home.Help]
+description = "Show/hide help"
+help = "help"
+keys = ["?"]
+symbol = "?"
+
+[keymap.home.IncreaseTocWidth]
+description = "Increase TOC panel width"
+help = "toc wider"
+keys = [">"]
+symbol = ">"
+
+[keymap.home.Input]
+description = "Enter input mode for the selected running block"
+help = "input"
+keys = ["i"]
+symbol = "i"
+
+[keymap.home.OpenFilePicker]
+description = "Open Markdown file picker"
+help = "files"
+keys = ["f"]
+symbol = "f"
+
+[keymap.home.Paste]
+description = "Paste clipboard content into the active PTY."
+help = "paste"
+keys = ["ctrl-v"]
+symbol = "ctrl-v"
+
+[keymap.home.Quit]
+description = "Quit"
+help = "quit"
+keys = [
+    "q",
+    "ctrl-c",
+]
+symbol = "q"
+
+[keymap.home.Reload]
+description = "Reload the input file, clearing all output"
+keys = ["ctrl-r"]
+symbol = "ctrl-r"
+
+[keymap.home.Search]
+description = "Search text"
+help = "search"
+keys = ["/"]
+symbol = "/"
+
+[keymap.home.SwitchTheme]
+description = "Switch theme"
+help = "theme"
+keys = ["t"]
+symbol = "t"
+
+[keymap.home.ToggleTransparency]
+description = "Toggle transparency"
+help = "transparent"
+keys = ["ctrl-t"]
+symbol = "ctrl-t"
+
+[keymap.home.ToggleZen]
+description = "Toggle zen mode"
+help = "zen"
+keys = ["z"]
+symbol = "z"
+
+[keymap.home.ViewOutput]
+description = "View output"
+help = "output"
+keys = ["o"]
+symbol = "o"
+
+[keymap.output.Back]
+description = "Go back to home view"
+help = "back"
+keys = ["ctrl-o"]
+symbol = "ctrl-o"
+
+[keymap.output.BackIfDone]
+description = "Go back to home view when the buffer is done (esc passthrough when running)"
+help = "back (done)"
+keys = ["esc"]
+symbol = "esc"
+
+[keymap.output.Copy]
+description = "Copy output to clipboard"
+help = "copy"
+keys = [
+    "y",
+    "Y",
+]
+symbol = "y"
+
+[keymap.output.Paste]
+description = "Paste clipboard content into the active PTY"
+help = "paste"
+keys = ["ctrl-v"]
+symbol = "ctrl-v"
+
+[keymap.cli.Quit]
+description = "Quits the application."
+keys = [
+    "q",
+    "ctrl-c",
+]
+symbol = "q"
+
+[keymap.cli.Run]
+description = "Executes the selected code block."
+keys = ["enter"]
+symbol = "enter"
+
+[keymap.menu.First]
+description = "Move to first item"
+keys = ["g"]
+symbol = "g"
+
+[keymap.menu.Last]
+description = "Move to last item"
+keys = [
+    "shift-G",
+    "G",
+]
+symbol = "shift-G"
+
+[keymap.menu.Next]
+description = "Move to next item"
+keys = [
+    "down",
+    "ctrl-n",
+    "j",
+]
+symbol = "down"
+
+[keymap.menu.PageDown]
+description = "Page down"
+keys = [
+    "pagedown",
+    "ctrl-f",
+]
+symbol = "pagedown"
+
+[keymap.menu.PageUp]
+description = "Page up"
+keys = [
+    "pageup",
+    "ctrl-b",
+]
+symbol = "pageup"
+
+[keymap.menu.Prev]
+description = "Move to previous item"
+keys = [
+    "up",
+    "ctrl-p",
+    "k",
+]
+symbol = "up"
+
+[keymap.preview.Copy]
+description = "Copies the current selection to the system clipboard."
+keys = ["y"]
+symbol = "y"
+
+[keymap.preview.PageDown]
+description = "Scrolls the viewport down by one page."
+keys = [
+    "pagedown",
+    "ctrl-f",
+]
+symbol = "pagedown"
+
+[keymap.preview.PageUp]
+description = "Scrolls the viewport up by one page."
+keys = [
+    "pageup",
+    "ctrl-b",
+]
+symbol = "pageup"
+
+[keymap.preview.ScrollDown]
+description = "Scrolls the preview content down by one line (mouse-triggered)."
+keys = []
+
+[keymap.preview.ScrollUp]
+description = "Scrolls the preview content up by one line (mouse-triggered)."
+keys = []
+
+[keymap.preview.Select]
+description = "Updates the text selection highlight (mouse-driven, no key binding)."
+keys = []
+
+[keymap.preview.SelectCodeBlock]
+description = "Clicked on a code block line. Auto-select that code block."
+keys = []
+
+[keymap.preview.Show]
+description = "Jumps to a specific code block by ID."
+keys = ["@digit"]
+symbol = "@digit"
+
+[keymap.preview.ToggleToc]
+description = "Toggles table of contents mode."
+keys = ["c"]
+symbol = "c"
+
+[keymap.confirm.Cancel]
+description = "Cancels the dialog without taking action."
+keys = ["esc"]
+symbol = "esc"
+
+[keymap.confirm.Cancelled]
+keys = []
+
+[keymap.confirm.Confirmed]
+keys = []
+
+[keymap.confirm.Select]
+description = "Confirms the currently highlighted option."
+keys = ["enter"]
+symbol = "enter"
+
+[keymap.confirm.Switch]
+description = "Switches between confirm dialog options."
+keys = [
+    "left",
+    "right",
+    "tab",
+]
+symbol = "left"
+
+[keymap.search.Delete]
+description = "Deletes the last character from the search query."
+help = "delete"
+keys = ["backspace"]
+symbol = "backspace"
+
+[keymap.search.Input]
+description = "Appends a character to the search query."
+keys = ["@any"]
+symbol = "@any"
+
+[keymap.search.Next]
+description = "Moves to the next search result."
+help = "next"
+keys = [
+    "down",
+    "ctrl-n",
+]
+symbol = "down"
+
+[keymap.search.Prev]
+description = "Moves to the previous search result."
+help = "prev"
+keys = [
+    "up",
+    "ctrl-p",
+]
+symbol = "up"
+
+[keymap.search.Quit]
+description = "Exits search mode without selecting."
+help = "quit"
+keys = ["esc"]
+symbol = "esc"
+
+[keymap.search.Select]
+description = "Selects the current search match and exits search mode."
+help = "select"
+keys = ["enter"]
+symbol = "enter"
+
+[keymap.goto.Delete]
+help = "delete"
+keys = ["backspace"]
+symbol = "backspace"
+
+[keymap.goto.Input]
+keys = ["@any"]
+symbol = "@any"
+
+[keymap.goto.Next]
+help = "next"
+keys = [
+    "down",
+    "ctrl-n",
+]
+symbol = "down"
+
+[keymap.goto.Prev]
+help = "prev"
+keys = [
+    "up",
+    "ctrl-p",
+]
+symbol = "up"
+
+[keymap.goto.Quit]
+help = "cancel"
+keys = ["esc"]
+symbol = "esc"
+
+[keymap.goto.Select]
+help = "go"
+keys = ["enter"]
+symbol = "enter"
+
+[keymap.file_picker.Delete]
+description = "Delete the last character from the filter query."
+help = "delete"
+keys = ["backspace"]
+symbol = "backspace"
+
+[keymap.file_picker.Input]
+description = "Append a typed character to the filter query."
+keys = ["@any"]
+symbol = "@any"
+
+[keymap.file_picker.Next]
+description = "Move selection to the next match."
+help = "next"
+keys = [
+    "down",
+    "ctrl-n",
+]
+symbol = "down"
+
+[keymap.file_picker.Prev]
+description = "Move selection to the previous match."
+help = "prev"
+keys = [
+    "up",
+    "ctrl-p",
+]
+symbol = "up"
+
+[keymap.file_picker.Quit]
+description = "Cancel the picker without selecting a file."
+help = "cancel"
+keys = [
+    "esc",
+    "ctrl-c",
+    "ctrl-d",
+]
+symbol = "esc"
+
+[keymap.file_picker.Select]
+description = "Open the currently selected file."
+help = "open"
+keys = ["enter"]
+symbol = "enter"
+
+[keymap.help.Delete]
+help = "delete"
+keys = ["backspace"]
+symbol = "backspace"
+
+[keymap.help.Input]
+description = "Must be last because @any catches all unmatched keys."
+keys = ["@any"]
+symbol = "@any"
+
+[keymap.help.Next]
+help = "next"
+keys = [
+    "down",
+    "ctrl-n",
+]
+symbol = "down"
+
+[keymap.help.Prev]
+help = "prev"
+keys = [
+    "up",
+    "ctrl-p",
+]
+symbol = "up"
+
+[keymap.help.Quit]
+description = "Closes the help overlay."
+help = "quit"
+keys = [
+    "q",
+    "esc",
+    "?",
+]
+symbol = "q"
+
+[keymap.envs.Add]
+description = "Add new environment variable"
+help = "new"
+keys = [
+    "a",
+    "n",
+]
+symbol = "a"
+
+[keymap.envs.Quit]
+description = "Quit environment list"
+help = "quit"
+keys = [
+    "esc",
+    "q",
+]
+symbol = "esc"
+
+[keymap.envs.Search]
+description = "Enter search mode"
+help = "search"
+keys = ["/"]
+symbol = "/"
+
+[keymap.envs.Select]
+description = "Select the current item"
+help = "edit"
+keys = ["enter"]
+symbol = "enter"
+
+[keymap.envs_edit.Delete]
+description = "Delete character"
+help = "delete"
+keys = ["backspace"]
+symbol = "backspace"
+
+[keymap.envs_edit.Input]
+description = "Input"
+keys = ["@any"]
+symbol = "@any"
+
+[keymap.envs_edit.Left]
+description = "Navigate left in inline editing"
+help = "left"
+keys = ["left"]
+symbol = "left"
+
+[keymap.envs_edit.Paste]
+description = "Paste from clipboard"
+help = "paste"
+keys = ["ctrl-v"]
+symbol = "ctrl-v"
+
+[keymap.envs_edit.Quit]
+description = "Quit editing mode"
+help = "cancel"
+keys = ["esc"]
+symbol = "esc"
+
+[keymap.envs_edit.Right]
+description = "Navigate right in inline editing"
+help = "right"
+keys = ["right"]
+symbol = "right"
+
+[keymap.envs_edit.Save]
+description = "Save changes"
+help = "save"
+keys = ["enter"]
+symbol = "enter"
+
+[keymap.envs_edit.SwitchField]
+description = "Switch between name and value fields"
+help = "switch"
+keys = ["tab"]
+symbol = "tab"
+
+[keymap.themes.Quit]
+description = "Quit theme list"
+keys = [
+    "esc",
+    "q",
+]
+symbol = "esc"
+
+[keymap.themes.Search]
+description = "Enter search mode"
+keys = ["/"]
+symbol = "/"
+
+[keymap.themes.Select]
+description = "Select the current theme"
+keys = ["enter"]
+symbol = "enter"
+
+[binaries]
+

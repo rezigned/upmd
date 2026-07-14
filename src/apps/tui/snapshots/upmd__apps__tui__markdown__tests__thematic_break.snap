@@ -1,0 +1,11 @@
+---
+source: src/apps/tui/markdown.rs
+assertion_line: 1457
+expression: viewline_summary(&lines)
+---
+ 0: [Text] above
+ 1: [Newline] 
+ 2: [ThematicBreak] 
+ 3: [Newline] 
+ 4: [Text] below
+ 5: [Newline]
