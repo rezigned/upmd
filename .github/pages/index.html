@@ -525,13 +525,14 @@
 
     footer {
       display: flex;
-      justify-content: space-between;
+      justify-content: flex-end;
       gap: 24px;
       padding: 32px 0 48px;
       color: var(--muted);
       font-family: var(--mono);
       font-size: 0.75rem;
     }
+    footer a { color: var(--accent); }
 
     @media (max-width: 980px) {
       .nav-actions { display: none; }
@@ -691,8 +692,9 @@
   </main>
 
   <footer class="wrap">
-    <span>upmd __UPMD_VERSION__</span>
+    <span>upmd <a href="https://github.com/rezigned/upmd/releases/tag/v__UPMD_VERSION__">__UPMD_VERSION__</a></span>
     <span>MIT licensed</span>
+    <span>&copy; __UPMD_YEAR__</span>
   </footer>
 <script>
   (function() {

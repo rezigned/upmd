@@ -1,10 +1,17 @@
 # upmd
 
 <p align="center">
-  <img src=".github/pages/upmd-logo.png" alt="upmd" width="200">
+  <img src=".github/pages/upmd-logo.png" alt="upmd" width="250">
 </p>
 
 <p align="center">Run code blocks directly from Markdown in a terminal UI or an automation-friendly CLI.</p>
+
+<p align="center">
+  <a href="https://github.com/rezigned/upmd/releases/latest"><img src="https://img.shields.io/github/v/release/rezigned/upmd?include_prereleases&style=flat-square" alt="Release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/rezigned/upmd?style=flat-square" alt="License"></a>
+  <a href="https://github.com/rezigned/upmd/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/rezigned/upmd/ci.yml?branch=main&style=flat-square" alt="CI"></a>
+  <a href="https://github.com/rezigned/upmd/releases"><img src="https://img.shields.io/github/downloads/rezigned/upmd/total?style=flat-square" alt="Downloads"></a>
+</p>
 
 <p align="center">
   <img src=".github/pages/demos/overview.gif" width="500" alt="upmd overview">
@@ -344,8 +351,8 @@ The workspace contains five packages:
 
 - `upmd`: TUI and CLI frontends, document lifecycle, execution coordination, and release binary.
 - `upmd-parser`: typed Markdown AST and fenced-code attributes.
-- `upmd-runner`: language registry, execution plans, quoting, temporary workspaces, and state-capture injection.
 - `upmd-pty`: PTY process lifecycle, terminal parsing, mouse protocol, and ratatui conversion.
+- `upmd-runner`: language registry, execution plans, quoting, temporary workspaces, and state-capture injection.
 - `upmd-runtime`: shared component engine with TUI and CLI runtimes.
 
 Important design constraints:

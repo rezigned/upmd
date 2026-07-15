@@ -32,6 +32,7 @@ jobs:
           mkdir -p _site
           cp -r .github/pages/* _site/
           sed -i "s/__UPMD_VERSION__/${{ env.version }}/g" _site/index.html
+          sed -i "s/__UPMD_YEAR__/$(date +%Y)/g" _site/index.html
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
