@@ -3,7 +3,7 @@ Require upmd
 Set Shell "zsh"
 
 # Fonts
-Set FontFamily "Fira Code Retina"
+Set FontFamily "Ioskeley Mono Term"
 Set FontSize 22
 Set LineHeight 1.3
 
