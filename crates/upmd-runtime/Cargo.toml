@@ -11,6 +11,6 @@ cli = ["dep:crossterm"]
 tui = ["dep:ratatui", "dep:crossterm"]
 
 [dependencies]
-flume = "0.11"
+flume = "0.12"
 crossterm = { version = "0.29", optional = true }
 ratatui = { version = "0.30", optional = true }
