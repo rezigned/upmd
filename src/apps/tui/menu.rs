@@ -4,9 +4,10 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use ratatui::{
     layout::{Alignment, Rect},
+    style::Style,
     symbols::merge::MergeStrategy,
-    text::Line,
-    widgets::{Borders, List, ListItem},
+    text::{Line, Span},
+    widgets::{Borders, List, ListItem, Paragraph},
     Frame,
 };
 use upmd_parser::nodes::Code;
@@ -41,6 +42,8 @@ pub struct Menu {
     spinner: Spinner,
     last_area: Cell<Rect>,
     toc_width_adjustment: i16,
+    /// Horizontal scroll offset (in columns) used in vertical-layout mode.
+    column_offset: Cell<usize>,
 }
 
 /// The menu's data: code block IDs and selection index.
@@ -89,6 +92,7 @@ impl Menu {
             spinner: Spinner::dot(),
             last_area: Cell::new(Rect::default()),
             toc_width_adjustment: 0,
+            column_offset: Cell::new(0),
         }
     }
     /// Advances the spinner tick counter (driven by Msg::Tick).
@@ -272,6 +276,84 @@ impl Menu {
         let max_adj = (crate::apps::config::MENU_TOC_MAX_WIDTH as i16).saturating_sub(base);
         self.toc_width_adjustment = (self.toc_width_adjustment + delta).clamp(min_adj, max_adj);
     }
+
+    /// Whether the menu is in vertical-layout mode (stacked single row)
+    /// instead of the normal sidebar list.
+    fn is_vertical_menu(&self, area: Rect) -> bool {
+        matches!(self.mode, MenuMode::CodeBlocks) && area.height <= config::VERTICAL_MENU_HEIGHT
+    }
+
+    /// Builds the label and style for a code-block menu item.
+    fn code_item(&self, i: usize, id: CodeId) -> (String, Style) {
+        let len = self.model.items.len().checked_ilog10().unwrap_or(0);
+        let padding = len.saturating_sub(id.checked_ilog10().unwrap_or(0)) as usize;
+        let mut content = format!(" {:>padding$}{id} ", "");
+        let mut style = self.theme.muted_style();
+        match self.code_statuses.get(&id) {
+            Some(MenuTaskStatus::Running) => {
+                content.replace_range(0..1, &self.spinner.render().to_string());
+                style = self.theme.running_style();
+            }
+            Some(MenuTaskStatus::Success) => {
+                style = self.theme.success_style();
+            }
+            Some(MenuTaskStatus::Error) => {
+                style = self.theme.error_style();
+            }
+            _ => {}
+        }
+
+        if Some(i) == self.model.state.selected() {
+            (content, self.theme.active_style())
+        } else {
+            (content, style)
+        }
+    }
+
+    /// Renders code-block items side by side on a single row, scrolling
+    /// horizontally to keep the selected item visible.
+    ///
+    /// | 1 | 2 | 3 | ... |
+    fn render_vertical(&self, frame: &mut Frame, area: Rect) {
+        let inner_width = area.width.saturating_sub(config::MENU_BORDER_SIZE) as usize;
+
+        let mut spans = Vec::with_capacity(self.model.items.len());
+        let mut total = 0usize;
+        let mut sel_range = None;
+        for (i, &id) in self.model.items.iter().enumerate() {
+            let (content, style) = self.code_item(i, id);
+            if Some(i) == self.model.state.selected() {
+                sel_range = Some((total, total + content.width()));
+            }
+            total += content.width();
+            spans.push(Span::styled(content, style));
+        }
+
+        // Scroll just enough to keep the selected item visible.
+        let mut offset = self
+            .column_offset
+            .get()
+            .min(total.saturating_sub(inner_width));
+        if let Some((start, end)) = sel_range {
+            if start < offset {
+                offset = start;
+            } else if end > offset + inner_width {
+                offset = end.saturating_sub(inner_width);
+            }
+        }
+        self.column_offset.set(offset);
+
+        let vertical = Paragraph::new(Line::from(spans))
+            .block(
+                self.theme
+                    .block()
+                    .borders(Borders::ALL)
+                    .border_style(self.theme.inactive_style())
+                    .merge_borders(MergeStrategy::Exact),
+            )
+            .scroll((0, u16::try_from(offset).unwrap_or(u16::MAX)));
+        frame.render_widget(vertical, area);
+    }
 }
 
 impl Input for Menu {
@@ -287,21 +369,44 @@ impl Input for Menu {
 }
 
 impl Menu {
+    /// Hit-tests a click in vertical-layout mode: all items share one row,
+    /// so the column plus scroll offset determines the item.
+    fn click_at_column(&self, mouse: crossterm::event::MouseEvent, area: Rect) -> Option<Action> {
+        if mouse.row != area.y + 1 {
+            return None;
+        }
+        let target = mouse.column.saturating_sub(area.x + 1) as usize + self.column_offset.get();
+        let mut col = 0usize;
+        for (i, &id) in self.model.items.iter().enumerate() {
+            col += self.code_item(i, id).0.width();
+            if target < col {
+                return Some(Action::Click(id));
+            }
+        }
+        None
+    }
+
     /// Hit-tests a mouse click against the list items.
     ///
     /// Row 0 of the area is the top border, so item 0 starts at area.y + 1.
     /// Accounts for the list scroll offset so clicks work even when the list
-    /// is scrolled down.
+    /// is scrolled down. In the vertical-layout strip (single inner row),
+    /// items are laid out horizontally and the column determines the item.
     fn handle_mouse(&self, mouse: crossterm::event::MouseEvent) -> Option<Action> {
         use crossterm::event::{MouseButton, MouseEventKind};
         if !matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) {
             return None;
         }
         let area = self.last_area.get();
-        // Must be inside the menu area.
         if !crate::utils::mouse_in_area(&mouse, area) {
             return None;
         }
+
+        // Vertical mode: items share one row, determined by column.
+        if self.is_vertical_menu(area) {
+            return self.click_at_column(mouse, area);
+        }
+
         // Row relative to the inner list (skip top border at area.y).
         let inner_row = mouse.row.saturating_sub(area.y + 1) as usize;
         let offset = self.model.state.offset();
@@ -350,39 +455,22 @@ impl Output for Menu {
         }
         self.last_area.set(area);
 
-        let items: Vec<ListItem> = match self.mode {
-            MenuMode::CodeBlocks => {
-                let len = self.model.items.len().checked_ilog10().unwrap_or(0);
-                self.model
-                    .items
-                    .iter()
-                    .enumerate()
-                    .map(|(i, &id)| {
-                        let padding = len.saturating_sub(id.checked_ilog10().unwrap_or(0)) as usize;
-                        let mut content = format!(" {:>padding$}{id} ", "");
-                        let mut style = self.theme.muted_style();
-                        match self.code_statuses.get(&id) {
-                            Some(MenuTaskStatus::Running) => {
-                                content.replace_range(0..1, &self.spinner.render().to_string());
-                                style = self.theme.running_style();
-                            }
-                            Some(MenuTaskStatus::Success) => {
-                                style = self.theme.success_style();
-                            }
-                            Some(MenuTaskStatus::Error) => {
-                                style = self.theme.error_style();
-                            }
-                            _ => {}
-                        }
+        if self.is_vertical_menu(area) {
+            self.render_vertical(frame, area);
+            return;
+        }
 
-                        if Some(i) == self.model.state.selected() {
-                            ListItem::new(content).style(self.theme.active_style())
-                        } else {
-                            ListItem::new(content).style(style)
-                        }
-                    })
-                    .collect()
-            }
+        let items: Vec<ListItem> = match self.mode {
+            MenuMode::CodeBlocks => self
+                .model
+                .items
+                .iter()
+                .enumerate()
+                .map(|(i, &id)| {
+                    let (content, style) = self.code_item(i, id);
+                    ListItem::new(content).style(style)
+                })
+                .collect(),
             MenuMode::Toc => {
                 let item_width = area.width.saturating_sub(config::MENU_BORDER_SIZE) as usize;
                 let min_level = self.toc_items.iter().map(|(l, _)| *l).min().unwrap_or(1);
@@ -549,5 +637,42 @@ mod tests {
             Some(0),
             "page_size fallback to 10"
         );
+    }
+
+    fn codes(n: u32) -> Vec<upmd_parser::nodes::Code> {
+        (1..=n)
+            .map(|id| upmd_parser::nodes::Code {
+                id,
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    fn render_vertical_text(menu: &Menu, width: u16) -> String {
+        let backend = ratatui::backend::TestBackend::new(width, 3);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| menu.render(frame, Rect::new(0, 0, width, 3)))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        (0..3)
+            .map(|y| (0..width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn test_vertical_render() {
+        use insta::assert_snapshot;
+        let nav_keymap: keymap::DerivedConfig<Navigation> = toml::from_str("").unwrap();
+        let menu = Menu::new(
+            &codes(10),
+            &[],
+            crate::apps::theme::Theme::default(),
+            nav_keymap,
+        );
+
+        // Items are laid out left to right and clipped at the area edge.
+        assert_snapshot!("menu_vertical", render_vertical_text(&menu, 30));
     }
 }
