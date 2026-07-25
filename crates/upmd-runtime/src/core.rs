@@ -495,12 +495,17 @@ impl<C: Component> Engine<C> {
     /// 2. **Low-priority**: Background commands are processed within an 8ms time budget
     ///    to maintain stable frame rates.
     ///
-    /// Processing stops early if a quit command is executed.
+    /// If a high-priority message stops the engine, drain queued low-priority
+    /// messages once before returning so accepted PTY output reaches the final render.
     pub fn tick(&mut self) {
         // High-priority: drain all UI messages before touching background cmds
         while let Ok(msg) = self.msg_rx.try_recv() {
             self.update(msg);
             if !self.is_running {
+                // Preserve accepted PTY output before the final render.
+                while let Ok(msg) = self.cmd_rx.try_recv() {
+                    self.update(msg);
+                }
                 return;
             }
         }
