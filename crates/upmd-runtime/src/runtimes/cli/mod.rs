@@ -3,7 +3,7 @@
 //! Provides a runtime implementation for terminal applications that render
 //! plain text (ANSI-escaped) output without full-screen terminal libraries.
 
-use std::io;
+use std::io::{self, IsTerminal};
 use std::time::Duration;
 
 use crate::core::{Component, Engine};
@@ -34,6 +34,7 @@ use crate::core::{Component, Engine};
 /// ```
 pub struct Runtime {
     config: Config,
+    terminal: bool,
     start: Option<Box<dyn FnOnce() -> io::Result<()>>>,
     stop: Option<Box<dyn FnOnce()>>,
 }
@@ -85,21 +86,30 @@ impl Drop for Runtime {
 impl Runtime {
     /// Creates a new CLI runtime with default setup/cleanup.
     ///
-    /// Default setup: raw mode, hide cursor
-    /// Default cleanup: show cursor, disable raw mode
+    /// Terminal stdout gets raw mode and cursor hiding for in-place redraw.
+    /// Non-terminal stdout skips crossterm setup and keyboard event polling.
     pub fn new() -> Self {
-        Self {
+        let terminal = io::stdout().is_terminal();
+        let mut runtime = Self {
             config: Config::default(),
-            start: Some(Box::new(|| {
+            terminal,
+            start: None,
+            stop: None,
+        };
+
+        if terminal {
+            runtime.start = Some(Box::new(|| {
                 crossterm::terminal::enable_raw_mode()?;
                 let _ = crossterm::execute!(io::stdout(), crossterm::cursor::Hide);
                 Ok(())
-            })),
-            stop: Some(Box::new(|| {
+            }));
+            runtime.stop = Some(Box::new(|| {
                 let _ = crossterm::execute!(io::stdout(), crossterm::cursor::Show);
                 let _ = crossterm::terminal::disable_raw_mode();
-            })),
+            }));
         }
+
+        runtime
     }
 
     /// Configures the runtime with custom settings.
@@ -156,9 +166,10 @@ impl<C: Component + Input + Output> crate::Runtime<C> for Runtime {
             start()?;
         }
 
+        let is_tty = self.terminal;
         let frame_duration = Duration::from_millis(self.config.poll_timeout_ms);
         while engine.is_running {
-            if crossterm::event::poll(frame_duration).unwrap_or(false) {
+            if is_tty && crossterm::event::poll(frame_duration).unwrap_or(false) {
                 loop {
                     if let Ok(evt) = crossterm::event::read() {
                         if let Some(msg) = engine.component.action(evt) {
@@ -170,6 +181,9 @@ impl<C: Component + Input + Output> crate::Runtime<C> for Runtime {
                         break;
                     }
                 }
+            } else if !is_tty {
+                // Non-terminal stdout has no keyboard event source to poll.
+                std::thread::sleep(frame_duration);
             }
             // Process queued messages and background commands
             engine.tick();
