@@ -1,6 +1,6 @@
 [package]
 name = "upmd"
-description = "Run code blocks directly from Markdown in a terminal UI or an automation-friendly CLI"
+description = "Run code blocks directly from Markdown in a real terminal, keeping commands, context, and output together"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.82"
