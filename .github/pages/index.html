@@ -3,10 +3,10 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>upmd: run markdown interactively</title>
-  <meta name="description" content="Run code blocks directly from Markdown in a terminal UI or an automation-friendly CLI.">
+  <title>upmd: run Markdown code blocks interactively in your terminal</title>
+  <meta name="description" content="Run code blocks directly from Markdown in a real terminal, keeping commands, context, and output together.">
   <meta property="og:title" content="upmd">
-  <meta property="og:description" content="Run code blocks directly from Markdown in a terminal UI or an automation-friendly CLI.">
+  <meta property="og:description" content="Run code blocks directly from Markdown in a real terminal, keeping commands, context, and output together.">
   <meta property="og:image" content="https://upmd.rezigned.com/cover.png">
   <meta property="og:image:width" content="2106">
   <meta property="og:image:height" content="1372">
@@ -14,10 +14,10 @@
   <meta property="og:url" content="https://upmd.rezigned.com/">
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="upmd">
-  <meta name="twitter:description" content="Run code blocks directly from Markdown in a terminal UI or an automation-friendly CLI.">
+  <meta name="twitter:description" content="Run code blocks directly from Markdown in a real terminal, keeping commands, context, and output together.">
   <meta name="twitter:image" content="https://upmd.rezigned.com/cover.png">
   <link rel="canonical" href="https://upmd.rezigned.com/">
-  <link rel="icon" type="image/png" href="upmd.png">
+  <link rel="icon" type="image/svg+xml" href="upmd-square.svg">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700;800&family=Geist+Mono:wght@400;500;600;700&family=Poppins:wght@400;500&display=swap" rel="stylesheet">
@@ -137,7 +137,10 @@
     }
     .lead strong {
       color: var(--ink);
-      font-weight: 600;
+      font-family: var(--brand);
+      font-size: 1.25em;
+      font-weight: 400;
+      letter-spacing: 0.05em;
     }
 
     .actions {
@@ -587,8 +590,8 @@
   <main id="top">
     <section class="hero" aria-labelledby="hero-title">
       <div class="hero-copy">
-        <h1 id="hero-title">Run code<br><span class="accent">inside Markdown</span></h1>
-        <p class="lead">Run code blocks directly from Markdown in a terminal UI or an automation-friendly CLI.</p>
+        <h1 id="hero-title">Run Markdown<br><span class="accent">in your terminal</span></h1>
+        <p class="lead"><strong>upmd</strong> runs code blocks directly from Markdown in a real terminal, keeping commands, context, and output together.</p>
         <div class="actions">
           <a class="button primary" href="https://github.com/rezigned/upmd/releases/latest">Quick start</a>
           <a class="button" href="https://github.com/rezigned/upmd#quick-start">Read docs</a>
@@ -600,7 +603,7 @@
         <div class="install-tabs" role="tablist" aria-label="Install options">
           <button type="button" class="active" role="tab" aria-selected="true" data-cmd="curl --proto '=https' --tlsv1.2 -LsSf https://github.com/rezigned/upmd/releases/latest/download/upmd-installer.sh | sh">Script</button>
           <button type="button" role="tab" aria-selected="false" data-cmd="brew install rezigned/tap/upmd">Homebrew</button>
-          <button type="button" role="tab" aria-selected="false" data-cmd="cargo install --path .">Source</button>
+          <button type="button" role="tab" aria-selected="false" data-cmd="cargo install --git https://github.com/rezigned/upmd.git">Source</button>
         </div>
         <div class="install" role="group" aria-label="Install command">
           <code id="install-cmd">$ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/rezigned/upmd/releases/latest/download/upmd-installer.sh | sh</code>
