@@ -182,6 +182,20 @@ upmd runbook.md -b setup --yes
 
 Numeric IDs are also accepted.
 
+### Dependencies
+
+`deps` names blocks that must finish before the selected block. Commas separate
+stages; `|` runs blocks in the same stage together:
+
+````markdown
+```bash [name:verify, deps:"build | lint, test"]
+echo "verified"
+```
+````
+
+If a prerequisite fails, its dependents are skipped. Under `--all`, unrelated
+blocks still run and the command exits non-zero.
+
 ### Runner precedence
 
 Executable settings resolve in this order:

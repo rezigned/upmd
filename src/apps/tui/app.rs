@@ -3,6 +3,7 @@
 use crate::apps::config::{self, Config as AppConfig};
 use crate::apps::exec;
 use crate::apps::navigation::Navigation;
+use crate::apps::scheduler::{AdvanceResult, Scheduler};
 use crate::apps::tui;
 use crate::apps::tui::{
     confirm, file_picker, layout, menu, preview, tasks::Tasks, themes, Shortcut,
@@ -17,7 +18,14 @@ use ratatui::{
     widgets::{Block, Paragraph},
     Frame,
 };
-use std::{cell::RefCell, collections::HashMap, path::PathBuf, thread, time::Duration};
+use std::{
+    cell::RefCell,
+    collections::{BTreeMap, HashMap},
+    path::PathBuf,
+    process::ExitCode,
+    thread,
+    time::Duration,
+};
 use upmd_parser::Parser;
 use upmd_parser::{resolve_code_block, CodeId};
 use upmd_runtime::{
@@ -68,10 +76,10 @@ pub struct App {
     file_picker_root: Option<PathBuf>,
     themes: Option<themes::ThemeSelector>,
     output: tui::output::Output,
-    /// Advance to next code block after each completes (--all).
-    auto_advance: Vec<CodeId>,
-    /// Working directory captured from the most recent shell block that
-    /// emitted `Stream::Cwd`. Used as the initial cwd for the next block.
+    scheduler: Option<Scheduler>,
+    auto_run_plan: bool,
+    plan_target: Option<CodeId>,
+    pending_states: BTreeMap<CodeId, (Option<config::Envs>, Option<PathBuf>)>,
     last_cwd: Option<PathBuf>,
     started: bool,
     /// Cached default footer right text (rebuilt when the theme changes).
@@ -155,7 +163,6 @@ impl App {
         app
     }
 
-    /// Creates the app from a parsed document.
     pub fn new(doc: upmd_parser::Document, config: AppConfig) -> Self {
         let upmd_parser::Document {
             nodes,
@@ -165,11 +172,6 @@ impl App {
         } = doc;
         let theme = config.theme.clone();
         let tasks = Tasks::new();
-        let auto_advance = if config.all {
-            codes.iter().map(|c| c.id).collect()
-        } else {
-            Vec::new()
-        };
         let selected = config
             .block
             .as_deref()
@@ -225,7 +227,10 @@ impl App {
             menu,
             themes: None,
             output: tui::output::Output::new(config.keymap.output()),
-            auto_advance,
+            scheduler: None,
+            auto_run_plan: false,
+            plan_target: None,
+            pending_states: BTreeMap::new(),
             last_cwd: None,
             notification: None,
             started: false,
@@ -304,58 +309,155 @@ impl App {
         crate::pty::process::Size::from((base.width, rows as u16))
     }
 
-    fn execute(&mut self, id: CodeId) -> Option<Cmd<Msg>> {
+    fn execute_block(&mut self, id: CodeId) -> Option<Cmd<Msg>> {
         let code = self.preview.code_by_id(id)?;
         let size = self.pty_size_for_code(id);
         let envs = self.envs.data();
+        let command = self
+            .tasks
+            .run(
+                code,
+                size,
+                envs,
+                self.config.capture_state,
+                &self.config.binaries,
+                self.config
+                    .working_dir
+                    .clone()
+                    .or_else(|| self.last_cwd.clone()),
+            )
+            .map(|receiver| exec::stream_rx(id, receiver, Msg::StreamUpdate));
 
-        if let Some(rx) = self.tasks.run(
-            code,
-            size,
-            envs,
-            self.config.capture_state,
-            &self.config.binaries,
-            self.config
-                .working_dir
-                .clone()
-                .or_else(|| self.last_cwd.clone()),
-        ) {
-            self.sync_menu_running_state();
-            Some(exec::stream_rx(id, rx, Msg::StreamUpdate))
-        } else {
+        if command.is_none() {
             self.preview.prefer_status_gutter_for(id);
             self.preview.rebuild_view(self.tasks.buffers());
-            self.sync_menu_running_state();
-            // The block failed to start (e.g. binary not found). Don't
-            // leave it in the auto-advance queue or --all will stall.
-            self.auto_advance.retain(|&i| i != id);
-            self.run_next_pending()
+        }
+        self.sync_menu_running_state();
+        command
+    }
+
+    fn launch_batch(&mut self, batch: Vec<CodeId>) -> Option<Cmd<Msg>> {
+        let mut commands = Vec::new();
+        let mut completed = None;
+
+        for id in batch {
+            let already_ran = self.plan_target != Some(id)
+                && self
+                    .tasks
+                    .get(id)
+                    .is_some_and(|task| task.exit_code == Some(0));
+            if already_ran {
+                completed = self.advance_scheduler(id, Some(0));
+            } else if let Some(command) = self.execute_block(id) {
+                commands.push(command);
+            } else {
+                completed = self.advance_scheduler(id, Some(1));
+            }
+        }
+
+        if let Some(result) = completed {
+            if let Some(command) = self.handle_advance(result) {
+                commands.push(command);
+            }
+        }
+
+        match commands.len() {
+            0 => None,
+            1 => commands.pop(),
+            _ => Some(Cmd::Batch(commands)),
+        }
+    }
+
+    fn begin_plan(
+        &mut self,
+        mut scheduler: Scheduler,
+        auto_run: bool,
+        target: Option<CodeId>,
+    ) -> Option<Cmd<Msg>> {
+        let batch = scheduler.start()?;
+        self.scheduler = Some(scheduler);
+        self.auto_run_plan = auto_run;
+        self.plan_target = target;
+        self.select_batch(&batch);
+        auto_run.then(|| self.launch_batch(batch)).flatten()
+    }
+
+    fn start_all(&mut self) -> Option<Cmd<Msg>> {
+        match Scheduler::for_all(self.preview.codes()) {
+            Ok(scheduler) => self.begin_plan(scheduler, self.config.yes, None),
+            Err(error) => {
+                self.notify_error(error);
+                None
+            }
+        }
+    }
+
+    fn start_target(&mut self, id: CodeId) -> Option<Cmd<Msg>> {
+        match Scheduler::for_target(self.preview.codes(), id) {
+            Ok(scheduler) => self.begin_plan(scheduler, true, Some(id)),
+            Err(error) => {
+                self.notify_error(error);
+                None
+            }
+        }
+    }
+
+    fn execute(&mut self, id: CodeId) -> Option<Cmd<Msg>> {
+        if let Some(scheduler) = &self.scheduler {
+            if !scheduler.is_running(id) {
+                return None;
+            }
+            return self.execute_block(id).or_else(|| {
+                self.advance_scheduler(id, Some(1))
+                    .and_then(|r| self.handle_advance(r))
+            });
+        }
+        self.start_target(id)
+    }
+
+    fn advance_scheduler(&mut self, id: CodeId, exit_code: Option<i32>) -> Option<AdvanceResult> {
+        self.scheduler
+            .as_mut()
+            .map(|scheduler| scheduler.advance(id, exit_code))
+    }
+
+    fn handle_advance(&mut self, result: AdvanceResult) -> Option<Cmd<Msg>> {
+        match result {
+            AdvanceResult::NextBatch(batch) => {
+                self.flush_pending_states();
+                self.select_batch(&batch);
+                self.auto_run_plan
+                    .then(|| self.launch_batch(batch))
+                    .flatten()
+            }
+            AdvanceResult::Pending | AdvanceResult::Untracked => None,
+            AdvanceResult::Stopped(failure) => {
+                self.flush_pending_states();
+                self.scheduler = None;
+                self.plan_target = None;
+                self.notify_error(format!(
+                    "Block {} failed - stopping dependency chain",
+                    failure.block
+                ));
+                None
+            }
+            AdvanceResult::Done => {
+                self.flush_pending_states();
+                self.scheduler = None;
+                self.plan_target = None;
+                None
+            }
+        }
+    }
+
+    fn select_batch(&mut self, batch: &[CodeId]) {
+        if let Some(first) = batch.first() {
+            self.navigate_to_code(*first);
         }
     }
 
     fn sync_menu_running_state(&mut self) {
         self.menu.set_code_statuses(self.tasks.task_statuses());
-    }
-
-    fn run_next_pending(&mut self) -> Option<Cmd<Msg>> {
-        let mut next = None;
-        for &id in &self.auto_advance {
-            if self.tasks.get(id).is_none_or(|b| b.done()) {
-                next = Some(id);
-                break;
-            }
-        }
-        if let Some(id) = next {
-            self.auto_advance.retain(|&i| i != id);
-            self.navigate_to_code(id);
-            if self.config.yes {
-                self.execute(id)
-            } else {
-                None
-            }
-        } else {
-            None
-        }
     }
     /// Sends raw text to the currently selected PTY as if the user typed it.
     fn send_text_to_pty(&mut self, text: &str) {
@@ -510,8 +612,9 @@ impl crate::RunApp for App {
         Self::from_file_picker(root, files, config)
     }
 
-    fn run(self) -> Result<()> {
-        Ok(upmd_runtime::runtimes::tui::run(self)?)
+    fn run(self) -> Result<ExitCode> {
+        upmd_runtime::runtimes::tui::run(self)?;
+        Ok(ExitCode::SUCCESS)
     }
 }
 
@@ -546,15 +649,14 @@ impl Component for App {
                 None
             }
             Msg::Tick => {
-                // Kick off auto mode on first tick.
                 if !self.started {
                     self.started = true;
                     if self.config.block.is_some() && self.config.yes {
                         if let Some(id) = self.menu.selected() {
                             return self.execute(id);
                         }
-                    } else if !self.auto_advance.is_empty() {
-                        return self.run_next_pending();
+                    } else if self.config.all {
+                        return self.start_all();
                     }
                 }
                 if self.tasks.is_dirty() {
@@ -1364,11 +1466,11 @@ impl App {
             self.config.tui.inline_max_lines(),
             self.config.keymap.preview::<preview::Action>(),
         );
-        self.auto_advance = if self.config.all {
-            codes.iter().map(|c| c.id).collect()
-        } else {
-            Vec::new()
-        };
+        self.scheduler = None;
+        self.auto_run_plan = false;
+        self.plan_target = None;
+        self.pending_states.clear();
+        self.started = false;
 
         // Reapply --block selection when a new document is loaded after
         // startup (e.g. from the directory file picker).
@@ -1450,11 +1552,53 @@ impl App {
         }
     }
 
+    fn capture_state(&mut self, id: CodeId, capture_env: bool, capture_cwd: bool) {
+        if !capture_env && !capture_cwd {
+            return;
+        }
+        let task = self.tasks.get(id);
+        let env = capture_env.then(|| task?.captured_envs.clone()).flatten();
+        let cwd = capture_cwd
+            .then(|| task?.captured_cwd.as_deref().map(PathBuf::from))
+            .flatten();
+
+        if self.scheduler.is_none() {
+            if let Some(env) = env {
+                self.envs.merge_envs(env);
+            }
+            if let Some(cwd) = cwd {
+                self.last_cwd = Some(cwd);
+            }
+            return;
+        }
+
+        let entry = self.pending_states.entry(id).or_default();
+        if let Some(env) = env {
+            entry.0 = Some(env);
+        }
+        if let Some(cwd) = cwd {
+            entry.1 = Some(cwd);
+        }
+    }
+
+    fn flush_pending_states(&mut self) {
+        for (_, (env, cwd)) in std::mem::take(&mut self.pending_states) {
+            if let Some(env) = env {
+                self.envs.merge_envs(env);
+            }
+            if let Some(cwd) = cwd {
+                self.last_cwd = Some(cwd);
+            }
+        }
+    }
+
     fn handle_stream_update(
         &mut self,
         id: CodeId,
         stream: crate::pty::stream::Stream,
     ) -> Option<Cmd<Msg>> {
+        let capture_env = matches!(&stream, crate::pty::stream::Stream::Env(_));
+        let capture_cwd = matches!(&stream, crate::pty::stream::Stream::Cwd(_));
         let was_alternate_screen = self
             .tasks
             .get(id)
@@ -1478,21 +1622,7 @@ impl App {
             self.preview.prefer_status_gutter_for(id);
         }
 
-        if matches!(&stream, crate::pty::stream::Stream::Env(_)) {
-            if let Some(buf) = self.tasks.get(id) {
-                if let Some(envs) = &buf.captured_envs {
-                    self.envs.merge_envs(envs.clone());
-                }
-            }
-        }
-
-        if let crate::pty::stream::Stream::Cwd(_) = &stream {
-            if let Some(buf) = self.tasks.get(id) {
-                if let Some(cwd) = &buf.captured_cwd {
-                    self.last_cwd = Some(std::path::PathBuf::from(cwd));
-                }
-            }
-        }
+        self.capture_state(id, capture_env, capture_cwd);
 
         if force_rebuild {
             self.preview.rebuild_view(self.tasks.buffers());
@@ -1510,12 +1640,15 @@ impl App {
         }
         self.sync_menu_running_state();
 
-        // Auto-advance to next block in --all mode.
-        if matches!(&stream, crate::pty::stream::Stream::End) && !self.auto_advance.is_empty() {
-            self.run_next_pending()
-        } else {
-            None
+        if matches!(&stream, crate::pty::stream::Stream::End) {
+            let exit_code = self.tasks.get(id).and_then(|task| task.exit_code);
+            if exit_code != Some(0) {
+                self.pending_states.remove(&id);
+            }
+            let result = self.advance_scheduler(id, exit_code)?;
+            return self.handle_advance(result);
         }
+        None
     }
 
     /// Reloads the active file and replaces all document-derived state.
@@ -1917,7 +2050,8 @@ mod tests {
 
         app.reload();
 
-        assert_eq!(app.auto_advance, vec![1, 2]);
+        assert!(app.scheduler.is_none());
+        assert!(!app.started);
         assert_eq!(app.menu.selected(), Some(2));
     }
 
@@ -1927,12 +2061,12 @@ mod tests {
         let mut app = app_for_reload(Path::new("unused.md"), markdown, true, Some("2"));
         app.config.file = None;
         let selected_before = app.menu.selected();
-        let auto_advance_before = app.auto_advance.clone();
+        let had_plan = app.scheduler.is_some();
 
         app.reload();
 
         assert_eq!(app.menu.selected(), selected_before);
-        assert_eq!(app.auto_advance, auto_advance_before);
+        assert_eq!(app.scheduler.is_some(), had_plan);
         let notification = app.notification.as_ref().unwrap();
         assert_eq!(notification.kind, tui::notification::FlashKind::Error);
         assert_eq!(notification.text, "No file path in config, cannot reload");

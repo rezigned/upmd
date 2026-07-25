@@ -1,5 +1,5 @@
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use ratatui::{
@@ -36,6 +36,7 @@ pub struct Menu {
     model: Model,
     theme: Theme,
     code_statuses: HashMap<CodeId, MenuTaskStatus>,
+    code_dependencies: HashSet<CodeId>,
     mode: MenuMode,
     toc_items: Vec<(u8, String)>,
     nav_keymap: DerivedConfig<Navigation>,
@@ -82,10 +83,16 @@ impl Menu {
         if !items.is_empty() {
             state.select(Some(0));
         }
+        let code_dependencies = codes
+            .iter()
+            .filter(|code| !code.dependencies.is_empty())
+            .map(|code| code.id)
+            .collect();
         Self {
             model: Model { items, state },
             theme,
             code_statuses: HashMap::new(),
+            code_dependencies,
             mode: MenuMode::CodeBlocks,
             toc_items,
             nav_keymap,
@@ -303,6 +310,9 @@ impl Menu {
             _ => {}
         }
 
+        if self.code_dependencies.contains(&id) {
+            content.push_str(" ▸");
+        }
         if Some(i) == self.model.state.selected() {
             (content, self.theme.active_style())
         } else {

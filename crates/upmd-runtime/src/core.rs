@@ -474,16 +474,16 @@ impl<C: Component> Engine<C> {
             Some(bound) => bounded(bound),
             None => unbounded(),
         };
-        if let Some(cmd) = component.create() {
-            spawn_cmd(cmd, cmd_tx.clone(), msg_tx.clone());
-        }
+        let is_running = component
+            .create()
+            .is_none_or(|cmd| spawn_cmd(cmd, cmd_tx.clone(), msg_tx.clone()));
         Self {
             component,
             msg_tx,
             msg_rx,
             cmd_tx,
             cmd_rx,
-            is_running: true,
+            is_running,
             is_dirty: true,
         }
     }
@@ -553,30 +553,65 @@ impl<C: Component> Engine<C> {
 
     fn update(&mut self, msg: C::Msg) {
         self.is_dirty = true;
-        match self.component.update(msg) {
-            None => {}
-            Some(Cmd::Quit) => self.is_running = false,
-            Some(cmd) => spawn_cmd(cmd, self.cmd_tx.clone(), self.msg_tx.clone()),
+        if let Some(cmd) = self.component.update(msg) {
+            self.is_running = spawn_cmd(cmd, self.cmd_tx.clone(), self.msg_tx.clone());
         }
     }
 }
 
-fn spawn_cmd<Msg: Send + 'static>(cmd: Cmd<Msg>, low_tx: Sender<Msg>, high_tx: Sender<Msg>) {
+fn spawn_cmd<Msg: Send + 'static>(
+    cmd: Cmd<Msg>,
+    low_tx: Sender<Msg>,
+    high_tx: Sender<Msg>,
+) -> bool {
     match cmd {
-        Cmd::Quit => unreachable!("quit is handled before spawn_cmd is called"),
+        Cmd::Quit => false,
         Cmd::Stream(run) => {
             thread::spawn(move || run(low_tx));
+            true
         }
         Cmd::PriorityStream(run) => {
             thread::spawn(move || run(low_tx, high_tx));
+            true
         }
         Cmd::Task(run) => {
             thread::spawn(run);
+            true
         }
-        Cmd::Batch(cmds) => {
-            for cmd in cmds {
-                spawn_cmd(cmd, low_tx.clone(), high_tx.clone());
-            }
+        Cmd::Batch(cmds) => cmds
+            .into_iter()
+            .all(|cmd| spawn_cmd(cmd, low_tx.clone(), high_tx.clone())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct CreateCommand(Option<Cmd<()>>);
+
+    impl Component for CreateCommand {
+        type Msg = ();
+
+        fn create(&mut self) -> Option<Cmd<Self::Msg>> {
+            self.0.take()
         }
+
+        fn update(&mut self, (): ()) -> Option<Cmd<Self::Msg>> {
+            None
+        }
+    }
+
+    #[test]
+    fn quit_from_create_stops_the_engine() {
+        let engine = Engine::new(CreateCommand(Some(Cmd::quit())));
+        assert!(!engine.is_running);
+    }
+
+    #[test]
+    fn quit_inside_a_batch_stops_the_engine() {
+        let command = Cmd::Batch(vec![Cmd::task(|| {}), Cmd::quit()]);
+        let engine = Engine::new(CreateCommand(Some(command)));
+        assert!(!engine.is_running);
     }
 }

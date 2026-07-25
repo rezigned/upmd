@@ -106,6 +106,10 @@ impl Runtime {
             runtime.stop = Some(Box::new(|| {
                 let _ = crossterm::execute!(io::stdout(), crossterm::cursor::Show);
                 let _ = crossterm::terminal::disable_raw_mode();
+                #[cfg(target_os = "macos")]
+                unsafe {
+                    libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH);
+                }
             }));
         }
 

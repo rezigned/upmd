@@ -1,8 +1,10 @@
 use std::{
     cell::{Cell, RefCell},
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     io::{self, Write},
     path::PathBuf,
+    process::ExitCode,
+    rc::Rc,
 };
 
 use upmd_runtime::{
@@ -18,6 +20,7 @@ use crate::{
     },
     apps::exec,
     apps::navigation::Navigation,
+    apps::scheduler::{AdvanceResult, Scheduler},
     apps::task,
     apps::theme::{ansi_bg, ansi_fg, ansi_style, Theme},
     pty::process::Size,
@@ -38,13 +41,10 @@ pub struct App {
     theme: Theme,
     keymap: DerivedConfig<Action>,
     nav_keymap: DerivedConfig<Navigation>,
-    /// Advance to the next block after each completes (--all).
-    auto_advance: Vec<CodeId>,
-    /// Captured environment variables, seeded from the parent process and
-    /// updated incrementally as each code block runs.
+    scheduler: Option<Scheduler>,
+    auto_run_plan: bool,
+    plan_target: Option<CodeId>,
     envs: Envs,
-    /// Captured working directory, seeded from the parent process and
-    /// updated incrementally as each code block runs.
     cwd: PathBuf,
     /// Lines written by the last render pass. Used to emit a move-up/clear
     /// escape sequence so the next render replaces the card in-place.
@@ -53,10 +53,10 @@ pub struct App {
     /// execution output on screen. Set after execution completes, cleared
     /// after one render cycle.
     reset_anchor: Cell<bool>,
-    /// When set, the app starts in file-picker mode and transitions to
-    /// code-block mode after the user selects a file.
     picker: Option<crate::apps::picker::PickerState>,
     picker_keymap: DerivedConfig<crate::apps::picker::PickerAction>,
+    pending_states: BTreeMap<CodeId, (Option<Envs>, Option<PathBuf>)>,
+    failed: Rc<Cell<bool>>,
 }
 
 #[derive(Clone, KeyMap, Debug, PartialEq, Eq, Hash)]
@@ -89,11 +89,7 @@ impl App {
             None => 0,
         };
 
-        let auto_advance = if config.all {
-            codes.iter().map(|c| c.id).collect()
-        } else {
-            Vec::new()
-        };
+        let failed = Rc::new(Cell::new(false));
 
         let keymap: DerivedConfig<Action> = config.keymap.cli::<Action>();
 
@@ -113,13 +109,17 @@ impl App {
             theme: config.theme.clone(),
             keymap,
             nav_keymap: config.keymap.cli::<Navigation>(),
-            auto_advance,
+            scheduler: None,
+            auto_run_plan: false,
+            plan_target: None,
             envs,
             cwd,
             prev_lines: Cell::new(0),
             reset_anchor: Cell::new(false),
             picker: None,
             picker_keymap: config.keymap.file_picker(),
+            pending_states: BTreeMap::new(),
+            failed,
         }
     }
 
@@ -164,43 +164,104 @@ impl App {
             }
             None => 0,
         };
-        self.auto_advance = if self.config.all {
-            self.codes.iter().map(|c| c.id).collect()
-        } else {
-            Vec::new()
-        };
+        self.scheduler = None;
+        self.auto_run_plan = false;
+        self.plan_target = None;
         self.outputs.borrow_mut().clear();
         self.prev_lines.set(0);
         self.reset_anchor.set(false);
+        self.pending_states.clear();
     }
 
-    fn auto_run_selected(&mut self) -> Option<Cmd<Msg>> {
-        let id = self.codes.get(self.selected)?.id;
-        self.execute(id)
+    fn launch_batch(&mut self, batch: Vec<CodeId>) -> Option<Cmd<Msg>> {
+        let mut commands = Vec::new();
+        let mut completed = None;
+
+        for id in batch {
+            let already_ran = self.plan_target != Some(id)
+                && self
+                    .outputs
+                    .borrow()
+                    .get(&id)
+                    .is_some_and(|task| task.exit_code == Some(0));
+            if already_ran {
+                completed = self.advance_scheduler(id, Some(0));
+            } else if let Some(command) = self.execute_block(id) {
+                commands.push(command);
+            } else {
+                completed = self.advance_scheduler(id, Some(1));
+            }
+        }
+
+        if let Some(result) = completed {
+            if let Some(command) = self.handle_advance(result) {
+                commands.push(command);
+            }
+        }
+
+        match commands.len() {
+            0 => None,
+            1 => commands.pop(),
+            _ => Some(Cmd::Batch(commands)),
+        }
     }
 
-    fn execute(&mut self, id: CodeId) -> Option<Cmd<Msg>> {
-        let code = self.codes.iter().find(|c| c.id == id)?;
+    fn begin_plan(
+        &mut self,
+        mut scheduler: Scheduler,
+        auto_run: bool,
+        target: Option<CodeId>,
+    ) -> Option<Cmd<Msg>> {
+        let Some(batch) = scheduler.start() else {
+            return self.config.yes.then(Cmd::quit);
+        };
+        self.scheduler = Some(scheduler);
+        self.auto_run_plan = auto_run;
+        self.plan_target = target;
+        self.select_batch(&batch);
+        auto_run.then(|| self.launch_batch(batch)).flatten()
+    }
 
+    fn start_all(&mut self) -> Option<Cmd<Msg>> {
+        match Scheduler::for_all(&self.codes) {
+            Ok(scheduler) => self.begin_plan(scheduler, self.config.yes, None),
+            Err(error) => self.plan_error(error),
+        }
+    }
+
+    fn start_target(&mut self, id: CodeId) -> Option<Cmd<Msg>> {
+        match Scheduler::for_target(&self.codes, id) {
+            Ok(scheduler) => self.begin_plan(scheduler, true, Some(id)),
+            Err(error) => self.plan_error(error),
+        }
+    }
+
+    fn plan_error(&self, error: String) -> Option<Cmd<Msg>> {
+        eprintln!("{error}");
+        if self.config.yes {
+            self.failed.set(true);
+            Some(Cmd::quit())
+        } else {
+            None
+        }
+    }
+
+    fn execute_block(&mut self, id: CodeId) -> Option<Cmd<Msg>> {
+        let code = self.codes.iter().find(|code| code.id == id)?;
         let (cols, rows) =
             crossterm::terminal::size().unwrap_or((PTY_DEFAULT_COLS, PTY_DEFAULT_ROWS));
-        // Limit PTY size to leave room for our UI and prevent scrolling issues
         let pty_rows = rows
             .saturating_sub(CLI_PTY_ROW_OVERHEAD)
             .max(CLI_PTY_MIN_ROWS);
         let pty_cols = cols
             .saturating_sub(CLI_PTY_COL_OVERHEAD)
             .max(CLI_PTY_MIN_COLS);
-
         let size = Size::from((pty_cols, pty_rows));
         let mut outputs = self.outputs.borrow_mut();
         let state = outputs
             .entry(id)
             .or_insert_with(|| task::Task::new(pty_cols, pty_rows, 1024));
-
-        // Pass the accumulated env/cwd so state capture from prior blocks
-        // is visible to later blocks in the same session.
-        exec::run_code(
+        let command = exec::run_code(
             code,
             size,
             self.envs.clone(),
@@ -209,29 +270,104 @@ impl App {
             state,
             Some(self.cwd.clone()),
         )
-        .map(|rx| exec::stream_rx(id, rx, Msg::StreamUpdate))
+        .map(|receiver| exec::stream_rx(id, receiver, Msg::StreamUpdate));
+        drop(outputs);
+
+        if command.is_none() {
+            eprintln!("Block {id} failed to start");
+        }
+        command
+    }
+
+    fn execute(&mut self, id: CodeId) -> Option<Cmd<Msg>> {
+        if let Some(scheduler) = &self.scheduler {
+            if !scheduler.is_running(id) {
+                return None;
+            }
+            return self.execute_block(id).or_else(|| {
+                self.advance_scheduler(id, Some(1))
+                    .and_then(|r| self.handle_advance(r))
+            });
+        }
+        self.start_target(id)
+    }
+
+    fn advance_scheduler(&mut self, id: CodeId, exit_code: Option<i32>) -> Option<AdvanceResult> {
+        self.scheduler
+            .as_mut()
+            .map(|scheduler| scheduler.advance(id, exit_code))
+    }
+
+    fn handle_advance(&mut self, result: AdvanceResult) -> Option<Cmd<Msg>> {
+        match result {
+            AdvanceResult::NextBatch(batch) => {
+                self.flush_pending_states();
+                self.select_batch(&batch);
+                self.auto_run_plan
+                    .then(|| self.launch_batch(batch))
+                    .flatten()
+            }
+            AdvanceResult::Pending | AdvanceResult::Untracked => None,
+            AdvanceResult::Stopped(failure) => {
+                self.flush_pending_states();
+                self.scheduler = None;
+                self.plan_target = None;
+                eprintln!("Block {} failed - stopping dependency chain", failure.block);
+                if self.config.yes {
+                    self.failed.set(true);
+                    Some(Cmd::quit())
+                } else {
+                    None
+                }
+            }
+            AdvanceResult::Done => {
+                self.flush_pending_states();
+                let failed = self
+                    .scheduler
+                    .take()
+                    .is_some_and(|scheduler| scheduler.has_failures());
+                self.plan_target = None;
+                if self.config.yes {
+                    self.failed.set(failed);
+                    Some(Cmd::quit())
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    fn select_batch(&mut self, batch: &[CodeId]) {
+        if let Some(first) = batch.first() {
+            if let Some(index) = self.codes.iter().position(|code| code.id == *first) {
+                self.selected = index;
+            }
+        }
     }
 
     fn handle_stream_update(&mut self, id: CodeId, stream: Stream) -> Option<Cmd<Msg>> {
-        // Pre-classify the stream so we can inspect by reference before moving
-        // it into `exec::handle_stream`.
         let is_env = matches!(stream, Stream::Env(_));
         let is_cwd = matches!(stream, Stream::Cwd(_));
         let is_end = matches!(stream, Stream::End);
-        let is_done = matches!(stream, Stream::End | Stream::Exit(_));
 
         self.apply_stream_to_output(id, &stream);
         self.apply_captured_state(id, is_env, is_cwd);
 
-        // Execution finished. Reset the anchor so the next card renders
-        // below this block's output rather than overwriting it.
-        if is_done {
+        if matches!(stream, Stream::End | Stream::Exit(_)) {
             self.reset_anchor.set(true);
         }
 
-        // On completion, auto-advance or quit.
-        if is_end && self.config.yes {
-            return self.maybe_auto_advance(id);
+        if is_end {
+            let exit_code = self
+                .outputs
+                .borrow()
+                .get(&id)
+                .and_then(|task| task.exit_code);
+            if exit_code != Some(0) {
+                self.pending_states.remove(&id);
+            }
+            let result = self.advance_scheduler(id, exit_code)?;
+            return self.handle_advance(result);
         }
         None
     }
@@ -283,48 +419,47 @@ impl App {
         }
     }
 
-    /// Merges captured environment variables and cwd from a block into the
-    /// session-wide state so later blocks inherit them.
     fn apply_captured_state(&mut self, id: CodeId, is_env: bool, is_cwd: bool) {
-        if is_env {
-            let outputs = self.outputs.borrow();
-            if let Some(state) = outputs.get(&id) {
-                if let Some(captured) = &state.captured_envs {
-                    exec::merge_envs(&mut self.envs, captured);
-                }
-            }
+        if !is_env && !is_cwd {
+            return;
         }
-        if is_cwd {
-            let outputs = self.outputs.borrow();
-            if let Some(state) = outputs.get(&id) {
-                if let Some(captured) = &state.captured_cwd {
-                    self.cwd = PathBuf::from(captured);
-                }
+        let outputs = self.outputs.borrow();
+        let env = is_env
+            .then(|| outputs.get(&id)?.captured_envs.clone())
+            .flatten();
+        let cwd = is_cwd
+            .then(|| outputs.get(&id)?.captured_cwd.clone())
+            .flatten();
+        drop(outputs);
+
+        if self.scheduler.is_none() {
+            if let Some(captured) = env {
+                exec::merge_envs(&mut self.envs, &captured);
             }
+            if let Some(captured) = cwd {
+                self.cwd = PathBuf::from(captured);
+            }
+            return;
+        }
+
+        let entry = self.pending_states.entry(id).or_default();
+        if let Some(env) = env {
+            entry.0 = Some(env);
+        }
+        if let Some(cwd) = cwd {
+            entry.1 = Some(PathBuf::from(cwd));
         }
     }
 
-    /// Auto-advances to the next pending block when `--yes` is enabled, or
-    /// quits when all blocks are finished.
-    fn maybe_auto_advance(&mut self, id: CodeId) -> Option<Cmd<Msg>> {
-        if self.auto_advance.is_empty() {
-            // Single block mode (--block --yes or --yes alone): quit when done.
-            return Some(Cmd::quit());
-        }
-        if let Some(pos) = self.auto_advance.iter().position(|&i| i == id) {
-            let next_pos = pos + 1;
-            if next_pos < self.auto_advance.len() {
-                let next = self.auto_advance[next_pos];
-                if let Some(idx) = self.codes.iter().position(|c| c.id == next) {
-                    self.selected = idx;
-                }
-                return self.execute(next);
-            } else {
-                // All blocks done. Auto-quit.
-                return Some(Cmd::quit());
+    fn flush_pending_states(&mut self) {
+        for (_, (env, cwd)) in std::mem::take(&mut self.pending_states) {
+            if let Some(captured) = env {
+                exec::merge_envs(&mut self.envs, &captured);
+            }
+            if let Some(captured) = cwd {
+                self.cwd = captured;
             }
         }
-        None
     }
 
     /// Handles picker actions when in file-picker mode.
@@ -385,7 +520,11 @@ impl App {
             _ => {}
         }
         if self.config.yes {
-            self.auto_run_selected()
+            if let Some(id) = self.codes.get(self.selected).map(|c| c.id) {
+                self.execute(id)
+            } else {
+                None
+            }
         } else {
             None
         }
@@ -406,8 +545,14 @@ impl crate::RunApp for App {
         Self::from_file_picker(files, config)
     }
 
-    fn run(self) -> Result<()> {
-        Ok(upmd_runtime::runtimes::cli::run(self)?)
+    fn run(self) -> Result<ExitCode> {
+        let failed = Rc::clone(&self.failed);
+        upmd_runtime::runtimes::cli::run(self)?;
+        Ok(if failed.get() {
+            ExitCode::FAILURE
+        } else {
+            ExitCode::SUCCESS
+        })
     }
 }
 
@@ -419,10 +564,10 @@ impl Component for App {
             return None;
         }
         if self.config.block.is_some() && self.config.yes {
-            self.auto_run_selected()
-        } else if !self.auto_advance.is_empty() && self.config.yes {
-            let first = self.auto_advance[0];
-            self.execute(first)
+            let id = self.codes.get(self.selected)?.id;
+            self.execute(id)
+        } else if self.config.all {
+            self.start_all()
         } else {
             None
         }
@@ -619,14 +764,30 @@ impl Output for App {
         let reset = "\x1b[0m";
 
         writeln!(counter)?;
+        let deps_str = match code.dependencies.groups() {
+            Ok([]) => String::new(),
+            Ok(groups) => {
+                let muted = ansi_fg(self.theme.muted);
+                let names = groups
+                    .iter()
+                    .flatten()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>();
+                format!(" {muted}→ {}{reset}", names.join(", "))
+            }
+            Err(_) => {
+                let muted = ansi_fg(self.theme.muted);
+                format!(" {muted}→ invalid deps{reset}")
+            }
+        };
         write!(
             counter,
-            "{info_bg}{info_fg} [{active_fg}{}{reset}{info_bg}{info_fg}/{}] ",
+            "{info_bg}{info_fg} [{active_fg}{}{reset}{info_bg}{info_fg}/{}]",
             index + 1,
             total
         )?;
         let language = upmd_runner::find_language(&code.language);
-        writeln!(counter, "{info_fg} {} {reset}", language.name)?;
+        writeln!(counter, "{info_fg} {}{reset}{deps_str}", language.name)?;
         writeln!(counter)?;
 
         // Code Preview
@@ -1045,7 +1206,7 @@ print("2")
     }
 
     #[test]
-    fn test_empty_codes_auto_run_does_not_panic() {
+    fn test_empty_all_plan_does_not_panic() {
         let mut app = App::new(
             upmd_parser::Document {
                 nodes: vec![],
@@ -1055,11 +1216,7 @@ print("2")
             },
             make_config(),
         );
-        let result = app.auto_run_selected();
-        assert!(
-            result.is_none(),
-            "auto_run_selected with no codes returns None"
-        );
+        assert!(app.start_all().is_none());
     }
 
     #[test]

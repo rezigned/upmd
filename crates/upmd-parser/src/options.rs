@@ -28,39 +28,28 @@ fn attrs_regex() -> &'static Regex {
     &RE
 }
 
-fn split_language_attrs(input: &str) -> (&str, &str) {
-    let input = input.trim();
-    let lang_end = input.find('[').unwrap_or(input.len());
-    (input[..lang_end].trim(), input[lang_end..].trim())
-}
-
-pub(crate) fn parse_language(input: &str) -> String {
-    let (language, _) = split_language_attrs(input);
-    language.to_string()
-}
-
-/// Parses the language name and bracketed attributes from a code fence info string.
-///
-/// The language is everything before the first `[`, returned as-is (trimmed).
-/// No character restrictions are imposed. Any markdown fence info string is valid.
-///
-/// Attributes are `key:value` pairs inside `[...]`, comma-separated.
+/// Parses the full fence info string into Options.
 ///
 /// ````markdown
 /// ```sh [name:build, bin:zsh]
 /// echo build
 /// ```
 /// ````
-///
-/// Returns an error when the attribute section contains unrecognized text
-/// that is not part of any key:value pair, bracket, comma, or whitespace.
 pub fn parse(input: &str) -> Result<Options, String> {
-    let (language, attrs_input) = split_language_attrs(input);
+    let (language, attrs_input) = split_language(input);
     let attrs = parse_attrs(attrs_input)?;
     Ok(Options {
         language: language.to_string(),
         attrs,
     })
+}
+
+pub(crate) fn with_language(info: &str) -> Options {
+    let (language, _) = split_language(info);
+    Options {
+        language: language.to_string(),
+        attrs: HashMap::new(),
+    }
 }
 
 /// Parses `key:value` pairs from the bracketed attribute section.
@@ -103,6 +92,43 @@ fn parse_attrs(input: &str) -> Result<HashMap<String, String>, String> {
     }
 
     Ok(map)
+}
+
+pub(crate) fn parse_dependencies(input: Option<&str>) -> Result<Vec<Vec<String>>, String> {
+    let Some(input) = input else {
+        return Ok(Vec::new());
+    };
+    if input.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    input
+        .split(',')
+        .map(|group| {
+            group
+                .split('|')
+                .map(str::trim)
+                .map(|name| {
+                    if name.is_empty() {
+                        Err("empty name in deps".to_string())
+                    } else if name.chars().any(char::is_whitespace) {
+                        Err(format!("dependency name contains whitespace: {name:?}"))
+                    } else {
+                        Ok(name.to_string())
+                    }
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Splits a fence info string into (language, attrs_section).
+///
+/// The language is everything before the first `[`. Both halves are trimmed.
+fn split_language(input: &str) -> (&str, &str) {
+    let input = input.trim();
+    let lang_end = input.find('[').unwrap_or(input.len());
+    (input[..lang_end].trim(), input[lang_end..].trim())
 }
 
 #[cfg(test)]
@@ -234,5 +260,29 @@ mod tests {
             err.contains("BAD"),
             "Expected error mentioning BAD, got: {err}"
         );
+    }
+
+    #[test]
+    fn test_parse_dependencies() {
+        for (input, expected) in [
+            (None, vec![]),
+            (Some(""), vec![]),
+            (Some("setup"), vec![vec!["setup"]]),
+            (Some("setup, build"), vec![vec!["setup"], vec!["build"]]),
+            (
+                Some("setup, build | lint, test"),
+                vec![vec!["setup"], vec!["build", "lint"], vec!["test"]],
+            ),
+            (
+                Some("  setup , build | lint  "),
+                vec![vec!["setup"], vec!["build", "lint"]],
+            ),
+        ] {
+            assert_eq!(parse_dependencies(input).unwrap(), expected);
+        }
+
+        for input in ["setup, , build", "setup || build", "setup build"] {
+            assert!(parse_dependencies(Some(input)).is_err(), "{input:?}");
+        }
     }
 }

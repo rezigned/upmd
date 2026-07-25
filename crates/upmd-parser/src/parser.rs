@@ -183,9 +183,7 @@ impl<'a> Parser<'a> {
         if content.trim().is_empty() {
             return None;
         }
-        let language = options::parse_language(&opts);
-        let mut options = options::parse(&opts).unwrap_or_default();
-        options.language = language;
+        let options = options::parse(&opts).unwrap_or_else(|_| options::with_language(&opts));
         let code = Code::new(self.code_id_counter, content, options);
         self.code_id_counter += 1;
         let code_id = code.id;
@@ -418,7 +416,7 @@ mod tests {
         let doc = Cmark::new().parse(text);
         let nodes = &doc.nodes;
         assert_eq!(nodes.len(), 3);
-        if let Node::Code(code_id) = &nodes[2] {
+        if let Node::Code(_) = &nodes[2] {
             let c = code_from_node(&doc, &nodes[2]);
             assert_eq!(c.content, "echo 1");
             assert_eq!(c.language, "bash");
@@ -433,7 +431,7 @@ mod tests {
         let doc = Cmark::new().parse(text);
         let nodes = &doc.nodes;
         assert_eq!(nodes.len(), 1);
-        if let Node::Code(code_id) = &nodes[0] {
+        if let Node::Code(_) = &nodes[0] {
             let c = code_from_node(&doc, &nodes[0]);
             assert_eq!(c.name, "setup");
             assert_eq!(c.language, "bash");
@@ -446,7 +444,7 @@ mod tests {
     fn test_parse_code_block_without_name_is_empty() {
         let doc = Cmark::new().parse("```bash\necho \"hello\"\n```\n");
         let nodes = &doc.nodes;
-        if let Node::Code(code_id) = &nodes[0] {
+        if let Node::Code(_) = &nodes[0] {
             let c = code_from_node(&doc, &nodes[0]);
             assert!(c.name.is_empty());
         } else {
@@ -462,13 +460,13 @@ mod tests {
         let doc = Cmark::new().parse(text);
         let nodes = &doc.nodes;
         assert_eq!(nodes.len(), 3);
-        if let Node::Code(code_id) = &nodes[1] {
+        if let Node::Code(_) = &nodes[1] {
             let c = code_from_node(&doc, &nodes[1]);
             assert_eq!(c.content, "echo first");
         } else {
             panic!();
         }
-        if let Node::Code(code_id) = &nodes[2] {
+        if let Node::Code(_) = &nodes[2] {
             let c = code_from_node(&doc, &nodes[2]);
             assert_eq!(c.content, "echo second");
         } else {
@@ -579,7 +577,7 @@ mod tests {
         let nodes = &doc.nodes;
         assert_eq!(nodes.len(), 2);
         match &nodes[1] {
-            Node::Code(code_id) => {
+            Node::Code(_) => {
                 let c = code_from_node(&doc, &nodes[1]);
                 assert_eq!(c.content, "echo hello\nworld");
             }
@@ -594,7 +592,7 @@ mod tests {
         let nodes = &doc.nodes;
         assert_eq!(nodes.len(), 1);
         match &nodes[0] {
-            Node::Code(code_id) => {
+            Node::Code(_) => {
                 let c = code_from_node(&doc, &nodes[0]);
                 assert_eq!(c.language, "");
                 assert_eq!(c.content, "just code\nno lang");
@@ -610,7 +608,7 @@ mod tests {
         let nodes = &doc.nodes;
         assert_eq!(nodes.len(), 2);
         match &nodes[0] {
-            Node::Code(code_id) => {
+            Node::Code(_) => {
                 let c = code_from_node(&doc, &nodes[0]);
                 assert_eq!(c.language, "rust");
                 assert_eq!(c.content, "fn main() {}");
@@ -618,7 +616,7 @@ mod tests {
             _ => panic!(),
         }
         match &nodes[1] {
-            Node::Code(code_id) => {
+            Node::Code(_) => {
                 let c = code_from_node(&doc, &nodes[1]);
                 assert_eq!(c.language, "");
                 assert_eq!(c.content, "some indented code");
