@@ -18,7 +18,9 @@ use unicode_width::UnicodeWidthChar;
 use crate::apps::config::PREVIEW_FRAME_OVERHEAD;
 use crate::apps::theme::Theme;
 use crate::runner::CodeId;
-use upmd_parser::nodes::{Alignment, Code, ListKind, Table as MarkdownTable, TaskStatus};
+use upmd_parser::nodes::{
+    Alignment, Code, Dependencies, DepsToken, ListKind, Table as MarkdownTable, TaskStatus,
+};
 
 use crate::apps::task::Task;
 
@@ -972,13 +974,25 @@ impl<'a> MarkdownRenderer<'a> {
         let language = upmd_runner::find_language(&code.language);
         let info_style = self.theme.code_info_style();
 
-        // Left: "{id}" or "{id} {name}"
+        // Left: "{id}" or "{id} {name}" with optional deps bracket.
         let left_text = if code.name.is_empty() {
             format!("{}", code.id)
         } else {
             format!("{} {}", code.id, code.name)
         };
         let mut left = vec![(left_text, info_style)];
+
+        if matches!(code.dependencies, Dependencies::Invalid(_)) {
+            left.push((" [invalid]".to_string(), info_style.fg(self.theme.error)));
+        } else {
+            for token in code.dependencies.segments() {
+                let style = match token {
+                    DepsToken::Punct(_) => info_style.patch(self.theme.muted_style()),
+                    DepsToken::Name(_) => info_style,
+                };
+                left.push((token.text().to_string(), style));
+            }
+        }
 
         // Status symbol with its own color, appended to left spans.
         if is_done {

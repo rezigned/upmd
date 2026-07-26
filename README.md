@@ -193,6 +193,13 @@ echo "verified"
 ```
 ````
 
+```mermaid
+flowchart LR
+    build --> test
+    lint --> test
+    test --> verify
+```
+
 If a prerequisite fails, its dependents are skipped. Under `--all`, unrelated
 blocks still run and the command exits non-zero.
 

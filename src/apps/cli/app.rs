@@ -42,8 +42,6 @@ pub struct App {
     keymap: DerivedConfig<Action>,
     nav_keymap: DerivedConfig<Navigation>,
     scheduler: Option<Scheduler>,
-    auto_run_plan: bool,
-    plan_target: Option<CodeId>,
     envs: Envs,
     cwd: PathBuf,
     /// Lines written by the last render pass. Used to emit a move-up/clear
@@ -110,8 +108,6 @@ impl App {
             keymap,
             nav_keymap: config.keymap.cli::<Navigation>(),
             scheduler: None,
-            auto_run_plan: false,
-            plan_target: None,
             envs,
             cwd,
             prev_lines: Cell::new(0),
@@ -165,8 +161,6 @@ impl App {
             None => 0,
         };
         self.scheduler = None;
-        self.auto_run_plan = false;
-        self.plan_target = None;
         self.outputs.borrow_mut().clear();
         self.prev_lines.set(0);
         self.reset_anchor.set(false);
@@ -178,13 +172,16 @@ impl App {
         let mut completed = None;
 
         for id in batch {
-            let already_ran = self.plan_target != Some(id)
-                && self
-                    .outputs
-                    .borrow()
-                    .get(&id)
-                    .is_some_and(|task| task.exit_code == Some(0));
-            if already_ran {
+            let succeeded = self
+                .outputs
+                .borrow()
+                .get(&id)
+                .is_some_and(|task| task.exit_code == Some(0));
+            let should_execute = self
+                .scheduler
+                .as_ref()
+                .is_none_or(|scheduler| scheduler.should_execute(id, succeeded));
+            if !should_execute {
                 completed = self.advance_scheduler(id, Some(0));
             } else if let Some(command) = self.execute_block(id) {
                 commands.push(command);
@@ -206,32 +203,26 @@ impl App {
         }
     }
 
-    fn begin_plan(
-        &mut self,
-        mut scheduler: Scheduler,
-        auto_run: bool,
-        target: Option<CodeId>,
-    ) -> Option<Cmd<Msg>> {
+    fn start_plan(&mut self, mut scheduler: Scheduler) -> Option<Cmd<Msg>> {
+        let auto_run = scheduler.auto_run();
         let Some(batch) = scheduler.start() else {
-            return self.config.yes.then(Cmd::quit);
+            return auto_run.then(Cmd::quit);
         };
         self.scheduler = Some(scheduler);
-        self.auto_run_plan = auto_run;
-        self.plan_target = target;
         self.select_batch(&batch);
         auto_run.then(|| self.launch_batch(batch)).flatten()
     }
 
     fn start_all(&mut self) -> Option<Cmd<Msg>> {
-        match Scheduler::for_all(&self.codes) {
-            Ok(scheduler) => self.begin_plan(scheduler, self.config.yes, None),
+        match Scheduler::for_all(&self.codes, self.config.yes) {
+            Ok(scheduler) => self.start_plan(scheduler),
             Err(error) => self.plan_error(error),
         }
     }
 
     fn start_target(&mut self, id: CodeId) -> Option<Cmd<Msg>> {
         match Scheduler::for_target(&self.codes, id) {
-            Ok(scheduler) => self.begin_plan(scheduler, true, Some(id)),
+            Ok(scheduler) => self.start_plan(scheduler),
             Err(error) => self.plan_error(error),
         }
     }
@@ -303,7 +294,9 @@ impl App {
             AdvanceResult::NextBatch(batch) => {
                 self.flush_pending_states();
                 self.select_batch(&batch);
-                self.auto_run_plan
+                self.scheduler
+                    .as_ref()
+                    .is_some_and(Scheduler::auto_run)
                     .then(|| self.launch_batch(batch))
                     .flatten()
             }
@@ -311,7 +304,6 @@ impl App {
             AdvanceResult::Stopped(failure) => {
                 self.flush_pending_states();
                 self.scheduler = None;
-                self.plan_target = None;
                 eprintln!("Block {} failed - stopping dependency chain", failure.block);
                 if self.config.yes {
                     self.failed.set(true);
@@ -320,13 +312,9 @@ impl App {
                     None
                 }
             }
-            AdvanceResult::Done => {
+            AdvanceResult::Finished { failed } => {
                 self.flush_pending_states();
-                let failed = self
-                    .scheduler
-                    .take()
-                    .is_some_and(|scheduler| scheduler.has_failures());
-                self.plan_target = None;
+                self.scheduler = None;
                 if self.config.yes {
                     self.failed.set(failed);
                     Some(Cmd::quit())
@@ -764,30 +752,24 @@ impl Output for App {
         let reset = "\x1b[0m";
 
         writeln!(counter)?;
-        let deps_str = match code.dependencies.groups() {
-            Ok([]) => String::new(),
-            Ok(groups) => {
-                let muted = ansi_fg(self.theme.muted);
-                let names = groups
-                    .iter()
-                    .flatten()
-                    .map(String::as_str)
-                    .collect::<Vec<_>>();
-                format!(" {muted}→ {}{reset}", names.join(", "))
-            }
-            Err(_) => {
-                let muted = ansi_fg(self.theme.muted);
-                format!(" {muted}→ invalid deps{reset}")
-            }
+        let deps_display = format!("{}", code.dependencies);
+        let deps_str = if deps_display.is_empty() {
+            String::new()
+        } else {
+            let muted = ansi_fg(self.theme.muted);
+            format!(" {muted}{deps_display}")
         };
+        // Note: `deps_display` has no trailing reset so `info_bg` stays active.
+        // The `{reset}` in the write below closes all styles.
+        let language = upmd_runner::find_language(&code.language);
         write!(
             counter,
-            "{info_bg}{info_fg} [{active_fg}{}{reset}{info_bg}{info_fg}/{}]",
-            index + 1,
-            total
+            "{info_bg}{info_fg} [{active_fg}{idx}{reset}{info_bg}{info_fg}/{total}]{info_fg} {lang}{deps}{reset}",
+            idx = index + 1,
+            total = total,
+            lang = language.name,
+            deps = deps_str,
         )?;
-        let language = upmd_runner::find_language(&code.language);
-        writeln!(counter, "{info_fg} {}{reset}{deps_str}", language.name)?;
         writeln!(counter)?;
 
         // Code Preview

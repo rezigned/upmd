@@ -2695,7 +2695,6 @@ version = "0.1.0"
 dependencies = [
  "crossterm",
  "flume",
- "libc",
  "ratatui",
 ]
 

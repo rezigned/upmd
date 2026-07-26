@@ -77,8 +77,6 @@ pub struct App {
     themes: Option<themes::ThemeSelector>,
     output: tui::output::Output,
     scheduler: Option<Scheduler>,
-    auto_run_plan: bool,
-    plan_target: Option<CodeId>,
     pending_states: BTreeMap<CodeId, (Option<config::Envs>, Option<PathBuf>)>,
     last_cwd: Option<PathBuf>,
     started: bool,
@@ -228,8 +226,6 @@ impl App {
             themes: None,
             output: tui::output::Output::new(config.keymap.output()),
             scheduler: None,
-            auto_run_plan: false,
-            plan_target: None,
             pending_states: BTreeMap::new(),
             last_cwd: None,
             notification: None,
@@ -341,12 +337,15 @@ impl App {
         let mut completed = None;
 
         for id in batch {
-            let already_ran = self.plan_target != Some(id)
-                && self
-                    .tasks
-                    .get(id)
-                    .is_some_and(|task| task.exit_code == Some(0));
-            if already_ran {
+            let succeeded = self
+                .tasks
+                .get(id)
+                .is_some_and(|task| task.exit_code == Some(0));
+            let should_execute = self
+                .scheduler
+                .as_ref()
+                .is_none_or(|scheduler| scheduler.should_execute(id, succeeded));
+            if !should_execute {
                 completed = self.advance_scheduler(id, Some(0));
             } else if let Some(command) = self.execute_block(id) {
                 commands.push(command);
@@ -368,23 +367,17 @@ impl App {
         }
     }
 
-    fn begin_plan(
-        &mut self,
-        mut scheduler: Scheduler,
-        auto_run: bool,
-        target: Option<CodeId>,
-    ) -> Option<Cmd<Msg>> {
+    fn start_plan(&mut self, mut scheduler: Scheduler) -> Option<Cmd<Msg>> {
+        let auto_run = scheduler.auto_run();
         let batch = scheduler.start()?;
         self.scheduler = Some(scheduler);
-        self.auto_run_plan = auto_run;
-        self.plan_target = target;
         self.select_batch(&batch);
         auto_run.then(|| self.launch_batch(batch)).flatten()
     }
 
     fn start_all(&mut self) -> Option<Cmd<Msg>> {
-        match Scheduler::for_all(self.preview.codes()) {
-            Ok(scheduler) => self.begin_plan(scheduler, self.config.yes, None),
+        match Scheduler::for_all(self.preview.codes(), self.config.yes) {
+            Ok(scheduler) => self.start_plan(scheduler),
             Err(error) => {
                 self.notify_error(error);
                 None
@@ -394,7 +387,7 @@ impl App {
 
     fn start_target(&mut self, id: CodeId) -> Option<Cmd<Msg>> {
         match Scheduler::for_target(self.preview.codes(), id) {
-            Ok(scheduler) => self.begin_plan(scheduler, true, Some(id)),
+            Ok(scheduler) => self.start_plan(scheduler),
             Err(error) => {
                 self.notify_error(error);
                 None
@@ -426,7 +419,9 @@ impl App {
             AdvanceResult::NextBatch(batch) => {
                 self.flush_pending_states();
                 self.select_batch(&batch);
-                self.auto_run_plan
+                self.scheduler
+                    .as_ref()
+                    .is_some_and(Scheduler::auto_run)
                     .then(|| self.launch_batch(batch))
                     .flatten()
             }
@@ -434,17 +429,15 @@ impl App {
             AdvanceResult::Stopped(failure) => {
                 self.flush_pending_states();
                 self.scheduler = None;
-                self.plan_target = None;
                 self.notify_error(format!(
                     "Block {} failed - stopping dependency chain",
                     failure.block
                 ));
                 None
             }
-            AdvanceResult::Done => {
+            AdvanceResult::Finished { .. } => {
                 self.flush_pending_states();
                 self.scheduler = None;
-                self.plan_target = None;
                 None
             }
         }
@@ -1467,8 +1460,6 @@ impl App {
             self.config.keymap.preview::<preview::Action>(),
         );
         self.scheduler = None;
-        self.auto_run_plan = false;
-        self.plan_target = None;
         self.pending_states.clear();
         self.started = false;
 

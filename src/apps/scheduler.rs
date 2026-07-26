@@ -2,27 +2,39 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use upmd_parser::{resolve_dependencies, Code, CodeId};
 
+/// Tracks a block that failed during execution.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BlockFailure {
     pub block: CodeId,
     pub exit_code: Option<i32>,
 }
 
+/// Result of advancing the scheduler past a completed block.
 #[derive(Debug, PartialEq, Eq)]
 pub enum AdvanceResult {
+    /// The next batch of blocks to run concurrently.
     NextBatch(Vec<CodeId>),
+    /// Blocks are still running in the current batch.
     Pending,
-    Done,
+    /// All blocks have finished.
+    Finished { failed: bool },
+    /// A failure occurred and policy is Stop; no more batches.
     Stopped(BlockFailure),
+    /// The given block was not being tracked by the scheduler.
     Untracked,
 }
 
+/// Whether the scheduler stops or continues after a failure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FailurePolicy {
     Continue,
     Stop,
 }
 
+/// Drives block execution in dependency order.
+///
+/// Produces batches of concurrent blocks.  A batch is a group of blocks whose
+/// dependencies are all satisfied and that have no dependency on each other.
 #[derive(Debug)]
 pub struct Scheduler {
     pending: VecDeque<Vec<CodeId>>,
@@ -31,10 +43,17 @@ pub struct Scheduler {
     dependents: HashMap<CodeId, Vec<CodeId>>,
     failure: Option<BlockFailure>,
     failure_policy: FailurePolicy,
+    auto_run: bool,
+    target: Option<CodeId>,
 }
 
 impl Scheduler {
-    pub fn for_all(codes: &[Code]) -> Result<Self, String> {
+    /// Creates a scheduler that runs _all_ blocks in order.
+    ///
+    /// Blocks with no dependencies run first, one at a time, preserving source
+    /// order.  Failed blocks skip their dependents but do not stop other blocks.
+    /// Set `auto_run` to start execution immediately after creation.
+    pub fn for_all(codes: &[Code], auto_run: bool) -> Result<Self, String> {
         let ids = codes.iter().map(|code| code.id).collect::<HashSet<_>>();
         let plan = build_plan(codes, &ids)?;
         let pending = plan
@@ -43,9 +62,20 @@ impl Scheduler {
             .flatten()
             .map(|id| vec![id])
             .collect();
-        Ok(Self::new(pending, plan.dependents, FailurePolicy::Continue))
+        Ok(Self::new(
+            pending,
+            plan.dependents,
+            FailurePolicy::Continue,
+            auto_run,
+            None,
+        ))
     }
 
+    /// Creates a scheduler that runs only the dependency chain of `target`.
+    ///
+    /// Blocks are grouped into batches: blocks in the same group run
+    /// concurrently, batches are sequential.  On failure, remaining batches are
+    /// cancelled and `Stopped` is returned.
     pub fn for_target(codes: &[Code], target: CodeId) -> Result<Self, String> {
         let ids = collect_dependencies(codes, target)?;
         let plan = build_plan(codes, &ids)?;
@@ -53,6 +83,8 @@ impl Scheduler {
             plan.layers.into(),
             plan.dependents,
             FailurePolicy::Stop,
+            true,
+            Some(target),
         ))
     }
 
@@ -60,6 +92,8 @@ impl Scheduler {
         pending: VecDeque<Vec<CodeId>>,
         dependents: HashMap<CodeId, Vec<CodeId>>,
         failure_policy: FailurePolicy,
+        auto_run: bool,
+        target: Option<CodeId>,
     ) -> Self {
         Self {
             pending,
@@ -67,10 +101,15 @@ impl Scheduler {
             blocked: HashSet::new(),
             dependents,
             failure: None,
+            auto_run,
+            target,
             failure_policy,
         }
     }
 
+    /// Returns the first batch and marks it running.
+    ///
+    /// Returns `None` if already started or no work remains.
     pub fn start(&mut self) -> Option<Vec<CodeId>> {
         if self.running.is_empty() {
             self.take_next_batch()
@@ -79,6 +118,11 @@ impl Scheduler {
         }
     }
 
+    /// Records completion of `block` and returns the next action.
+    ///
+    /// Call once per block when it finishes.  The caller provides `exit_code`:
+    /// `Some(0)` for success, `Some(n)` for failure, or `None` if the process
+    /// was externally killed.
     pub fn advance(&mut self, block: CodeId, exit_code: Option<i32>) -> AdvanceResult {
         if !self.running.remove(&block) {
             return AdvanceResult::Untracked;
@@ -103,18 +147,35 @@ impl Scheduler {
             }
         }
 
-        self.take_next_batch()
-            .map_or(AdvanceResult::Done, AdvanceResult::NextBatch)
+        self.take_next_batch().map_or_else(
+            || AdvanceResult::Finished {
+                failed: self.failure.is_some(),
+            },
+            AdvanceResult::NextBatch,
+        )
     }
 
-    pub fn has_failures(&self) -> bool {
-        self.failure.is_some()
+    /// Whether the scheduler should start running immediately.
+    pub fn auto_run(&self) -> bool {
+        self.auto_run
     }
 
+    /// Whether `block` should execute given the result of its dependencies.
+    ///
+    /// Returns `true` if dependencies failed (so this block should be skipped)
+    /// or if this is the target block (always runs regardless).
+    pub fn should_execute(&self, block: CodeId, succeeded: bool) -> bool {
+        !succeeded || self.target == Some(block)
+    }
+
+    /// Whether `block` is currently executing.
     pub fn is_running(&self, block: CodeId) -> bool {
         self.running.contains(&block)
     }
 
+    /// Pops the next non-empty batch that hasn't been blocked.
+    ///
+    /// Skips batches where all blocks were blocked by a failure.
     fn take_next_batch(&mut self) -> Option<Vec<CodeId>> {
         while let Some(mut batch) = self.pending.pop_front() {
             batch.retain(|id| !self.blocked.contains(id));
@@ -126,6 +187,11 @@ impl Scheduler {
         None
     }
 
+    /// Marks all transitive dependents of `failed` as blocked.
+    ///
+    /// A blocked block will be skipped when its batch reaches the front of the
+    /// queue.  If it is the last non-blocked block in its batch the entire batch
+    /// is skipped.
     fn block_dependents(&mut self, failed: CodeId) {
         let mut stack = vec![failed];
         while let Some(block) = stack.pop() {
@@ -138,11 +204,6 @@ impl Scheduler {
             }
         }
     }
-
-    #[cfg(test)]
-    fn batches(&self) -> Vec<Vec<CodeId>> {
-        self.pending.iter().cloned().collect()
-    }
 }
 
 struct Plan {
@@ -150,6 +211,7 @@ struct Plan {
     dependents: HashMap<CodeId, Vec<CodeId>>,
 }
 
+/// Walks the dependency tree of `target` and returns all reachable block IDs.
 fn collect_dependencies(codes: &[Code], target: CodeId) -> Result<HashSet<CodeId>, String> {
     if !codes.iter().any(|code| code.id == target) {
         return Err(format!("target block {target} not found"));
@@ -171,6 +233,10 @@ fn collect_dependencies(codes: &[Code], target: CodeId) -> Result<HashSet<CodeId
     Ok(selected)
 }
 
+/// Builds a topological layer plan from a selected subset of blocks.
+///
+/// Returns layers (batches of concurrent blocks) and the dependency edges for
+/// dependent-blocking on failure.  Errors on cycles.
 fn build_plan(codes: &[Code], selected: &HashSet<CodeId>) -> Result<Plan, String> {
     let positions = codes
         .iter()
@@ -242,11 +308,13 @@ fn build_plan(codes: &[Code], selected: &HashSet<CodeId>) -> Result<Plan, String
     Ok(Plan { layers, dependents })
 }
 
+/// Resolves the dependency names of `code` into block IDs.
 fn dependencies_for(codes: &[Code], code: &Code) -> Result<Vec<Vec<CodeId>>, String> {
     resolve_dependencies(codes, &code.dependencies)
         .map_err(|error| format!("block {}: {error}", code.id))
 }
 
+/// Adds a directed edge `from -> to` in the dependency graph.
 fn add_edge(
     from: CodeId,
     to: CodeId,
@@ -291,10 +359,24 @@ mod tests {
             code(5, "target", Some("setup, build | lint, test")),
         ];
 
-        let scheduler = Scheduler::for_target(&codes, 5).unwrap();
+        let mut scheduler = Scheduler::for_target(&codes, 5).unwrap();
+        assert_eq!(scheduler.start(), Some(vec![1]));
         assert_eq!(
-            scheduler.batches(),
-            vec![vec![1], vec![2, 3], vec![4], vec![5]]
+            scheduler.advance(1, Some(0)),
+            AdvanceResult::NextBatch(vec![2, 3])
+        );
+        assert_eq!(scheduler.advance(2, Some(0)), AdvanceResult::Pending);
+        assert_eq!(
+            scheduler.advance(3, Some(0)),
+            AdvanceResult::NextBatch(vec![4])
+        );
+        assert_eq!(
+            scheduler.advance(4, Some(0)),
+            AdvanceResult::NextBatch(vec![5])
+        );
+        assert_eq!(
+            scheduler.advance(5, Some(0)),
+            AdvanceResult::Finished { failed: false }
         );
     }
 
@@ -306,8 +388,20 @@ mod tests {
             code(3, "setup", None),
         ];
 
-        let scheduler = Scheduler::for_target(&codes, 1).unwrap();
-        assert_eq!(scheduler.batches(), vec![vec![3], vec![2], vec![1]]);
+        let mut scheduler = Scheduler::for_target(&codes, 1).unwrap();
+        assert_eq!(scheduler.start(), Some(vec![3]));
+        assert_eq!(
+            scheduler.advance(3, Some(0)),
+            AdvanceResult::NextBatch(vec![2])
+        );
+        assert_eq!(
+            scheduler.advance(2, Some(0)),
+            AdvanceResult::NextBatch(vec![1])
+        );
+        assert_eq!(
+            scheduler.advance(1, Some(0)),
+            AdvanceResult::Finished { failed: false }
+        );
     }
 
     #[test]
@@ -318,14 +412,28 @@ mod tests {
             code(3, "setup", None),
         ];
 
-        let scheduler = Scheduler::for_all(&codes).unwrap();
-        assert_eq!(scheduler.batches(), vec![vec![2], vec![3], vec![1]]);
+        let mut scheduler = Scheduler::for_all(&codes, false).unwrap();
+        assert_eq!(scheduler.start(), Some(vec![2]));
+        assert_eq!(
+            scheduler.advance(2, Some(0)),
+            AdvanceResult::NextBatch(vec![3])
+        );
+        assert_eq!(
+            scheduler.advance(3, Some(0)),
+            AdvanceResult::NextBatch(vec![1])
+        );
+        assert_eq!(
+            scheduler.advance(1, Some(0)),
+            AdvanceResult::Finished { failed: false }
+        );
     }
 
     #[test]
     fn cycles_and_ambiguous_names_are_rejected() {
         let cycle = vec![code(1, "a", Some("b")), code(2, "b", Some("a"))];
-        assert!(Scheduler::for_all(&cycle).unwrap_err().contains("cycle"));
+        assert!(Scheduler::for_all(&cycle, false)
+            .unwrap_err()
+            .contains("cycle"));
 
         let ambiguous = vec![
             code(1, "same", None),
@@ -341,7 +449,7 @@ mod tests {
     fn target_validation_ignores_unrelated_blocks() {
         let codes = vec![code(1, "target", None), code(2, "broken", Some("missing"))];
         assert!(Scheduler::for_target(&codes, 1).is_ok());
-        assert!(Scheduler::for_all(&codes).is_err());
+        assert!(Scheduler::for_all(&codes, false).is_err());
     }
 
     #[test]
@@ -371,14 +479,16 @@ mod tests {
             code(2, "dependent", Some("fail")),
             code(3, "independent", None),
         ];
-        let mut scheduler = Scheduler::for_all(&codes).unwrap();
+        let mut scheduler = Scheduler::for_all(&codes, true).unwrap();
 
         assert_eq!(scheduler.start(), Some(vec![1]));
         assert_eq!(
             scheduler.advance(1, Some(1)),
             AdvanceResult::NextBatch(vec![3])
         );
-        assert_eq!(scheduler.advance(3, Some(0)), AdvanceResult::Done);
-        assert!(scheduler.has_failures());
+        assert_eq!(
+            scheduler.advance(3, Some(0)),
+            AdvanceResult::Finished { failed: true }
+        );
     }
 }

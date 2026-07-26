@@ -89,6 +89,54 @@ impl Dependencies {
     pub fn is_empty(&self) -> bool {
         matches!(self, Self::Valid(groups) if groups.is_empty())
     }
+
+    pub fn segments(&self) -> Vec<DepsToken<'_>> {
+        match self {
+            Self::Valid(groups) if groups.is_empty() => vec![],
+            Self::Valid(groups) => {
+                let mut tokens = vec![DepsToken::Punct(" [")];
+                for (gi, group) in groups.iter().enumerate() {
+                    if gi > 0 {
+                        tokens.push(DepsToken::Punct(" → "));
+                    }
+                    for (ni, name) in group.iter().enumerate() {
+                        if ni > 0 {
+                            tokens.push(DepsToken::Punct(" | "));
+                        }
+                        tokens.push(DepsToken::Name(name));
+                    }
+                }
+                tokens.push(DepsToken::Punct("]"));
+                tokens
+            }
+            Self::Invalid(_) => vec![DepsToken::Punct(" [invalid]")],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum DepsToken<'a> {
+    Punct(&'a str),
+    Name(&'a str),
+}
+
+impl DepsToken<'_> {
+    pub fn text(&self) -> &str {
+        match self {
+            Self::Punct(s) | Self::Name(s) => s,
+        }
+    }
+}
+
+use std::fmt;
+
+impl fmt::Display for Dependencies {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for token in self.segments() {
+            write!(f, "{}", token.text())?;
+        }
+        Ok(())
+    }
 }
 
 /// Parsed code block with language, content, and execution metadata.
