@@ -156,6 +156,10 @@ pub struct KeymapConfig {
     #[serde(default)]
     pub goto: toml::Table,
 
+    /// Overrides for the `Dependencies` popup's `Action` enum.
+    #[serde(default)]
+    pub dependencies: toml::Table,
+
     /// Overrides for the `FilePicker` component's `Action` enum.
     #[serde(default)]
     pub file_picker: toml::Table,
@@ -188,6 +192,7 @@ impl Default for KeymapConfig {
             confirm: toml::Table::new(),
             search: toml::Table::new(),
             goto: toml::Table::new(),
+            dependencies: toml::Table::new(),
             file_picker: toml::Table::new(),
             help: toml::Table::new(),
             envs: toml::Table::new(),
@@ -263,6 +268,14 @@ impl KeymapConfig {
         T: KeyMapConfig<T> + for<'de> Deserialize<'de> + Eq + std::hash::Hash,
     {
         Self::parse_derived(&self.goto)
+    }
+
+    /// Same as [`home_keymap`] but for the `Dependencies` popup.
+    pub fn dependencies<T>(&self) -> DerivedConfig<T>
+    where
+        T: KeyMapConfig<T> + for<'de> Deserialize<'de> + Eq + std::hash::Hash,
+    {
+        Self::parse_derived(&self.dependencies)
     }
 
     /// Same as [`home_keymap`] but for the `FilePicker` component.
@@ -372,6 +385,7 @@ impl KeymapConfig {
             confirm: Self::dump_keymap_table::<crate::apps::tui::confirm::Action>(),
             search: Self::dump_keymap_table::<crate::apps::tui::search::Action>(),
             goto: Self::dump_keymap_table::<crate::apps::tui::goto::Action>(),
+            dependencies: Self::dump_keymap_table::<crate::apps::tui::dependencies::Action>(),
             help: Self::dump_keymap_table::<crate::apps::tui::help::Action>(),
             file_picker: Self::dump_keymap_table::<crate::apps::tui::file_picker::Action>(),
             envs: Self::dump_keymap_table::<crate::apps::tui::envs::MainAction>(),
@@ -718,6 +732,7 @@ preview_lines = 6
         assert!(kc.cli.is_empty());
         assert!(kc.menu.is_empty());
         assert!(kc.preview.is_empty());
+        assert!(kc.dependencies.is_empty());
     }
 
     #[test]

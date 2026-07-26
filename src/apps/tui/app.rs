@@ -6,7 +6,7 @@ use crate::apps::navigation::Navigation;
 use crate::apps::scheduler::{AdvanceResult, Scheduler};
 use crate::apps::tui;
 use crate::apps::tui::{
-    confirm, file_picker, layout, menu, preview, tasks::Tasks, themes, Shortcut,
+    confirm, dependencies, file_picker, layout, menu, preview, tasks::Tasks, themes, Shortcut,
 };
 use crate::utils::key_to_bytes;
 use color_eyre::Result;
@@ -26,8 +26,7 @@ use std::{
     thread,
     time::Duration,
 };
-use upmd_parser::Parser;
-use upmd_parser::{resolve_code_block, CodeId};
+use upmd_parser::{resolve_code_block, CodeId, Parser};
 use upmd_runtime::{
     runtimes::tui::{Input, Output},
     Cmd, Component,
@@ -45,6 +44,7 @@ enum Mode {
     Goto,
     Themes,
     FilePicker,
+    Dependencies,
 }
 
 /// Main TUI application component.
@@ -67,6 +67,7 @@ pub struct App {
     help: Option<tui::help::Help>,
     search: Option<tui::search::Search>,
     goto: Option<tui::goto::Goto>,
+    dependencies: Option<dependencies::Dependencies>,
     file_picker: Option<file_picker::FilePicker>,
     /// When true, picker cancel quits the app (startup mode).
     /// When false, picker cancel returns to the active document.
@@ -136,6 +137,12 @@ pub enum Action {
     /// Show/hide help
     #[key("?", help = "help")]
     Help,
+    /// Show dependency diagram
+    #[key(";", help = "deps")]
+    ShowDeps,
+    /// Show schedule's dependency diagram
+    #[key("'", help = "schedule deps")]
+    ShowScheduleDeps,
     /// Quit
     #[key("q", "ctrl-c", help = "quit")]
     Quit,
@@ -230,6 +237,7 @@ impl App {
             last_cwd: None,
             notification: None,
             started: false,
+            dependencies: None,
             footer_right_text: Self::build_footer_right_text(&theme),
         }
     }
@@ -395,6 +403,16 @@ impl App {
         }
     }
 
+    fn rerun_target(&mut self, id: CodeId) -> Option<Cmd<Msg>> {
+        match Scheduler::for_target_rerun(self.preview.codes(), id) {
+            Ok(scheduler) => self.start_plan(scheduler),
+            Err(error) => {
+                self.notify_error(error);
+                None
+            }
+        }
+    }
+
     fn execute(&mut self, id: CodeId) -> Option<Cmd<Msg>> {
         if let Some(scheduler) = &self.scheduler {
             if !scheduler.is_running(id) {
@@ -444,6 +462,17 @@ impl App {
     }
 
     fn select_batch(&mut self, batch: &[CodeId]) {
+        // Don't auto-navigate when running a specific target — stay on the
+        // block the user originally selected.  In for_all mode (no target)
+        // navigation follows the execution order.
+        let has_target = self
+            .scheduler
+            .as_ref()
+            .and_then(Scheduler::target)
+            .is_some();
+        if has_target {
+            return;
+        }
         if let Some(first) = batch.first() {
             self.navigate_to_code(*first);
         }
@@ -580,6 +609,7 @@ pub enum Msg {
     Confirm(confirm::Action),
     Search(tui::search::Action),
     Goto(tui::goto::Action),
+    Dependencies(dependencies::Action),
     Help(tui::help::Action),
     Envs(tui::envs::Action),
     Themes(themes::Action),
@@ -632,6 +662,7 @@ impl Component for App {
             Msg::FilePicker(action) => self.handle_file_picker_msg(action),
             Msg::Search(action) => self.handle_search_msg(action),
             Msg::Goto(action) => self.handle_goto_msg(action),
+            Msg::Dependencies(action) => self.handle_dependencies_msg(action),
             Msg::Help(action) => self.handle_help_msg(action),
             Msg::Envs(action) => self.handle_envs_msg(action),
             Msg::Themes(action) => self.handle_themes_msg(action),
@@ -664,6 +695,10 @@ impl Component for App {
                 }
                 self.preview.tick();
                 self.output.tick();
+                let statuses = self.tasks.task_statuses();
+                if let Some(dependencies) = &mut self.dependencies {
+                    dependencies.tick(statuses);
+                }
 
                 // Clear expired flash notification.
                 if self
@@ -841,6 +876,32 @@ impl App {
                 }
                 None
             }
+            Action::ShowDeps => {
+                self.dependencies = Some(dependencies::Dependencies::for_target(
+                    self.preview.codes(),
+                    self.menu.selected(),
+                    self.tasks.task_statuses(),
+                    self.theme.clone(),
+                    self.config.keymap.dependencies(),
+                ));
+                self.mode = Mode::Dependencies;
+                None
+            }
+            Action::ShowScheduleDeps => {
+                let graph = self
+                    .scheduler
+                    .as_ref()
+                    .map(|scheduler| scheduler.graph().clone());
+                self.dependencies = Some(dependencies::Dependencies::for_schedule(
+                    self.preview.codes(),
+                    graph,
+                    self.tasks.task_statuses(),
+                    self.theme.clone(),
+                    self.config.keymap.dependencies(),
+                ));
+                self.mode = Mode::Dependencies;
+                None
+            }
             Action::ToggleTransparency => self.toggle_transparency(),
             Action::Paste => {
                 if let Some(text) = crate::utils::clipboard_paste() {
@@ -888,6 +949,11 @@ impl App {
                 let action = self.goto.as_ref()?.action(event)?;
                 let cmd = self.goto.as_mut()?.update(action)?;
                 Some(cmd.map(Msg::Goto))
+            }
+            Mode::Dependencies => {
+                let action = self.dependencies.as_ref()?.action(event)?;
+                let cmd = self.dependencies.as_mut()?.update(action)?;
+                Some(cmd.map(Msg::Dependencies))
             }
             Mode::FilePicker => {
                 let action = self.file_picker.as_ref()?.action(event)?;
@@ -1231,7 +1297,7 @@ impl App {
                 self.confirm = None;
                 self.mode = Mode::Home;
                 self.auto_input_paused = false;
-                self.execute(id)
+                self.rerun_target(id)
             }
             confirm::Action::Cancelled => {
                 self.confirm = None;
@@ -1334,6 +1400,13 @@ impl App {
             &mut items,
             "goto",
             self.config.keymap.goto::<tui::goto::Action>(),
+        );
+        Self::append_help_entries(
+            &mut items,
+            "dependencies",
+            self.config
+                .keymap
+                .dependencies::<tui::dependencies::Action>(),
         );
         Self::append_help_entries(
             &mut items,
@@ -1460,6 +1533,7 @@ impl App {
             self.config.keymap.preview::<preview::Action>(),
         );
         self.scheduler = None;
+        self.dependencies = None;
         self.pending_states.clear();
         self.started = false;
 
@@ -1472,6 +1546,14 @@ impl App {
                 self.navigate_to_code(id);
             }
         }
+    }
+
+    fn handle_dependencies_msg(&mut self, action: dependencies::Action) -> Option<Cmd<Msg>> {
+        if action == dependencies::Action::Quit {
+            self.dependencies = None;
+            self.mode = Mode::Home;
+        }
+        None
     }
 
     fn handle_goto_msg(&mut self, action: tui::goto::Action) -> Option<Cmd<Msg>> {
@@ -1623,6 +1705,7 @@ impl App {
 
         // Auto-focus when the selected block becomes ready for input.
         if self.mode != Mode::Input
+            && self.mode != Mode::Dependencies
             && !self.auto_input_paused
             && self.menu.selected() == Some(id)
             && self.tasks.is_waiting_for_input(id)
@@ -1663,7 +1746,7 @@ impl App {
 impl Input for App {
     fn action(&self, event: crossterm::event::Event) -> Option<Msg> {
         match self.mode {
-            Mode::Home | Mode::Input | Mode::Output => Some(Msg::Event(event)),
+            Mode::Home | Mode::Input | Mode::Output | Mode::Dependencies => Some(Msg::Event(event)),
             Mode::Confirm => self
                 .confirm
                 .as_ref()
@@ -1748,6 +1831,11 @@ impl Output for App {
             Mode::FilePicker => {
                 if let Some(picker) = &self.file_picker {
                     picker.render(frame, area);
+                }
+            }
+            Mode::Dependencies => {
+                if let Some(dependencies) = &self.dependencies {
+                    dependencies.render(frame, area);
                 }
             }
             _ => {}
@@ -2062,6 +2150,76 @@ mod tests {
         assert_eq!(notification.kind, tui::notification::FlashKind::Error);
         assert_eq!(notification.text, "No file path in config, cannot reload");
     }
+    #[test]
+    fn dependency_popup_uses_scheduler_validation() {
+        let markdown = "\
+```sh [name:dup]\n:\n```\n\
+```sh [name:dup]\n:\n```\n\
+```sh [name:target, deps:dup]\n:\n```\n";
+        let mut app = App::new(
+            upmd_parser::new().parse(markdown),
+            AppConfig {
+                block: Some("target".to_string()),
+                ..Default::default()
+            },
+        );
+
+        app.handle_action(Action::ShowDeps);
+
+        let error = app
+            .dependencies
+            .as_ref()
+            .and_then(dependencies::Dependencies::message)
+            .unwrap();
+        assert!(error.contains("ambiguous"));
+    }
+
+    #[test]
+    fn schedule_popup_keeps_all_mode_graph() {
+        let markdown = "\
+```sh [name:a]\n:\n```\n\
+```sh [name:b, deps:a]\n:\n```\n\
+```sh [name:independent]\n:\n```\n";
+        let mut app = App::new(upmd_parser::new().parse(markdown), AppConfig::default());
+        app.start_all();
+
+        app.handle_action(Action::ShowScheduleDeps);
+
+        let graph = app
+            .dependencies
+            .as_ref()
+            .and_then(dependencies::Dependencies::graph)
+            .unwrap();
+        assert_eq!(graph.layers(), &[vec![1, 3], vec![2]]);
+    }
+
+    #[test]
+    fn dependency_popup_handles_both_scroll_axes() {
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+
+        let mut app = App::new(
+            upmd_parser::new().parse("```sh [name:a]\n:\n```\n"),
+            AppConfig::default(),
+        );
+        app.handle_action(Action::ShowDeps);
+        let shortcuts = app.dependencies.as_ref().unwrap().footer_shortcuts();
+        let shortcuts = shortcuts.to_string();
+        assert!(shortcuts.contains("scroll"));
+        assert!(shortcuts.contains("page"));
+        assert!(shortcuts.contains("reset"));
+        assert!(shortcuts.contains("close"));
+
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Right,
+            KeyModifiers::NONE,
+        )));
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)));
+        assert_eq!(app.dependencies.as_ref().unwrap().scroll_offset(), (2, 1));
+
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)));
+        assert_eq!(app.dependencies.as_ref().unwrap().scroll_offset(), (0, 0));
+    }
+
     #[cfg(unix)]
     #[test]
     fn alternate_screen_is_resized_to_rows_below_source_block() {

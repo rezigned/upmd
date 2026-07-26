@@ -40,11 +40,11 @@ pub struct Scheduler {
     pending: VecDeque<Vec<CodeId>>,
     running: HashSet<CodeId>,
     blocked: HashSet<CodeId>,
-    dependents: HashMap<CodeId, Vec<CodeId>>,
+    graph: DependencyGraph,
     failure: Option<BlockFailure>,
     failure_policy: FailurePolicy,
     auto_run: bool,
-    target: Option<CodeId>,
+    skip_succeeded: bool,
 }
 
 impl Scheduler {
@@ -54,20 +54,19 @@ impl Scheduler {
     /// order.  Failed blocks skip their dependents but do not stop other blocks.
     /// Set `auto_run` to start execution immediately after creation.
     pub fn for_all(codes: &[Code], auto_run: bool) -> Result<Self, String> {
-        let ids = codes.iter().map(|code| code.id).collect::<HashSet<_>>();
-        let plan = build_plan(codes, &ids)?;
-        let pending = plan
-            .layers
-            .into_iter()
+        let graph = DependencyGraph::for_all(codes)?;
+        let pending = graph
+            .layers()
+            .iter()
             .flatten()
-            .map(|id| vec![id])
+            .map(|&id| vec![id])
             .collect();
         Ok(Self::new(
             pending,
-            plan.dependents,
+            graph,
             FailurePolicy::Continue,
             auto_run,
-            None,
+            true,
         ))
     }
 
@@ -77,33 +76,42 @@ impl Scheduler {
     /// concurrently, batches are sequential.  On failure, remaining batches are
     /// cancelled and `Stopped` is returned.
     pub fn for_target(codes: &[Code], target: CodeId) -> Result<Self, String> {
-        let ids = collect_dependencies(codes, target)?;
-        let plan = build_plan(codes, &ids)?;
+        Self::build_target(codes, target, true)
+    }
+
+    /// Creates a target scheduler that re-executes previously successful dependencies.
+    pub fn for_target_rerun(codes: &[Code], target: CodeId) -> Result<Self, String> {
+        Self::build_target(codes, target, false)
+    }
+
+    fn build_target(codes: &[Code], target: CodeId, skip_succeeded: bool) -> Result<Self, String> {
+        let graph = DependencyGraph::for_target(codes, target)?;
+        let pending = graph.layers().iter().cloned().collect();
         Ok(Self::new(
-            plan.layers.into(),
-            plan.dependents,
+            pending,
+            graph,
             FailurePolicy::Stop,
             true,
-            Some(target),
+            skip_succeeded,
         ))
     }
 
     fn new(
         pending: VecDeque<Vec<CodeId>>,
-        dependents: HashMap<CodeId, Vec<CodeId>>,
+        graph: DependencyGraph,
         failure_policy: FailurePolicy,
         auto_run: bool,
-        target: Option<CodeId>,
+        skip_succeeded: bool,
     ) -> Self {
         Self {
             pending,
             running: HashSet::new(),
             blocked: HashSet::new(),
-            dependents,
+            graph,
             failure: None,
             auto_run,
-            target,
             failure_policy,
+            skip_succeeded,
         }
     }
 
@@ -155,17 +163,26 @@ impl Scheduler {
         )
     }
 
+    /// The target block this schedule is working toward, if any.
+    pub fn target(&self) -> Option<CodeId> {
+        self.graph.target()
+    }
+
+    pub fn graph(&self) -> &DependencyGraph {
+        &self.graph
+    }
+
     /// Whether the scheduler should start running immediately.
     pub fn auto_run(&self) -> bool {
         self.auto_run
     }
 
-    /// Whether `block` should execute given the result of its dependencies.
+    /// Whether `block` should execute given its previous result.
     ///
-    /// Returns `true` if dependencies failed (so this block should be skipped)
-    /// or if this is the target block (always runs regardless).
+    /// Normal plans reuse successful prerequisites while always executing the
+    /// target. Explicit rerun plans execute the entire dependency chain.
     pub fn should_execute(&self, block: CodeId, succeeded: bool) -> bool {
-        !succeeded || self.target == Some(block)
+        !self.skip_succeeded || !succeeded || self.graph.target() == Some(block)
     }
 
     /// Whether `block` is currently executing.
@@ -195,7 +212,7 @@ impl Scheduler {
     fn block_dependents(&mut self, failed: CodeId) {
         let mut stack = vec![failed];
         while let Some(block) = stack.pop() {
-            if let Some(dependents) = self.dependents.get(&block) {
+            if let Some(dependents) = self.graph.dependents.get(&block) {
                 for &dependent in dependents {
                     if self.blocked.insert(dependent) {
                         stack.push(dependent);
@@ -206,9 +223,31 @@ impl Scheduler {
     }
 }
 
-struct Plan {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DependencyGraph {
     layers: Vec<Vec<CodeId>>,
     dependents: HashMap<CodeId, Vec<CodeId>>,
+    target: Option<CodeId>,
+}
+
+impl DependencyGraph {
+    pub fn for_all(codes: &[Code]) -> Result<Self, String> {
+        let ids = codes.iter().map(|code| code.id).collect::<HashSet<_>>();
+        build_plan(codes, &ids, None)
+    }
+
+    pub fn for_target(codes: &[Code], target: CodeId) -> Result<Self, String> {
+        let ids = collect_dependencies(codes, target)?;
+        build_plan(codes, &ids, Some(target))
+    }
+
+    pub fn layers(&self) -> &[Vec<CodeId>] {
+        &self.layers
+    }
+
+    pub fn target(&self) -> Option<CodeId> {
+        self.target
+    }
 }
 
 /// Walks the dependency tree of `target` and returns all reachable block IDs.
@@ -237,7 +276,11 @@ fn collect_dependencies(codes: &[Code], target: CodeId) -> Result<HashSet<CodeId
 ///
 /// Returns layers (batches of concurrent blocks) and the dependency edges for
 /// dependent-blocking on failure.  Errors on cycles.
-fn build_plan(codes: &[Code], selected: &HashSet<CodeId>) -> Result<Plan, String> {
+fn build_plan(
+    codes: &[Code],
+    selected: &HashSet<CodeId>,
+    target: Option<CodeId>,
+) -> Result<DependencyGraph, String> {
     let positions = codes
         .iter()
         .enumerate()
@@ -305,7 +348,11 @@ fn build_plan(codes: &[Code], selected: &HashSet<CodeId>) -> Result<Plan, String
         })
         .collect();
 
-    Ok(Plan { layers, dependents })
+    Ok(DependencyGraph {
+        layers,
+        dependents,
+        target,
+    })
 }
 
 /// Resolves the dependency names of `code` into block IDs.
@@ -381,6 +428,19 @@ mod tests {
     }
 
     #[test]
+    fn target_rerun_executes_successful_dependencies_again() {
+        let codes = vec![code(1, "setup", None), code(2, "target", Some("setup"))];
+
+        let normal = Scheduler::for_target(&codes, 2).unwrap();
+        assert!(!normal.should_execute(1, true));
+        assert!(normal.should_execute(2, true));
+
+        let rerun = Scheduler::for_target_rerun(&codes, 2).unwrap();
+        assert!(rerun.should_execute(1, true));
+        assert!(rerun.should_execute(2, true));
+    }
+
+    #[test]
     fn nested_dependencies_are_ordered_before_the_target() {
         let codes = vec![
             code(1, "target", Some("build")),
@@ -426,6 +486,41 @@ mod tests {
             scheduler.advance(1, Some(0)),
             AdvanceResult::Finished { failed: false }
         );
+    }
+
+    #[test]
+    fn graph_uses_scheduler_validation() {
+        let codes = vec![
+            code(1, "same", None),
+            code(2, "same", None),
+            code(3, "target", Some("same")),
+        ];
+        assert!(DependencyGraph::for_target(&codes, 3)
+            .unwrap_err()
+            .contains("ambiguous"));
+    }
+
+    #[test]
+    fn graph_layers_contain_each_block_once() {
+        let codes = vec![
+            code(1, "a", None),
+            code(2, "b", Some("a")),
+            code(3, "target", Some("a, b")),
+        ];
+        let graph = DependencyGraph::for_target(&codes, 3).unwrap();
+        assert_eq!(graph.layers(), &[vec![1], vec![2], vec![3]]);
+    }
+
+    #[test]
+    fn all_mode_retains_its_complete_graph() {
+        let codes = vec![
+            code(1, "a", None),
+            code(2, "b", Some("a")),
+            code(3, "independent", None),
+        ];
+        let scheduler = Scheduler::for_all(&codes, false).unwrap();
+        assert_eq!(scheduler.graph().layers(), &[vec![1, 3], vec![2]]);
+        assert_eq!(scheduler.graph().target(), None);
     }
 
     #[test]

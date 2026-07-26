@@ -347,6 +347,65 @@ help = "go"
 keys = ["enter"]
 symbol = "enter"
 
+[keymap.dependencies.Down]
+help = "down"
+keys = [
+    "down",
+    "j",
+]
+symbol = "down"
+
+[keymap.dependencies.Exit]
+keys = ["ctrl-c"]
+symbol = "ctrl-c"
+
+[keymap.dependencies.Left]
+help = "left"
+keys = [
+    "left",
+    "h",
+]
+symbol = "left"
+
+[keymap.dependencies.PageDown]
+help = "page down"
+keys = ["pagedown"]
+symbol = "pagedown"
+
+[keymap.dependencies.PageUp]
+help = "page up"
+keys = ["pageup"]
+symbol = "pageup"
+
+[keymap.dependencies.Quit]
+help = "close"
+keys = [
+    "esc",
+    "q",
+]
+symbol = "esc"
+
+[keymap.dependencies.Reset]
+help = "reset"
+keys = ["home"]
+symbol = "home"
+
+[keymap.dependencies.Right]
+help = "right"
+keys = [
+    "right",
+    "l",
+]
+symbol = "right"
+
+[keymap.dependencies.Up]
+help = "up"
+keys = [
+    "up",
+    "k",
+]
+symbol = "up"
+
 [keymap.file_picker.Delete]
 description = "Delete the last character from the filter query."
 help = "delete"
