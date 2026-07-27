@@ -12,6 +12,7 @@ use upmd_runtime::{
     Cmd, Component,
 };
 
+use super::output::BatchOutput;
 use crate::{
     apps::config::Config as AppConfig,
     apps::config::{
@@ -44,13 +45,7 @@ pub struct App {
     scheduler: Option<Scheduler>,
     envs: Envs,
     cwd: PathBuf,
-    /// Lines written by the last render pass. Used to emit a move-up/clear
-    /// escape sequence so the next render replaces the card in-place.
-    prev_lines: Cell<u16>,
-    /// When true, the next render skips the move-up/clear, leaving previous
-    /// execution output on screen. Set after execution completes, cleared
-    /// after one render cycle.
-    reset_anchor: Cell<bool>,
+    batch_output: BatchOutput,
     picker: Option<crate::apps::picker::PickerState>,
     picker_keymap: DerivedConfig<crate::apps::picker::PickerAction>,
     pending_states: BTreeMap<CodeId, (Option<Envs>, Option<PathBuf>)>,
@@ -62,6 +57,9 @@ pub enum Action {
     /// Executes the selected code block.
     #[key("enter")]
     Run,
+    /// Focuses the next block in a parallel batch.
+    #[key("tab")]
+    FocusNext,
     /// Quits the application.
     #[key("q", "ctrl-c")]
     Quit,
@@ -110,8 +108,7 @@ impl App {
             scheduler: None,
             envs,
             cwd,
-            prev_lines: Cell::new(0),
-            reset_anchor: Cell::new(false),
+            batch_output: BatchOutput::new(),
             picker: None,
             picker_keymap: config.keymap.file_picker(),
             pending_states: BTreeMap::new(),
@@ -162,8 +159,7 @@ impl App {
         };
         self.scheduler = None;
         self.outputs.borrow_mut().clear();
-        self.prev_lines.set(0);
-        self.reset_anchor.set(false);
+        self.batch_output.reset();
         self.pending_states.clear();
     }
 
@@ -238,6 +234,13 @@ impl App {
     }
 
     fn execute_block(&mut self, id: CodeId) -> Option<Cmd<Msg>> {
+        if self
+            .scheduler
+            .as_ref()
+            .is_some_and(|scheduler| scheduler.is_running(id))
+        {
+            self.batch_output.track(id);
+        }
         let code = self.codes.iter().find(|code| code.id == id)?;
         let (cols, rows) =
             crossterm::terminal::size().unwrap_or((PTY_DEFAULT_COLS, PTY_DEFAULT_ROWS));
@@ -284,9 +287,14 @@ impl App {
     }
 
     fn advance_scheduler(&mut self, id: CodeId, exit_code: Option<i32>) -> Option<AdvanceResult> {
-        self.scheduler
+        let result = self
+            .scheduler
             .as_mut()
-            .map(|scheduler| scheduler.advance(id, exit_code))
+            .map(|scheduler| scheduler.advance(id, exit_code));
+        if let Some(result) = &result {
+            self.batch_output.complete(result);
+        }
+        result
     }
 
     fn handle_advance(&mut self, result: AdvanceResult) -> Option<Cmd<Msg>> {
@@ -326,10 +334,23 @@ impl App {
     }
 
     fn select_batch(&mut self, batch: &[CodeId]) {
+        self.batch_output.select(batch);
         if let Some(first) = batch.first() {
             if let Some(index) = self.codes.iter().position(|code| code.id == *first) {
                 self.selected = index;
             }
+        }
+    }
+
+    fn focus_next_batch_block(&mut self) {
+        let Some(selected) = self.codes.get(self.selected).map(|code| code.id) else {
+            return;
+        };
+        let Some(next) = self.batch_output.focus_next(selected) else {
+            return;
+        };
+        if let Some(index) = self.codes.iter().position(|code| code.id == next) {
+            self.selected = index;
         }
     }
 
@@ -340,10 +361,6 @@ impl App {
 
         self.apply_stream_to_output(id, &stream);
         self.apply_captured_state(id, is_env, is_cwd);
-
-        if matches!(stream, Stream::End | Stream::Exit(_)) {
-            self.reset_anchor.set(true);
-        }
 
         if is_end {
             let exit_code = self
@@ -364,6 +381,10 @@ impl App {
     /// writing PTY output directly to the terminal when in the alternate
     /// screen and resizing the PTY on alternate-screen transitions.
     fn apply_stream_to_output(&mut self, id: CodeId, stream: &Stream) {
+        let focused = self
+            .codes
+            .get(self.selected)
+            .is_some_and(|code| code.id == id);
         let mut outputs = self.outputs.borrow_mut();
         let Some(state) = outputs.get_mut(&id) else {
             return;
@@ -378,7 +399,7 @@ impl App {
         // real terminal so escape sequences (cursor positioning, alt
         // screen entry/exit) are processed natively.
         if let Stream::Out(s) = stream {
-            if was_alt || now_alt {
+            if self.batch_output.is_terminal() && focused && (was_alt || now_alt) {
                 let _ = io::stdout().write_all(s.as_bytes());
                 let _ = io::stdout().flush();
             }
@@ -390,7 +411,7 @@ impl App {
         if was_alt != now_alt {
             let (cols, rows) =
                 crossterm::terminal::size().unwrap_or((PTY_DEFAULT_COLS, PTY_DEFAULT_ROWS));
-            let pty_size = if now_alt {
+            let pty_size = if now_alt && self.batch_output.is_terminal() && focused {
                 Size::from((cols, rows))
             } else {
                 let pty_rows = rows
@@ -480,6 +501,10 @@ impl App {
                 let id = self.codes.get(self.selected)?.id;
                 self.execute(id)
             }
+            Action::FocusNext => {
+                self.focus_next_batch_block();
+                None
+            }
             Action::Quit => Some(Cmd::quit()),
         }
     }
@@ -533,9 +558,11 @@ impl crate::RunApp for App {
         Self::from_file_picker(files, config)
     }
 
-    fn run(self) -> Result<ExitCode> {
+    fn run(mut self) -> Result<ExitCode> {
         let failed = Rc::clone(&self.failed);
-        upmd_runtime::runtimes::cli::run(self)?;
+        let runtime = upmd_runtime::runtimes::cli::Runtime::new();
+        self.batch_output.set_terminal(runtime.is_terminal());
+        upmd_runtime::Runtime::run(runtime, upmd_runtime::Engine::new(self))?;
         Ok(if failed.get() {
             ExitCode::FAILURE
         } else {
@@ -582,6 +609,12 @@ impl Input for App {
                 return None;
             }
 
+            if self.batch_output.visible().len() > 1
+                && self.keymap.get(&key) == Some(&Action::FocusNext)
+            {
+                return Some(Msg::Action(Action::FocusNext));
+            }
+
             // Forward input to process if one is running. Write directly
             // via RefCell so keystrokes don't trigger a render cycle.
             let Some(code) = self.codes.get(self.selected) else {
@@ -626,7 +659,7 @@ impl App {
         out: &mut W,
         picker: &crate::apps::picker::PickerState,
     ) -> std::io::Result<()> {
-        let prev = self.prev_lines.get();
+        let prev = self.batch_output.previous_lines();
         if prev > 0 {
             write!(out, "\x1b[{prev}A\r\x1b[J")?;
         } else {
@@ -694,13 +727,126 @@ impl App {
         write!(out, "\r\n")?;
         lines += 1;
 
-        self.prev_lines.set(lines);
+        self.batch_output.set_previous_lines(lines);
+        Ok(())
+    }
+
+    fn code_label(&self, id: CodeId) -> String {
+        self.codes
+            .iter()
+            .find(|code| code.id == id)
+            .map(|code| {
+                if code.name.is_empty() {
+                    code.id.to_string()
+                } else {
+                    code.name.clone()
+                }
+            })
+            .unwrap_or_else(|| id.to_string())
+    }
+
+    fn render_plain_transcript<W: Write>(&self, out: &mut W, id: CodeId) -> io::Result<()> {
+        let label = self.code_label(id);
+        writeln!(out, "==> {label} [block {id}]")?;
+        if let Some(task) = self.outputs.borrow().get(&id) {
+            let text = task.parser.inline_contents(false);
+            for line in text.lines {
+                for span in line.spans {
+                    write!(out, "{}", span.content)?;
+                }
+                writeln!(out)?;
+            }
+            match task.exit_code {
+                Some(exit_code) => writeln!(out, "<== {label} exited with code {exit_code}")?,
+                None => writeln!(out, "<== {label} failed to start")?,
+            }
+        } else {
+            writeln!(out, "<== {label} produced no output")?;
+        }
+        Ok(())
+    }
+
+    fn render_terminal_transcript<W: Write>(&self, out: &mut W, id: CodeId) -> io::Result<()> {
+        let label = self.code_label(id);
+        let active = ansi_fg(self.theme.active);
+        let reset = "\x1b[0m";
+        writeln!(out, "\n{active}==> {label} [block {id}]{reset}")?;
+        if let Some(task) = self.outputs.borrow().get(&id) {
+            let text = task.parser.inline_contents(false);
+            for line in text.lines {
+                write!(out, "  ")?;
+                for span in line.spans {
+                    write!(out, "{}{}{}", ansi_style(span.style), span.content, reset)?;
+                }
+                writeln!(out)?;
+            }
+            let (symbol, color, result) = match task.exit_code {
+                Some(0) => (
+                    crate::apps::config::SUCCESS_SYMBOL,
+                    ansi_fg(self.theme.success),
+                    "exited with code 0".to_string(),
+                ),
+                Some(exit_code) => (
+                    crate::apps::config::ERROR_SYMBOL,
+                    ansi_fg(self.theme.error),
+                    format!("exited with code {exit_code}"),
+                ),
+                None => (
+                    crate::apps::config::ERROR_SYMBOL,
+                    ansi_fg(self.theme.error),
+                    "failed to start".to_string(),
+                ),
+            };
+            writeln!(out, "  {color}{symbol} {result}{reset}")?;
+        }
+        Ok(())
+    }
+
+    fn render_plain<W: Write>(&self, out: &mut W) -> io::Result<()> {
+        for batch in self.batch_output.take_pending() {
+            for id in batch {
+                self.render_plain_transcript(out, id)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn render_batch_tabs<W: Write>(&self, out: &mut W) -> io::Result<()> {
+        let visible = self.batch_output.visible();
+        if visible.len() <= 1 {
+            return Ok(());
+        }
+
+        let selected = self.codes.get(self.selected).map(|code| code.id);
+        let outputs = self.outputs.borrow();
+        let active = ansi_fg(self.theme.active);
+        let muted = ansi_fg(self.theme.muted);
+        let reset = "\x1b[0m";
+        write!(out, "  Parallel:")?;
+        for &id in visible {
+            let status = match outputs.get(&id) {
+                Some(task) if !task.done => "●",
+                Some(task) if task.exit_code == Some(0) => crate::apps::config::SUCCESS_SYMBOL,
+                Some(_) => crate::apps::config::ERROR_SYMBOL,
+                None => "·",
+            };
+            let color = if selected == Some(id) {
+                &active
+            } else {
+                &muted
+            };
+            write!(out, " {color}[{} {status}]{reset}", self.code_label(id))?;
+        }
+        writeln!(out, "  {active}tab{reset} {muted}switch{reset}")?;
         Ok(())
     }
 }
 
 impl Output for App {
     fn is_alternate_screen(&self) -> bool {
+        if !self.batch_output.is_terminal() {
+            return false;
+        }
         if self.codes.is_empty() {
             return false;
         }
@@ -713,33 +859,42 @@ impl Output for App {
     }
 
     fn render<W: Write>(&self, out: &mut W) -> std::io::Result<()> {
-        // In picker mode, render the compact file picker list.
+        if !self.batch_output.is_terminal() {
+            return self.render_plain(out);
+        }
+
         if let Some(picker) = &self.picker {
             return self.render_picker(out, picker);
         }
 
-        // Always overwrite the previous card in-place, even on the final
-        // render after execution completes.  The reset_anchor flag tells
-        // us to set prev_lines to 0 afterwards, so the next navigation
-        // renders fresh below rather than overwriting the output.
-        let anchor_reset = self.reset_anchor.get();
-        let prev = self.prev_lines.get();
+        let prev = self.batch_output.previous_lines();
         if prev > 0 {
             write!(out, "\x1b[{prev}A\r\x1b[J")?;
         }
-        self.reset_anchor.set(false);
 
         let term_width = crossterm::terminal::size()
             .map(|(w, _)| w as usize)
             .unwrap_or(80);
+        let pending = self.batch_output.take_pending();
+        let committed = !pending.is_empty();
+        if committed {
+            let mut transcript = LineCounter::new(out, term_width as u16);
+            for batch in pending {
+                for id in batch {
+                    self.render_terminal_transcript(&mut transcript, id)?;
+                }
+            }
+        }
 
-        // Wrap the output in a line counter so we can track prev_lines
-        // for the next render.
+        if committed && self.batch_output.visible().is_empty() {
+            self.batch_output.set_previous_lines(0);
+            return Ok(());
+        }
+
         let mut counter = LineCounter::new(out, term_width as u16);
         if self.codes.is_empty() {
             writeln!(counter, "No code blocks found.")?;
-            self.prev_lines
-                .set(if anchor_reset { 0 } else { counter.lines });
+            self.batch_output.set_previous_lines(counter.lines);
             return Ok(());
         }
 
@@ -751,6 +906,7 @@ impl Output for App {
         let active_fg = ansi_fg(self.theme.active);
         let reset = "\x1b[0m";
 
+        self.render_batch_tabs(&mut counter)?;
         writeln!(counter)?;
         let deps_display = format!("{}", code.dependencies);
         let deps_str = if deps_display.is_empty() {
@@ -853,8 +1009,7 @@ impl Output for App {
             )?;
         }
 
-        self.prev_lines
-            .set(if anchor_reset { 0 } else { counter.lines });
+        self.batch_output.set_previous_lines(counter.lines);
         Ok(())
     }
 }
@@ -1014,6 +1169,22 @@ echo world
 "#;
         let doc = upmd_parser::new().parse(input);
         App::new(doc, make_config())
+    }
+
+    fn make_parallel_app() -> App {
+        let input = "\
+```sh [name:a]\n:\n```\n\
+```sh [name:b]\n:\n```\n\
+```sh [name:target, deps:\"a | b\"]\n:\n```\n";
+        App::new(upmd_parser::new().parse(input), make_config())
+    }
+
+    fn insert_completed_output(app: &App, id: CodeId, text: &str, exit_code: i32) {
+        let mut output = task::Task::new(80, 24, 1024);
+        exec::handle_stream(&mut output, &Stream::Out(text.to_string()));
+        exec::handle_stream(&mut output, &Stream::Exit(exit_code));
+        exec::handle_stream(&mut output, &Stream::End);
+        app.outputs.borrow_mut().insert(id, output);
     }
 
     #[test]
@@ -1228,7 +1399,7 @@ print("2")
         app.render(&mut buf1).unwrap();
         // Reset anchor so the second render doesn't emit a move-up escape
         // sequence.  This simulates two independent render sessions.
-        app.prev_lines.set(0);
+        app.batch_output.set_previous_lines(0);
         let mut buf2 = Vec::new();
         app.render(&mut buf2).unwrap();
         assert_eq!(
@@ -1256,5 +1427,62 @@ print("2")
         assert!(card1.contains("print"), "first block contains python code");
         assert!(card2.contains("echo"), "second block contains bash code");
         assert_ne!(card1, card2, "different blocks produce different cards");
+    }
+
+    #[test]
+    fn non_terminal_parallel_output_is_plain_and_deterministic() {
+        let mut app = make_parallel_app();
+        insert_completed_output(&app, 1, "from a\n", 0);
+        insert_completed_output(&app, 2, "from b\n", 0);
+        app.batch_output.set_terminal(false);
+        app.batch_output.select(&[1, 2]);
+        app.batch_output.track(1);
+        app.batch_output.track(2);
+        app.batch_output
+            .complete(&AdvanceResult::NextBatch(vec![3]));
+
+        let mut buf = Vec::new();
+        app.render(&mut buf).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        assert!(!output.contains('\u{1b}'));
+        assert!(output.find("==> a").unwrap() < output.find("==> b").unwrap());
+        assert!(output.contains("from a"));
+        assert!(output.contains("from b"));
+        assert!(output.contains("<== a exited with code 0"));
+        assert!(output.contains("<== b exited with code 0"));
+
+        let mut second_render = Vec::new();
+        app.render(&mut second_render).unwrap();
+        assert!(second_render.is_empty());
+    }
+
+    #[test]
+    fn terminal_parallel_output_supports_focus_and_commits_every_block() {
+        let mut app = make_parallel_app();
+        insert_completed_output(&app, 1, "from a\n", 0);
+        insert_completed_output(&app, 2, "from b\n", 0);
+        app.batch_output.select(&[1, 2]);
+        app.batch_output.track(1);
+        app.batch_output.track(2);
+
+        let mut live = Vec::new();
+        app.render(&mut live).unwrap();
+        let live = String::from_utf8(live).unwrap();
+        assert!(live.contains("Parallel:"));
+        assert!(live.contains("tab"));
+        assert_eq!(app.codes[app.selected].id, 1);
+        app.focus_next_batch_block();
+        assert_eq!(app.codes[app.selected].id, 2);
+
+        app.batch_output
+            .complete(&AdvanceResult::Finished { failed: false });
+        app.batch_output.set_previous_lines(0);
+        let mut committed = Vec::new();
+        app.render(&mut committed).unwrap();
+        let committed = String::from_utf8(committed).unwrap();
+        assert!(committed.find("==> a").unwrap() < committed.find("==> b").unwrap());
+        assert!(committed.contains("from a"));
+        assert!(committed.contains("from b"));
+        assert_eq!(app.batch_output.previous_lines(), 0);
     }
 }

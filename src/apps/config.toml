@@ -139,6 +139,11 @@ help = "paste"
 keys = ["ctrl-v"]
 symbol = "ctrl-v"
 
+[keymap.cli.FocusNext]
+description = "Focuses the next block in a parallel batch."
+keys = ["tab"]
+symbol = "tab"
+
 [keymap.cli.Quit]
 description = "Quits the application."
 keys = [

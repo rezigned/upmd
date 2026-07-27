@@ -66,34 +66,43 @@ pub enum Alignment {
 pub type CodeId = u32;
 
 /// Parsed dependency groups from a code block's `deps` attribute.
+///
+/// `Ok(groups)` groups are comma-separated, `|` separates parallel items.
+/// `Err(error)` the attribute could not be parsed.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Dependencies {
-    Valid(Vec<Vec<String>>),
-    Invalid(String),
+pub struct Dependencies(pub Result<DepsGroup, String>);
+type DepsGroup = Vec<Vec<String>>;
+
+impl std::ops::Deref for Dependencies {
+    type Target = Result<DepsGroup, String>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 
 impl Default for Dependencies {
     fn default() -> Self {
-        Self::Valid(Vec::new())
+        Self(Ok(Vec::new()))
     }
 }
 
 impl Dependencies {
+    /// Parsed dependency groups, or an error message.
     pub fn groups(&self) -> Result<&[Vec<String>], &str> {
-        match self {
-            Self::Valid(groups) => Ok(groups),
-            Self::Invalid(error) => Err(error),
-        }
+        self.as_deref().map_err(|e| e.as_str())
     }
 
+    /// Returns `true` if there's no dependencies declared.
     pub fn is_empty(&self) -> bool {
-        matches!(self, Self::Valid(groups) if groups.is_empty())
+        self.as_deref().is_ok_and(|groups| groups.is_empty())
     }
 
+    /// Tokenizes the dependency declaration for styled display.
     pub fn segments(&self) -> Vec<DepsToken<'_>> {
-        match self {
-            Self::Valid(groups) if groups.is_empty() => vec![],
-            Self::Valid(groups) => {
+        match &**self {
+            Ok(groups) if groups.is_empty() => vec![],
+            Ok(groups) => {
                 let mut tokens = vec![DepsToken::Punct(" [")];
                 for (gi, group) in groups.iter().enumerate() {
                     if gi > 0 {
@@ -109,7 +118,7 @@ impl Dependencies {
                 tokens.push(DepsToken::Punct("]"));
                 tokens
             }
-            Self::Invalid(_) => vec![DepsToken::Punct(" [invalid]")],
+            Err(_) => vec![DepsToken::Punct(" [invalid]")],
         }
     }
 }
@@ -163,8 +172,8 @@ impl Code {
         let name = options.attrs.get("name").cloned().unwrap_or_default();
         let dependencies =
             match options::parse_dependencies(options.attrs.get("deps").map(String::as_str)) {
-                Ok(groups) => Dependencies::Valid(groups),
-                Err(error) => Dependencies::Invalid(error),
+                Ok(groups) => Dependencies(Ok(groups)),
+                Err(error) => Dependencies(Err(error)),
             };
 
         Self {
@@ -362,14 +371,14 @@ mod tests {
             ),
             (vec![vec!["build".to_string()]], vec![vec![2]]),
         ] {
-            let dependencies = Dependencies::Valid(groups);
+            let dependencies = Dependencies(Ok(groups));
             assert_eq!(
                 resolve_dependencies(&codes, &dependencies).unwrap(),
                 expected
             );
         }
 
-        let missing = Dependencies::Valid(vec![vec!["missing".to_string()]]);
+        let missing = Dependencies(Ok(vec![vec!["missing".to_string()]]));
         assert!(resolve_dependencies(&codes, &missing).is_err());
     }
 }

@@ -19,7 +19,7 @@ use crate::apps::config::PREVIEW_FRAME_OVERHEAD;
 use crate::apps::theme::Theme;
 use crate::runner::CodeId;
 use upmd_parser::nodes::{
-    Alignment, Code, Dependencies, DepsToken, ListKind, Table as MarkdownTable, TaskStatus,
+    Alignment, Code, DepsToken, ListKind, Table as MarkdownTable, TaskStatus,
 };
 
 use crate::apps::task::Task;
@@ -982,7 +982,7 @@ impl<'a> MarkdownRenderer<'a> {
         };
         let mut left = vec![(left_text, info_style)];
 
-        if matches!(code.dependencies, Dependencies::Invalid(_)) {
+        if code.dependencies.is_err() {
             left.push((" [invalid]".to_string(), info_style.fg(self.theme.error)));
         } else {
             for token in code.dependencies.segments() {
