@@ -2,9 +2,7 @@ pub mod nodes;
 pub mod options;
 pub mod parser;
 
-pub use nodes::{
-    resolve_code_block, resolve_dependencies, Code, CodeId, Dependencies, Heading, Node,
-};
+pub use nodes::{resolve_code_block, Code, CodeId, Dependencies, Heading, Node};
 
 /// Completeness of [`Document::nodes`].
 #[derive(Clone, Debug, PartialEq, Eq)]

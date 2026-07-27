@@ -17,10 +17,10 @@ use upmd_runtime::{
 
 use crate::apps::{
     config::{ERROR_SYMBOL, SUCCESS_SYMBOL},
-    scheduler::DependencyGraph,
     task::TaskStatus,
     theme::Theme,
     tui::{layout::centered_rect, widgets::Spinner, Shortcut},
+    workflow::DependencyGraph,
 };
 
 /// Scrollable dependency graph popup.
@@ -79,7 +79,7 @@ impl Dependencies {
         )
     }
 
-    pub fn for_schedule(
+    pub fn for_workflow(
         codes: &[Code],
         graph: Option<DependencyGraph>,
         statuses: HashMap<CodeId, TaskStatus>,
@@ -87,10 +87,10 @@ impl Dependencies {
         keymap: DerivedConfig<Action>,
     ) -> Self {
         Self::new(
-            "Schedule Dependencies",
+            "Workflow Dependencies",
             codes,
             graph.map(Ok),
-            "No active schedule",
+            "No active workflow",
             statuses,
             theme,
             keymap,

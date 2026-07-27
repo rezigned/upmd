@@ -1,42 +1,57 @@
+//! Builds and advances workflows for Markdown code blocks.
+//!
+//! A workflow resolves block dependencies into topologically ordered layers.
+//! Blocks in the same layer have no ordering constraints and can run
+//! concurrently. A later layer starts only after the current layer finishes.
+//!
+//! ```text
+//!   Declaration        Dependency graph       Execution layers
+//!
+//! [deps: "B | C"]         B ──┬──→ A          ┌─────┐  ┌─────┐
+//!   on block A                │               │ B C │  │  A  │
+//!                         C ──┘               └─────┘  └─────┘
+//!                                             layer 0  layer 1
+//! ```
+//!
+//! Target workflows run each layer as one concurrent batch. All-block
+//! workflows flatten the layers into one-block batches, preserving dependency
+//! order and using source order as the tie-breaker.
+
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use upmd_parser::{resolve_dependencies, Code, CodeId};
+use upmd_parser::{resolve_code_block, Code, CodeId};
 
-/// Tracks a block that failed during execution.
+/// A block that failed during execution.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BlockFailure {
     pub block: CodeId,
     pub exit_code: Option<i32>,
 }
 
-/// Result of advancing the scheduler past a completed block.
+/// Result of advancing the workflow past a completed block.
 #[derive(Debug, PartialEq, Eq)]
-pub enum AdvanceResult {
-    /// The next batch of blocks to run concurrently.
+pub enum WorkflowTransition {
+    /// Next concurrent batch ready to run.
     NextBatch(Vec<CodeId>),
-    /// Blocks are still running in the current batch.
+    /// Current batch still in progress.
     Pending,
     /// All blocks have finished.
     Finished { failed: bool },
-    /// A failure occurred and policy is Stop; no more batches.
+    /// A failure occurred; remaining batches cancelled.
     Stopped(BlockFailure),
-    /// The given block was not being tracked by the scheduler.
+    /// The given block was not tracked by the workflow.
     Untracked,
 }
 
-/// Whether the scheduler stops or continues after a failure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FailurePolicy {
     Continue,
     Stop,
 }
 
-/// Drives block execution in dependency order.
-///
-/// Produces batches of concurrent blocks.  A batch is a group of blocks whose
-/// dependencies are all satisfied and that have no dependency on each other.
+/// An execution plan that runs blocks in dependency order.
 #[derive(Debug)]
-pub struct Scheduler {
+pub struct Workflow {
     pending: VecDeque<Vec<CodeId>>,
     running: HashSet<CodeId>,
     blocked: HashSet<CodeId>,
@@ -47,12 +62,9 @@ pub struct Scheduler {
     skip_succeeded: bool,
 }
 
-impl Scheduler {
-    /// Creates a scheduler that runs _all_ blocks in order.
-    ///
-    /// Blocks with no dependencies run first, one at a time, preserving source
-    /// order.  Failed blocks skip their dependents but do not stop other blocks.
-    /// Set `auto_run` to start execution immediately after creation.
+impl Workflow {
+    /// Runs all blocks sequentially, one at a time, preserving source order.
+    /// Failed blocks skip their dependents but do not stop other blocks.
     pub fn for_all(codes: &[Code], auto_run: bool) -> Result<Self, String> {
         let graph = DependencyGraph::for_all(codes)?;
         let pending = graph
@@ -61,6 +73,7 @@ impl Scheduler {
             .flatten()
             .map(|&id| vec![id])
             .collect();
+
         Ok(Self::new(
             pending,
             graph,
@@ -70,16 +83,14 @@ impl Scheduler {
         ))
     }
 
-    /// Creates a scheduler that runs only the dependency chain of `target`.
-    ///
-    /// Blocks are grouped into batches: blocks in the same group run
-    /// concurrently, batches are sequential.  On failure, remaining batches are
-    /// cancelled and `Stopped` is returned.
+    /// Runs the dependency chain of `target`.
+    /// Blocks in the same group run concurrently; groups are sequential.
+    /// On failure, remaining groups are cancelled and `Stopped` is returned.
     pub fn for_target(codes: &[Code], target: CodeId) -> Result<Self, String> {
         Self::build_target(codes, target, true)
     }
 
-    /// Creates a target scheduler that re-executes previously successful dependencies.
+    /// Runs the dependency chain of `target`, re-executing all prerequisites.
     pub fn for_target_rerun(codes: &[Code], target: CodeId) -> Result<Self, String> {
         Self::build_target(codes, target, false)
     }
@@ -131,9 +142,9 @@ impl Scheduler {
     /// Call once per block when it finishes.  The caller provides `exit_code`:
     /// `Some(0)` for success, `Some(n)` for failure, or `None` if the process
     /// was externally killed.
-    pub fn advance(&mut self, block: CodeId, exit_code: Option<i32>) -> AdvanceResult {
+    pub fn advance(&mut self, block: CodeId, exit_code: Option<i32>) -> WorkflowTransition {
         if !self.running.remove(&block) {
-            return AdvanceResult::Untracked;
+            return WorkflowTransition::Untracked;
         }
 
         if exit_code != Some(0) {
@@ -145,25 +156,25 @@ impl Scheduler {
         }
 
         if !self.running.is_empty() {
-            return AdvanceResult::Pending;
+            return WorkflowTransition::Pending;
         }
 
         if self.failure_policy == FailurePolicy::Stop {
             if let Some(failure) = self.failure {
                 self.pending.clear();
-                return AdvanceResult::Stopped(failure);
+                return WorkflowTransition::Stopped(failure);
             }
         }
 
         self.take_next_batch().map_or_else(
-            || AdvanceResult::Finished {
+            || WorkflowTransition::Finished {
                 failed: self.failure.is_some(),
             },
-            AdvanceResult::NextBatch,
+            WorkflowTransition::NextBatch,
         )
     }
 
-    /// The target block this schedule is working toward, if any.
+    /// The target block this workflow is working toward, if any.
     pub fn target(&self) -> Option<CodeId> {
         self.graph.target()
     }
@@ -172,20 +183,18 @@ impl Scheduler {
         &self.graph
     }
 
-    /// Whether the scheduler should start running immediately.
     pub fn auto_run(&self) -> bool {
         self.auto_run
     }
 
     /// Whether `block` should execute given its previous result.
     ///
-    /// Normal plans reuse successful prerequisites while always executing the
-    /// target. Explicit rerun plans execute the entire dependency chain.
+    /// Standard execution skips successful non-target prerequisites.
+    /// Rerun execution runs the entire dependency chain.
     pub fn should_execute(&self, block: CodeId, succeeded: bool) -> bool {
         !self.skip_succeeded || !succeeded || self.graph.target() == Some(block)
     }
 
-    /// Whether `block` is currently executing.
     pub fn is_running(&self, block: CodeId) -> bool {
         self.running.contains(&block)
     }
@@ -223,6 +232,7 @@ impl Scheduler {
     }
 }
 
+/// Topologically sorted dependency layers and their edge map.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DependencyGraph {
     layers: Vec<Vec<CodeId>>,
@@ -233,12 +243,12 @@ pub struct DependencyGraph {
 impl DependencyGraph {
     pub fn for_all(codes: &[Code]) -> Result<Self, String> {
         let ids = codes.iter().map(|code| code.id).collect::<HashSet<_>>();
-        build_plan(codes, &ids, None)
+        build_dependency_graph(codes, &ids, None)
     }
 
     pub fn for_target(codes: &[Code], target: CodeId) -> Result<Self, String> {
         let ids = collect_dependencies(codes, target)?;
-        build_plan(codes, &ids, Some(target))
+        build_dependency_graph(codes, &ids, Some(target))
     }
 
     pub fn layers(&self) -> &[Vec<CodeId>] {
@@ -263,7 +273,7 @@ fn collect_dependencies(codes: &[Code], target: CodeId) -> Result<HashSet<CodeId
             .iter()
             .find(|code| code.id == id)
             .ok_or_else(|| format!("block {id} not found"))?;
-        for dependency in dependencies_for(codes, code)?.into_iter().flatten() {
+        for dependency in resolve_dependencies_for(codes, code)?.into_iter().flatten() {
             if selected.insert(dependency) {
                 stack.push(dependency);
             }
@@ -272,11 +282,8 @@ fn collect_dependencies(codes: &[Code], target: CodeId) -> Result<HashSet<CodeId
     Ok(selected)
 }
 
-/// Builds a topological layer plan from a selected subset of blocks.
-///
-/// Returns layers (batches of concurrent blocks) and the dependency edges for
-/// dependent-blocking on failure.  Errors on cycles.
-fn build_plan(
+/// Builds a `DependencyGraph` via topological sort from a selected subset of blocks.
+fn build_dependency_graph(
     codes: &[Code],
     selected: &HashSet<CodeId>,
     target: Option<CodeId>,
@@ -293,7 +300,7 @@ fn build_plan(
     let mut edges = HashMap::<CodeId, HashSet<CodeId>>::new();
 
     for code in codes.iter().filter(|code| selected.contains(&code.id)) {
-        let groups = dependencies_for(codes, code)?;
+        let groups = resolve_dependencies_for(codes, code)?;
         for &dependency in groups.iter().flatten() {
             add_edge(dependency, code.id, &mut edges, &mut in_degree);
         }
@@ -355,13 +362,51 @@ fn build_plan(
     })
 }
 
-/// Resolves the dependency names of `code` into block IDs.
-fn dependencies_for(codes: &[Code], code: &Code) -> Result<Vec<Vec<CodeId>>, String> {
-    resolve_dependencies(codes, &code.dependencies)
-        .map_err(|error| format!("block {}: {error}", code.id))
+/// Resolves a block's dependency names and numeric IDs while preserving groups.
+fn resolve_dependencies_for(codes: &[Code], code: &Code) -> Result<Vec<Vec<CodeId>>, String> {
+    let groups = code
+        .deps
+        .groups()
+        .map_err(|error| format!("block {}: {error}", code.id))?;
+    let mut seen = HashSet::new();
+
+    groups
+        .iter()
+        .map(|group| {
+            group
+                .iter()
+                .map(|dependency| {
+                    let matches = resolve_code_block(codes, dependency);
+                    let id = match matches.as_slice() {
+                        [] => {
+                            return Err(format!(
+                                "block {}: dependency {dependency:?} not found in document",
+                                code.id
+                            ))
+                        }
+                        [id] => *id,
+                        _ => {
+                            return Err(format!(
+                                "block {}: dependency {dependency:?} is ambiguous ({} matches)",
+                                code.id,
+                                matches.len()
+                            ))
+                        }
+                    };
+
+                    if !seen.insert(id) {
+                        return Err(format!(
+                            "block {}: dependency {dependency:?} refers to block {id}, which is already listed",
+                            code.id
+                        ));
+                    }
+                    Ok(id)
+                })
+                .collect()
+        })
+        .collect()
 }
 
-/// Adds a directed edge `from -> to` in the dependency graph.
 fn add_edge(
     from: CodeId,
     to: CodeId,
@@ -375,25 +420,50 @@ fn add_edge(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
-    use upmd_parser::nodes::Options;
+    use upmd_parser::options;
 
     use super::*;
 
     fn code(id: CodeId, name: &str, dependencies: Option<&str>) -> Code {
-        let mut attrs = HashMap::from([("name".to_string(), name.to_string())]);
-        if let Some(dependencies) = dependencies {
-            attrs.insert("deps".to_string(), dependencies.to_string());
+        let mut attrs = Vec::new();
+        if !name.is_empty() {
+            attrs.push(format!("name:{name}"));
         }
-        Code::new(
-            id,
-            String::new(),
-            Options {
-                language: "sh".to_string(),
-                attrs,
-            },
-        )
+        if let Some(dependencies) = dependencies {
+            attrs.push(format!(r#"deps:"{dependencies}""#));
+        }
+        let info = if attrs.is_empty() {
+            "sh".to_string()
+        } else {
+            format!("sh [{}]", attrs.join(", "))
+        };
+        Code::new(id, String::new(), options::parse(&info))
+    }
+
+    #[test]
+    fn dependency_groups_resolve_names_and_numeric_ids() {
+        let codes = vec![
+            code(1, "setup", None),
+            code(2, "build", None),
+            code(3, "test", None),
+            code(10, "", None),
+            code(20, "", None),
+        ];
+
+        for (dependencies, expected) in [
+            ("setup", vec![vec![1]]),
+            ("test", vec![vec![3]]),
+            ("10, 20", vec![vec![10], vec![20]]),
+            ("build", vec![vec![2]]),
+        ] {
+            let target = code(30, "target", Some(dependencies));
+            assert_eq!(resolve_dependencies_for(&codes, &target).unwrap(), expected);
+        }
+
+        let target = code(30, "target", Some("missing"));
+        assert!(resolve_dependencies_for(&codes, &target)
+            .unwrap_err()
+            .starts_with("block 30:"));
     }
 
     #[test]
@@ -406,24 +476,24 @@ mod tests {
             code(5, "target", Some("setup, build | lint, test")),
         ];
 
-        let mut scheduler = Scheduler::for_target(&codes, 5).unwrap();
-        assert_eq!(scheduler.start(), Some(vec![1]));
+        let mut workflow = Workflow::for_target(&codes, 5).unwrap();
+        assert_eq!(workflow.start(), Some(vec![1]));
         assert_eq!(
-            scheduler.advance(1, Some(0)),
-            AdvanceResult::NextBatch(vec![2, 3])
+            workflow.advance(1, Some(0)),
+            WorkflowTransition::NextBatch(vec![2, 3])
         );
-        assert_eq!(scheduler.advance(2, Some(0)), AdvanceResult::Pending);
+        assert_eq!(workflow.advance(2, Some(0)), WorkflowTransition::Pending);
         assert_eq!(
-            scheduler.advance(3, Some(0)),
-            AdvanceResult::NextBatch(vec![4])
-        );
-        assert_eq!(
-            scheduler.advance(4, Some(0)),
-            AdvanceResult::NextBatch(vec![5])
+            workflow.advance(3, Some(0)),
+            WorkflowTransition::NextBatch(vec![4])
         );
         assert_eq!(
-            scheduler.advance(5, Some(0)),
-            AdvanceResult::Finished { failed: false }
+            workflow.advance(4, Some(0)),
+            WorkflowTransition::NextBatch(vec![5])
+        );
+        assert_eq!(
+            workflow.advance(5, Some(0)),
+            WorkflowTransition::Finished { failed: false }
         );
     }
 
@@ -431,11 +501,11 @@ mod tests {
     fn target_rerun_executes_successful_dependencies_again() {
         let codes = vec![code(1, "setup", None), code(2, "target", Some("setup"))];
 
-        let normal = Scheduler::for_target(&codes, 2).unwrap();
+        let normal = Workflow::for_target(&codes, 2).unwrap();
         assert!(!normal.should_execute(1, true));
         assert!(normal.should_execute(2, true));
 
-        let rerun = Scheduler::for_target_rerun(&codes, 2).unwrap();
+        let rerun = Workflow::for_target_rerun(&codes, 2).unwrap();
         assert!(rerun.should_execute(1, true));
         assert!(rerun.should_execute(2, true));
     }
@@ -448,19 +518,19 @@ mod tests {
             code(3, "setup", None),
         ];
 
-        let mut scheduler = Scheduler::for_target(&codes, 1).unwrap();
-        assert_eq!(scheduler.start(), Some(vec![3]));
+        let mut workflow = Workflow::for_target(&codes, 1).unwrap();
+        assert_eq!(workflow.start(), Some(vec![3]));
         assert_eq!(
-            scheduler.advance(3, Some(0)),
-            AdvanceResult::NextBatch(vec![2])
+            workflow.advance(3, Some(0)),
+            WorkflowTransition::NextBatch(vec![2])
         );
         assert_eq!(
-            scheduler.advance(2, Some(0)),
-            AdvanceResult::NextBatch(vec![1])
+            workflow.advance(2, Some(0)),
+            WorkflowTransition::NextBatch(vec![1])
         );
         assert_eq!(
-            scheduler.advance(1, Some(0)),
-            AdvanceResult::Finished { failed: false }
+            workflow.advance(1, Some(0)),
+            WorkflowTransition::Finished { failed: false }
         );
     }
 
@@ -472,24 +542,24 @@ mod tests {
             code(3, "setup", None),
         ];
 
-        let mut scheduler = Scheduler::for_all(&codes, false).unwrap();
-        assert_eq!(scheduler.start(), Some(vec![2]));
+        let mut workflow = Workflow::for_all(&codes, false).unwrap();
+        assert_eq!(workflow.start(), Some(vec![2]));
         assert_eq!(
-            scheduler.advance(2, Some(0)),
-            AdvanceResult::NextBatch(vec![3])
+            workflow.advance(2, Some(0)),
+            WorkflowTransition::NextBatch(vec![3])
         );
         assert_eq!(
-            scheduler.advance(3, Some(0)),
-            AdvanceResult::NextBatch(vec![1])
+            workflow.advance(3, Some(0)),
+            WorkflowTransition::NextBatch(vec![1])
         );
         assert_eq!(
-            scheduler.advance(1, Some(0)),
-            AdvanceResult::Finished { failed: false }
+            workflow.advance(1, Some(0)),
+            WorkflowTransition::Finished { failed: false }
         );
     }
 
     #[test]
-    fn graph_uses_scheduler_validation() {
+    fn graph_uses_workflow_validation() {
         let codes = vec![
             code(1, "same", None),
             code(2, "same", None),
@@ -518,15 +588,15 @@ mod tests {
             code(2, "b", Some("a")),
             code(3, "independent", None),
         ];
-        let scheduler = Scheduler::for_all(&codes, false).unwrap();
-        assert_eq!(scheduler.graph().layers(), &[vec![1, 3], vec![2]]);
-        assert_eq!(scheduler.graph().target(), None);
+        let workflow = Workflow::for_all(&codes, false).unwrap();
+        assert_eq!(workflow.graph().layers(), &[vec![1, 3], vec![2]]);
+        assert_eq!(workflow.graph().target(), None);
     }
 
     #[test]
     fn cycles_and_ambiguous_names_are_rejected() {
         let cycle = vec![code(1, "a", Some("b")), code(2, "b", Some("a"))];
-        assert!(Scheduler::for_all(&cycle, false)
+        assert!(Workflow::for_all(&cycle, false)
             .unwrap_err()
             .contains("cycle"));
 
@@ -535,7 +605,7 @@ mod tests {
             code(2, "same", None),
             code(3, "target", Some("same")),
         ];
-        assert!(Scheduler::for_target(&ambiguous, 3)
+        assert!(Workflow::for_target(&ambiguous, 3)
             .unwrap_err()
             .contains("ambiguous"));
     }
@@ -543,8 +613,8 @@ mod tests {
     #[test]
     fn target_validation_ignores_unrelated_blocks() {
         let codes = vec![code(1, "target", None), code(2, "broken", Some("missing"))];
-        assert!(Scheduler::for_target(&codes, 1).is_ok());
-        assert!(Scheduler::for_all(&codes, false).is_err());
+        assert!(Workflow::for_target(&codes, 1).is_ok());
+        assert!(Workflow::for_all(&codes, false).is_err());
     }
 
     #[test]
@@ -554,13 +624,13 @@ mod tests {
             code(2, "b", None),
             code(3, "target", Some("a | b")),
         ];
-        let mut scheduler = Scheduler::for_target(&codes, 3).unwrap();
+        let mut workflow = Workflow::for_target(&codes, 3).unwrap();
 
-        assert_eq!(scheduler.start(), Some(vec![1, 2]));
-        assert_eq!(scheduler.advance(1, Some(7)), AdvanceResult::Pending);
+        assert_eq!(workflow.start(), Some(vec![1, 2]));
+        assert_eq!(workflow.advance(1, Some(7)), WorkflowTransition::Pending);
         assert_eq!(
-            scheduler.advance(2, Some(0)),
-            AdvanceResult::Stopped(BlockFailure {
+            workflow.advance(2, Some(0)),
+            WorkflowTransition::Stopped(BlockFailure {
                 block: 1,
                 exit_code: Some(7)
             })
@@ -574,16 +644,16 @@ mod tests {
             code(2, "dependent", Some("fail")),
             code(3, "independent", None),
         ];
-        let mut scheduler = Scheduler::for_all(&codes, true).unwrap();
+        let mut workflow = Workflow::for_all(&codes, true).unwrap();
 
-        assert_eq!(scheduler.start(), Some(vec![1]));
+        assert_eq!(workflow.start(), Some(vec![1]));
         assert_eq!(
-            scheduler.advance(1, Some(1)),
-            AdvanceResult::NextBatch(vec![3])
+            workflow.advance(1, Some(1)),
+            WorkflowTransition::NextBatch(vec![3])
         );
         assert_eq!(
-            scheduler.advance(3, Some(0)),
-            AdvanceResult::Finished { failed: true }
+            workflow.advance(3, Some(0)),
+            WorkflowTransition::Finished { failed: true }
         );
     }
 }

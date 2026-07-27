@@ -6,10 +6,10 @@ pub mod config;
 pub mod exec;
 pub mod navigation;
 pub mod picker;
-pub mod scheduler;
 pub mod task;
 mod theme;
 pub mod tui;
+pub mod workflow;
 
 /// Target directory for writing files.
 ///

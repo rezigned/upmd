@@ -3,11 +3,11 @@
 use crate::apps::config::{self, Config as AppConfig};
 use crate::apps::exec;
 use crate::apps::navigation::Navigation;
-use crate::apps::scheduler::{AdvanceResult, Scheduler};
 use crate::apps::tui;
 use crate::apps::tui::{
     confirm, dependencies, file_picker, layout, menu, preview, tasks::Tasks, themes, Shortcut,
 };
+use crate::apps::workflow::{Workflow, WorkflowTransition};
 use crate::utils::key_to_bytes;
 use color_eyre::Result;
 use keymap::{DerivedConfig, KeyMap};
@@ -77,7 +77,7 @@ pub struct App {
     file_picker_root: Option<PathBuf>,
     themes: Option<themes::ThemeSelector>,
     output: tui::output::Output,
-    scheduler: Option<Scheduler>,
+    workflow: Option<Workflow>,
     pending_states: BTreeMap<CodeId, (Option<config::Envs>, Option<PathBuf>)>,
     last_cwd: Option<PathBuf>,
     started: bool,
@@ -140,9 +140,9 @@ pub enum Action {
     /// Show dependency diagram
     #[key(";", help = "deps")]
     ShowDeps,
-    /// Show schedule's dependency diagram
-    #[key("'", help = "schedule deps")]
-    ShowScheduleDeps,
+    /// Show workflow's dependency diagram
+    #[key("'", help = "workflow deps")]
+    ShowWorkflowDeps,
     /// Quit
     #[key("q", "ctrl-c", help = "quit")]
     Quit,
@@ -232,7 +232,7 @@ impl App {
             menu,
             themes: None,
             output: tui::output::Output::new(config.keymap.output()),
-            scheduler: None,
+            workflow: None,
             pending_states: BTreeMap::new(),
             last_cwd: None,
             notification: None,
@@ -350,15 +350,15 @@ impl App {
                 .get(id)
                 .is_some_and(|task| task.exit_code == Some(0));
             let should_execute = self
-                .scheduler
+                .workflow
                 .as_ref()
-                .is_none_or(|scheduler| scheduler.should_execute(id, succeeded));
+                .is_none_or(|workflow| workflow.should_execute(id, succeeded));
             if !should_execute {
-                completed = self.advance_scheduler(id, Some(0));
+                completed = self.advance_workflow(id, Some(0));
             } else if let Some(command) = self.execute_block(id) {
                 commands.push(command);
             } else {
-                completed = self.advance_scheduler(id, Some(1));
+                completed = self.advance_workflow(id, Some(1));
             }
         }
 
@@ -375,17 +375,17 @@ impl App {
         }
     }
 
-    fn start_plan(&mut self, mut scheduler: Scheduler) -> Option<Cmd<Msg>> {
-        let auto_run = scheduler.auto_run();
-        let batch = scheduler.start()?;
-        self.scheduler = Some(scheduler);
+    fn start_plan(&mut self, mut workflow: Workflow) -> Option<Cmd<Msg>> {
+        let auto_run = workflow.auto_run();
+        let batch = workflow.start()?;
+        self.workflow = Some(workflow);
         self.select_batch(&batch);
         auto_run.then(|| self.launch_batch(batch)).flatten()
     }
 
     fn start_all(&mut self) -> Option<Cmd<Msg>> {
-        match Scheduler::for_all(self.preview.codes(), self.config.yes) {
-            Ok(scheduler) => self.start_plan(scheduler),
+        match Workflow::for_all(self.preview.codes(), self.config.yes) {
+            Ok(workflow) => self.start_plan(workflow),
             Err(error) => {
                 self.notify_error(error);
                 None
@@ -394,8 +394,8 @@ impl App {
     }
 
     fn start_target(&mut self, id: CodeId) -> Option<Cmd<Msg>> {
-        match Scheduler::for_target(self.preview.codes(), id) {
-            Ok(scheduler) => self.start_plan(scheduler),
+        match Workflow::for_target(self.preview.codes(), id) {
+            Ok(workflow) => self.start_plan(workflow),
             Err(error) => {
                 self.notify_error(error);
                 None
@@ -404,8 +404,8 @@ impl App {
     }
 
     fn rerun_target(&mut self, id: CodeId) -> Option<Cmd<Msg>> {
-        match Scheduler::for_target_rerun(self.preview.codes(), id) {
-            Ok(scheduler) => self.start_plan(scheduler),
+        match Workflow::for_target_rerun(self.preview.codes(), id) {
+            Ok(workflow) => self.start_plan(workflow),
             Err(error) => {
                 self.notify_error(error);
                 None
@@ -414,48 +414,52 @@ impl App {
     }
 
     fn execute(&mut self, id: CodeId) -> Option<Cmd<Msg>> {
-        if let Some(scheduler) = &self.scheduler {
-            if !scheduler.is_running(id) {
+        if let Some(workflow) = &self.workflow {
+            if !workflow.is_running(id) {
                 return None;
             }
             return self.execute_block(id).or_else(|| {
-                self.advance_scheduler(id, Some(1))
+                self.advance_workflow(id, Some(1))
                     .and_then(|r| self.handle_advance(r))
             });
         }
         self.start_target(id)
     }
 
-    fn advance_scheduler(&mut self, id: CodeId, exit_code: Option<i32>) -> Option<AdvanceResult> {
-        self.scheduler
+    fn advance_workflow(
+        &mut self,
+        id: CodeId,
+        exit_code: Option<i32>,
+    ) -> Option<WorkflowTransition> {
+        self.workflow
             .as_mut()
-            .map(|scheduler| scheduler.advance(id, exit_code))
+            .map(|workflow| workflow.advance(id, exit_code))
     }
 
-    fn handle_advance(&mut self, result: AdvanceResult) -> Option<Cmd<Msg>> {
+    fn handle_advance(&mut self, result: WorkflowTransition) -> Option<Cmd<Msg>> {
         match result {
-            AdvanceResult::NextBatch(batch) => {
+            WorkflowTransition::NextBatch(batch) => {
                 self.flush_pending_states();
                 self.select_batch(&batch);
-                self.scheduler
+                self.workflow
                     .as_ref()
-                    .is_some_and(Scheduler::auto_run)
+                    .is_some_and(Workflow::auto_run)
                     .then(|| self.launch_batch(batch))
                     .flatten()
             }
-            AdvanceResult::Pending | AdvanceResult::Untracked => None,
-            AdvanceResult::Stopped(failure) => {
+            WorkflowTransition::Pending | WorkflowTransition::Untracked => None,
+            WorkflowTransition::Stopped(failure) => {
                 self.flush_pending_states();
-                self.scheduler = None;
+                self.workflow = None;
                 self.notify_error(format!(
                     "Block {} failed - stopping dependency chain",
                     failure.block
                 ));
                 None
             }
-            AdvanceResult::Finished { .. } => {
+            WorkflowTransition::Finished { .. } => {
                 self.flush_pending_states();
-                self.scheduler = None;
+                self.workflow = None;
                 None
             }
         }
@@ -465,11 +469,7 @@ impl App {
         // Don't auto-navigate when running a specific target — stay on the
         // block the user originally selected.  In for_all mode (no target)
         // navigation follows the execution order.
-        let has_target = self
-            .scheduler
-            .as_ref()
-            .and_then(Scheduler::target)
-            .is_some();
+        let has_target = self.workflow.as_ref().and_then(Workflow::target).is_some();
         if has_target {
             return;
         }
@@ -887,12 +887,12 @@ impl App {
                 self.mode = Mode::Dependencies;
                 None
             }
-            Action::ShowScheduleDeps => {
+            Action::ShowWorkflowDeps => {
                 let graph = self
-                    .scheduler
+                    .workflow
                     .as_ref()
-                    .map(|scheduler| scheduler.graph().clone());
-                self.dependencies = Some(dependencies::Dependencies::for_schedule(
+                    .map(|workflow| workflow.graph().clone());
+                self.dependencies = Some(dependencies::Dependencies::for_workflow(
                     self.preview.codes(),
                     graph,
                     self.tasks.task_statuses(),
@@ -1532,7 +1532,7 @@ impl App {
             self.config.tui.inline_max_lines(),
             self.config.keymap.preview::<preview::Action>(),
         );
-        self.scheduler = None;
+        self.workflow = None;
         self.dependencies = None;
         self.pending_states.clear();
         self.started = false;
@@ -1635,7 +1635,7 @@ impl App {
             .then(|| task?.captured_cwd.as_deref().map(PathBuf::from))
             .flatten();
 
-        if self.scheduler.is_none() {
+        if self.workflow.is_none() {
             if let Some(env) = env {
                 self.envs.merge_envs(env);
             }
@@ -1719,7 +1719,7 @@ impl App {
             if exit_code != Some(0) {
                 self.pending_states.remove(&id);
             }
-            let result = self.advance_scheduler(id, exit_code)?;
+            let result = self.advance_workflow(id, exit_code)?;
             return self.handle_advance(result);
         }
         None
@@ -2129,7 +2129,7 @@ mod tests {
 
         app.reload();
 
-        assert!(app.scheduler.is_none());
+        assert!(app.workflow.is_none());
         assert!(!app.started);
         assert_eq!(app.menu.selected(), Some(2));
     }
@@ -2140,18 +2140,18 @@ mod tests {
         let mut app = app_for_reload(Path::new("unused.md"), markdown, true, Some("2"));
         app.config.file = None;
         let selected_before = app.menu.selected();
-        let had_plan = app.scheduler.is_some();
+        let had_plan = app.workflow.is_some();
 
         app.reload();
 
         assert_eq!(app.menu.selected(), selected_before);
-        assert_eq!(app.scheduler.is_some(), had_plan);
+        assert_eq!(app.workflow.is_some(), had_plan);
         let notification = app.notification.as_ref().unwrap();
         assert_eq!(notification.kind, tui::notification::FlashKind::Error);
         assert_eq!(notification.text, "No file path in config, cannot reload");
     }
     #[test]
-    fn dependency_popup_uses_scheduler_validation() {
+    fn dependency_popup_uses_workflow_validation() {
         let markdown = "\
 ```sh [name:dup]\n:\n```\n\
 ```sh [name:dup]\n:\n```\n\
@@ -2175,7 +2175,7 @@ mod tests {
     }
 
     #[test]
-    fn schedule_popup_keeps_all_mode_graph() {
+    fn workflow_popup_keeps_all_mode_graph() {
         let markdown = "\
 ```sh [name:a]\n:\n```\n\
 ```sh [name:b, deps:a]\n:\n```\n\
@@ -2183,7 +2183,7 @@ mod tests {
         let mut app = App::new(upmd_parser::new().parse(markdown), AppConfig::default());
         app.start_all();
 
-        app.handle_action(Action::ShowScheduleDeps);
+        app.handle_action(Action::ShowWorkflowDeps);
 
         let graph = app
             .dependencies

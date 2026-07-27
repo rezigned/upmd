@@ -5,11 +5,11 @@ use std::{
 
 use upmd_parser::CodeId;
 
-use crate::apps::scheduler::AdvanceResult;
+use crate::apps::workflow::WorkflowTransition;
 
-/// Output lifecycle for scheduler batches in the CLI frontend.
+/// Output lifecycle for workflow batches in the CLI frontend.
 ///
-/// The scheduler remains the source of batch ordering. This state records only
+/// The workflow remains the source of batch ordering. This state records only
 /// blocks that actually execute, queues completed batches for deterministic
 /// rendering, and tracks the transient terminal dashboard height.
 pub struct BatchOutput {
@@ -54,8 +54,11 @@ impl BatchOutput {
         }
     }
 
-    pub fn complete(&mut self, result: &AdvanceResult) {
-        if matches!(result, AdvanceResult::Pending | AdvanceResult::Untracked) {
+    pub fn complete(&mut self, result: &WorkflowTransition) {
+        if matches!(
+            result,
+            WorkflowTransition::Pending | WorkflowTransition::Untracked
+        ) {
             return;
         }
         self.scheduled.clear();
@@ -106,16 +109,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn completed_batch_preserves_scheduler_order() {
+    fn completed_batch_preserves_workflow_order() {
         let mut output = BatchOutput::new();
         output.select(&[1, 2]);
         output.track(1);
         output.track(2);
 
-        output.complete(&AdvanceResult::Pending);
+        output.complete(&WorkflowTransition::Pending);
         assert!(output.take_pending().is_empty());
 
-        output.complete(&AdvanceResult::NextBatch(vec![3]));
+        output.complete(&WorkflowTransition::NextBatch(vec![3]));
         assert_eq!(output.take_pending(), VecDeque::from([vec![1, 2]]));
     }
 

@@ -982,10 +982,10 @@ impl<'a> MarkdownRenderer<'a> {
         };
         let mut left = vec![(left_text, info_style)];
 
-        if code.dependencies.is_err() {
+        if code.deps.is_err() {
             left.push((" [invalid]".to_string(), info_style.fg(self.theme.error)));
         } else {
-            for token in code.dependencies.segments() {
+            for token in code.deps.segments() {
                 let style = match token {
                     DepsToken::Punct(_) => info_style.patch(self.theme.muted_style()),
                     DepsToken::Name(_) => info_style,

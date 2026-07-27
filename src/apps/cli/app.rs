@@ -21,9 +21,9 @@ use crate::{
     },
     apps::exec,
     apps::navigation::Navigation,
-    apps::scheduler::{AdvanceResult, Scheduler},
     apps::task,
     apps::theme::{ansi_bg, ansi_fg, ansi_style, Theme},
+    apps::workflow::{Workflow, WorkflowTransition},
     pty::process::Size,
     pty::stream::Stream,
     utils::key_to_bytes,
@@ -42,7 +42,7 @@ pub struct App {
     theme: Theme,
     keymap: DerivedConfig<Action>,
     nav_keymap: DerivedConfig<Navigation>,
-    scheduler: Option<Scheduler>,
+    workflow: Option<Workflow>,
     envs: Envs,
     cwd: PathBuf,
     batch_output: BatchOutput,
@@ -105,7 +105,7 @@ impl App {
             theme: config.theme.clone(),
             keymap,
             nav_keymap: config.keymap.cli::<Navigation>(),
-            scheduler: None,
+            workflow: None,
             envs,
             cwd,
             batch_output: BatchOutput::new(),
@@ -157,7 +157,7 @@ impl App {
             }
             None => 0,
         };
-        self.scheduler = None;
+        self.workflow = None;
         self.outputs.borrow_mut().clear();
         self.batch_output.reset();
         self.pending_states.clear();
@@ -174,15 +174,15 @@ impl App {
                 .get(&id)
                 .is_some_and(|task| task.exit_code == Some(0));
             let should_execute = self
-                .scheduler
+                .workflow
                 .as_ref()
-                .is_none_or(|scheduler| scheduler.should_execute(id, succeeded));
+                .is_none_or(|workflow| workflow.should_execute(id, succeeded));
             if !should_execute {
-                completed = self.advance_scheduler(id, Some(0));
+                completed = self.advance_workflow(id, Some(0));
             } else if let Some(command) = self.execute_block(id) {
                 commands.push(command);
             } else {
-                completed = self.advance_scheduler(id, Some(1));
+                completed = self.advance_workflow(id, Some(1));
             }
         }
 
@@ -199,26 +199,26 @@ impl App {
         }
     }
 
-    fn start_plan(&mut self, mut scheduler: Scheduler) -> Option<Cmd<Msg>> {
-        let auto_run = scheduler.auto_run();
-        let Some(batch) = scheduler.start() else {
+    fn start_plan(&mut self, mut workflow: Workflow) -> Option<Cmd<Msg>> {
+        let auto_run = workflow.auto_run();
+        let Some(batch) = workflow.start() else {
             return auto_run.then(Cmd::quit);
         };
-        self.scheduler = Some(scheduler);
+        self.workflow = Some(workflow);
         self.select_batch(&batch);
         auto_run.then(|| self.launch_batch(batch)).flatten()
     }
 
     fn start_all(&mut self) -> Option<Cmd<Msg>> {
-        match Scheduler::for_all(&self.codes, self.config.yes) {
-            Ok(scheduler) => self.start_plan(scheduler),
+        match Workflow::for_all(&self.codes, self.config.yes) {
+            Ok(workflow) => self.start_plan(workflow),
             Err(error) => self.plan_error(error),
         }
     }
 
     fn start_target(&mut self, id: CodeId) -> Option<Cmd<Msg>> {
-        match Scheduler::for_target(&self.codes, id) {
-            Ok(scheduler) => self.start_plan(scheduler),
+        match Workflow::for_target(&self.codes, id) {
+            Ok(workflow) => self.start_plan(workflow),
             Err(error) => self.plan_error(error),
         }
     }
@@ -235,9 +235,9 @@ impl App {
 
     fn execute_block(&mut self, id: CodeId) -> Option<Cmd<Msg>> {
         if self
-            .scheduler
+            .workflow
             .as_ref()
-            .is_some_and(|scheduler| scheduler.is_running(id))
+            .is_some_and(|workflow| workflow.is_running(id))
         {
             self.batch_output.track(id);
         }
@@ -274,44 +274,48 @@ impl App {
     }
 
     fn execute(&mut self, id: CodeId) -> Option<Cmd<Msg>> {
-        if let Some(scheduler) = &self.scheduler {
-            if !scheduler.is_running(id) {
+        if let Some(workflow) = &self.workflow {
+            if !workflow.is_running(id) {
                 return None;
             }
             return self.execute_block(id).or_else(|| {
-                self.advance_scheduler(id, Some(1))
+                self.advance_workflow(id, Some(1))
                     .and_then(|r| self.handle_advance(r))
             });
         }
         self.start_target(id)
     }
 
-    fn advance_scheduler(&mut self, id: CodeId, exit_code: Option<i32>) -> Option<AdvanceResult> {
+    fn advance_workflow(
+        &mut self,
+        id: CodeId,
+        exit_code: Option<i32>,
+    ) -> Option<WorkflowTransition> {
         let result = self
-            .scheduler
+            .workflow
             .as_mut()
-            .map(|scheduler| scheduler.advance(id, exit_code));
+            .map(|workflow| workflow.advance(id, exit_code));
         if let Some(result) = &result {
             self.batch_output.complete(result);
         }
         result
     }
 
-    fn handle_advance(&mut self, result: AdvanceResult) -> Option<Cmd<Msg>> {
+    fn handle_advance(&mut self, result: WorkflowTransition) -> Option<Cmd<Msg>> {
         match result {
-            AdvanceResult::NextBatch(batch) => {
+            WorkflowTransition::NextBatch(batch) => {
                 self.flush_pending_states();
                 self.select_batch(&batch);
-                self.scheduler
+                self.workflow
                     .as_ref()
-                    .is_some_and(Scheduler::auto_run)
+                    .is_some_and(Workflow::auto_run)
                     .then(|| self.launch_batch(batch))
                     .flatten()
             }
-            AdvanceResult::Pending | AdvanceResult::Untracked => None,
-            AdvanceResult::Stopped(failure) => {
+            WorkflowTransition::Pending | WorkflowTransition::Untracked => None,
+            WorkflowTransition::Stopped(failure) => {
                 self.flush_pending_states();
-                self.scheduler = None;
+                self.workflow = None;
                 eprintln!("Block {} failed - stopping dependency chain", failure.block);
                 if self.config.yes {
                     self.failed.set(true);
@@ -320,9 +324,9 @@ impl App {
                     None
                 }
             }
-            AdvanceResult::Finished { failed } => {
+            WorkflowTransition::Finished { failed } => {
                 self.flush_pending_states();
-                self.scheduler = None;
+                self.workflow = None;
                 if self.config.yes {
                     self.failed.set(failed);
                     Some(Cmd::quit())
@@ -371,7 +375,7 @@ impl App {
             if exit_code != Some(0) {
                 self.pending_states.remove(&id);
             }
-            let result = self.advance_scheduler(id, exit_code)?;
+            let result = self.advance_workflow(id, exit_code)?;
             return self.handle_advance(result);
         }
         None
@@ -441,7 +445,7 @@ impl App {
             .flatten();
         drop(outputs);
 
-        if self.scheduler.is_none() {
+        if self.workflow.is_none() {
             if let Some(captured) = env {
                 exec::merge_envs(&mut self.envs, &captured);
             }
@@ -908,7 +912,7 @@ impl Output for App {
 
         self.render_batch_tabs(&mut counter)?;
         writeln!(counter)?;
-        let deps_display = format!("{}", code.dependencies);
+        let deps_display = format!("{}", code.deps);
         let deps_str = if deps_display.is_empty() {
             String::new()
         } else {
@@ -1439,7 +1443,7 @@ print("2")
         app.batch_output.track(1);
         app.batch_output.track(2);
         app.batch_output
-            .complete(&AdvanceResult::NextBatch(vec![3]));
+            .complete(&WorkflowTransition::NextBatch(vec![3]));
 
         let mut buf = Vec::new();
         app.render(&mut buf).unwrap();
@@ -1475,7 +1479,7 @@ print("2")
         assert_eq!(app.codes[app.selected].id, 2);
 
         app.batch_output
-            .complete(&AdvanceResult::Finished { failed: false });
+            .complete(&WorkflowTransition::Finished { failed: false });
         app.batch_output.set_previous_lines(0);
         let mut committed = Vec::new();
         app.render(&mut committed).unwrap();

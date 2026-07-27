@@ -85,7 +85,7 @@ impl Menu {
         }
         let code_dependencies = codes
             .iter()
-            .filter(|code| !code.dependencies.is_empty())
+            .filter(|code| !code.deps.is_empty())
             .map(|code| code.id)
             .collect();
         Self {

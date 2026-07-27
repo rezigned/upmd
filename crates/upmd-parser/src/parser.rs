@@ -183,7 +183,7 @@ impl<'a> Parser<'a> {
         if content.trim().is_empty() {
             return None;
         }
-        let options = options::parse(&opts).unwrap_or_else(|_| options::with_language(&opts));
+        let options = options::parse(&opts);
         let code = Code::new(self.code_id_counter, content, options);
         self.code_id_counter += 1;
         let code_id = code.id;
@@ -692,10 +692,14 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_code_block_preserves_language_on_bad_attrs() {
-        let text = "```bash [name:foo bad]\necho hi\n```\n";
+    fn test_parse_code_block_recovers_valid_metadata_around_bad_attrs() {
+        let text = "```bash [name:foo bad, bin:zsh]\necho hi\n```\n";
         let doc = Cmark::new().parse(text);
-        let c = doc.codes.first().unwrap();
-        assert_eq!(c.language, "bash");
+        let code = doc.codes.first().unwrap();
+
+        assert_eq!(code.language, "bash");
+        assert_eq!(code.name, "foo");
+        assert_eq!(code.attrs.get("bin").map(String::as_str), Some("zsh"));
+        assert!(code.errors.iter().any(|error| error.contains("bad")));
     }
 }

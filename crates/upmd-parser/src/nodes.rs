@@ -1,7 +1,5 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::ops::Range;
-
-use crate::options;
 
 #[derive(Debug, Clone)]
 pub enum Node {
@@ -70,11 +68,11 @@ pub type CodeId = u32;
 /// `Ok(groups)` groups are comma-separated, `|` separates parallel items.
 /// `Err(error)` the attribute could not be parsed.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Dependencies(pub Result<DepsGroup, String>);
-type DepsGroup = Vec<Vec<String>>;
+pub struct Dependencies(pub Result<DepsGroups, String>);
+pub(crate) type DepsGroups = Vec<Vec<String>>;
 
 impl std::ops::Deref for Dependencies {
-    type Target = Result<DepsGroup, String>;
+    type Target = Result<DepsGroups, String>;
 
     fn deref(&self) -> &Self::Target {
         &self.0
@@ -154,45 +152,44 @@ pub struct Code {
     pub id: CodeId,
     pub language: String,
     pub name: String,
-    pub dependencies: Dependencies,
+    pub deps: Dependencies,
+    pub attrs: HashMap<String, String>,
+    /// Errors found while parsing the fence attributes.
+    pub errors: Vec<String>,
     pub content: String,
-    pub options: Options,
 }
 
-/// Parser options for a code block: language and custom attributes.
+/// Parsed language, attributes, and execution metadata for a code block.
 #[derive(Debug, Default, Clone)]
 pub struct Options {
     pub language: String,
+    pub name: String,
+    pub deps: Dependencies,
     /// Arbitrary key:value attributes from fence info (e.g. `name`, `bin`, ...).
     pub attrs: HashMap<String, String>,
+    /// Recoverable errors found while parsing the fence attributes.
+    pub errors: Vec<String>,
 }
 
 impl Code {
     pub fn new(id: u32, content: String, options: Options) -> Self {
-        let name = options.attrs.get("name").cloned().unwrap_or_default();
-        let dependencies =
-            match options::parse_dependencies(options.attrs.get("deps").map(String::as_str)) {
-                Ok(groups) => Dependencies(Ok(groups)),
-                Err(error) => Dependencies(Err(error)),
-            };
+        let Options {
+            language,
+            name,
+            deps,
+            attrs,
+            errors,
+        } = options;
 
         Self {
             id,
+            language,
             name,
-            dependencies,
+            deps,
+            attrs,
+            errors,
             content,
-            language: options.language.clone(),
-            options,
         }
-    }
-
-    /// Returns an excerpt from the code.
-    pub fn excerpt(&self, lines: usize) -> String {
-        self.content
-            .lines()
-            .take(lines)
-            .collect::<Vec<&str>>()
-            .join("\n")
     }
 }
 
@@ -212,67 +209,9 @@ pub fn resolve_code_block(codes: &[Code], spec: &str) -> Vec<CodeId> {
     }
 }
 
-/// Resolves dependency names and numeric IDs while preserving their groups.
-pub fn resolve_dependencies(
-    codes: &[Code],
-    dependencies: &Dependencies,
-) -> Result<Vec<Vec<CodeId>>, String> {
-    let groups = dependencies.groups()?;
-    let mut seen = HashSet::new();
-
-    groups
-        .iter()
-        .map(|group| {
-            group
-                .iter()
-                .map(|dependency| {
-                    let matches = resolve_code_block(codes, dependency);
-                    let id = match matches.as_slice() {
-                        [] => {
-                            return Err(format!(
-                                "dependency {dependency:?} not found in document"
-                            ))
-                        }
-                        [id] => *id,
-                        _ => {
-                            return Err(format!(
-                                "dependency {dependency:?} is ambiguous ({} matches)",
-                                matches.len()
-                            ))
-                        }
-                    };
-
-                    if !seen.insert(id) {
-                        return Err(format!(
-                            "dependency {dependency:?} refers to block {id}, which is already listed"
-                        ));
-                    }
-                    Ok(id)
-                })
-                .collect()
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_code_excerpt() {
-        let code = Code {
-            content: "line1\nline2\nline3".into(),
-            ..Default::default()
-        };
-        for (lines, expected) in [
-            (1, "line1"),
-            (2, "line1\nline2"),
-            (10, "line1\nline2\nline3"),
-        ] {
-            assert_eq!(code.excerpt(lines), expected);
-        }
-        assert_eq!(Code::default().excerpt(5), "");
-    }
 
     #[test]
     fn test_resolve_code_block() {
@@ -327,58 +266,11 @@ mod tests {
                 vec![vec!["setup"], vec!["build", "lint"], vec!["test"]],
             ),
         ] {
-            let code = Code::new(1, "echo hi".into(), crate::options::parse(info).unwrap());
-            assert_eq!(code.dependencies.groups().unwrap(), expected);
+            let code = Code::new(1, "echo hi".into(), crate::options::parse(info));
+            assert_eq!(code.deps.groups().unwrap(), expected);
         }
 
-        let code = Code::new(1, "echo hi".into(), crate::options::parse("sh").unwrap());
-        assert!(code.dependencies.is_empty());
-    }
-
-    #[test]
-    fn test_resolve_dependencies() {
-        let codes = vec![
-            Code {
-                id: 1,
-                name: "setup".into(),
-                ..Default::default()
-            },
-            Code {
-                id: 2,
-                name: "build".into(),
-                ..Default::default()
-            },
-            Code {
-                id: 3,
-                name: "test".into(),
-                ..Default::default()
-            },
-            Code {
-                id: 10,
-                ..Default::default()
-            },
-            Code {
-                id: 20,
-                ..Default::default()
-            },
-        ];
-        for (groups, expected) in [
-            (vec![vec!["setup".to_string()]], vec![vec![1]]),
-            (vec![vec!["test".to_string()]], vec![vec![3]]),
-            (
-                vec![vec!["10".to_string()], vec!["20".to_string()]],
-                vec![vec![10], vec![20]],
-            ),
-            (vec![vec!["build".to_string()]], vec![vec![2]]),
-        ] {
-            let dependencies = Dependencies(Ok(groups));
-            assert_eq!(
-                resolve_dependencies(&codes, &dependencies).unwrap(),
-                expected
-            );
-        }
-
-        let missing = Dependencies(Ok(vec![vec!["missing".to_string()]]));
-        assert!(resolve_dependencies(&codes, &missing).is_err());
+        let code = Code::new(1, "echo hi".into(), crate::options::parse("sh"));
+        assert!(code.deps.is_empty());
     }
 }
