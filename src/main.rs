@@ -45,9 +45,14 @@ fn main() -> Result<ExitCode> {
     let user_cfg = crate::apps::config::UserConfig::load();
     let mut config = args::build_config(args, user_cfg);
 
-    // No file argument on an interactive terminal: open current directory.
+    // No file argument on an interactive terminal: check for up.md/UP.md,
+    // otherwise open current directory for the file picker.
     if config.file.is_none() && std::io::stdin().is_terminal() {
-        config.file = Some(".".to_string());
+        config.file = ["up.md", "UP.md"]
+            .into_iter()
+            .find(|f| std::path::Path::new(f).exists())
+            .map(|f| f.to_string())
+            .or_else(|| Some(".".to_string()));
     }
 
     if is_cli {
