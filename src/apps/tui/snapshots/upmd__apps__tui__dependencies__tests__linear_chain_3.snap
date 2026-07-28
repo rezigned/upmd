@@ -2,4 +2,4 @@
 source: src/apps/tui/dependencies.rs
 expression: "lines.join(\"\\n\")"
 ---
- · a ─────→ · b ─────→ · c
+ · a ────→ · b ────→ · c

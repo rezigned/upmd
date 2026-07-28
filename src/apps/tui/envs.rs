@@ -210,8 +210,8 @@ impl EnvVars {
         self.items.map.clone()
     }
 
-    pub fn set_theme(&mut self, theme: Theme) {
-        self.theme = theme;
+    pub fn set_theme(&mut self, theme: &Theme) {
+        self.theme.clone_from(theme);
     }
 
     pub fn merge_envs(&mut self, envs: Envs) {

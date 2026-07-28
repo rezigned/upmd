@@ -94,12 +94,6 @@ help = "deps"
 keys = [";"]
 symbol = ";"
 
-[keymap.home.ShowWorkflowDeps]
-description = "Show workflow's dependency diagram"
-help = "workflow deps"
-keys = ["'"]
-symbol = "'"
-
 [keymap.home.SwitchTheme]
 description = "Switch theme"
 help = "theme"

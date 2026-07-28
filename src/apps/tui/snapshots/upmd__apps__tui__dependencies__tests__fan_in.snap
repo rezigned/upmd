@@ -2,6 +2,6 @@
 source: src/apps/tui/dependencies.rs
 expression: "lines.join(\"\\n\")"
 ---
- · a ──┬──→ · c 
-       │        
+ · a ──┬─→ · c 
+       │       
  · b ──┘

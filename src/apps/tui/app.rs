@@ -12,10 +12,11 @@ use crate::utils::key_to_bytes;
 use color_eyre::Result;
 use keymap::{DerivedConfig, KeyMap};
 use ratatui::{
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect, Spacing},
     style::Style,
+    symbols::merge::MergeStrategy,
     text::{Line, Span},
-    widgets::{Block, Paragraph},
+    widgets::{Block, Borders, Paragraph},
     Frame,
 };
 use std::{
@@ -85,6 +86,8 @@ pub struct App {
     footer_right_text: Line<'static>,
     /// Transient flash notification at the bottom right.
     notification: Option<tui::notification::FlashMessage>,
+    /// Inline dependency graph shown when running a block with deps.
+    graph_inline: Option<dependencies::Dependencies>,
 }
 
 #[derive(Clone, KeyMap, Debug, PartialEq, Eq, Hash)]
@@ -140,9 +143,6 @@ pub enum Action {
     /// Show dependency diagram
     #[key(";", help = "deps")]
     ShowDeps,
-    /// Show workflow's dependency diagram
-    #[key("'", help = "workflow deps")]
-    ShowWorkflowDeps,
     /// Quit
     #[key("q", "ctrl-c", help = "quit")]
     Quit,
@@ -238,6 +238,7 @@ impl App {
             notification: None,
             started: false,
             deps: None,
+            graph_inline: None,
             footer_right_text: Self::build_footer_right_text(&theme),
         }
     }
@@ -410,6 +411,22 @@ impl App {
                 self.notify_error(error);
                 None
             }
+        }
+    }
+
+    fn build_inline_graph(&mut self, id: CodeId) {
+        if self
+            .preview
+            .code_by_id(id)
+            .is_some_and(|code| !code.deps.is_empty())
+        {
+            self.graph_inline = Some(dependencies::Dependencies::for_target(
+                self.preview.codes(),
+                Some(id),
+                self.tasks.task_statuses(),
+                self.theme.clone(),
+                self.config.keymap.dependencies(),
+            ));
         }
     }
 
@@ -677,6 +694,7 @@ impl Component for App {
                     self.started = true;
                     if self.config.block.is_some() && self.config.yes {
                         if let Some(id) = self.menu.selected() {
+                            self.build_inline_graph(id);
                             return self.execute(id);
                         }
                     } else if self.config.all {
@@ -697,7 +715,10 @@ impl Component for App {
                 self.output.tick();
                 let statuses = self.tasks.task_statuses();
                 if let Some(dependencies) = &mut self.deps {
-                    dependencies.tick(statuses);
+                    dependencies.tick(statuses.clone());
+                }
+                if let Some(inline) = &mut self.graph_inline {
+                    inline.tick(statuses);
                 }
 
                 // Clear expired flash notification.
@@ -732,7 +753,6 @@ impl App {
                     .or_else(|| self.preview.selected_code_id())
                 {
                     if self.tasks.contains(id) {
-                        // Confirm re-run (will wipe existing output).
                         self.confirm = Some(confirm::Confirm::rerun(
                             id,
                             self.theme.clone(),
@@ -742,6 +762,7 @@ impl App {
                         None
                     } else {
                         self.auto_input_paused = false;
+                        self.build_inline_graph(id);
                         self.execute(id)
                     }
                 } else {
@@ -749,6 +770,9 @@ impl App {
                 }
             }
             Action::Quit => {
+                if self.graph_inline.take().is_some() {
+                    return None;
+                }
                 self.confirm = Some(confirm::Confirm::quit(
                     self.theme.clone(),
                     self.config.keymap.confirm(),
@@ -880,21 +904,6 @@ impl App {
                 self.deps = Some(dependencies::Dependencies::for_target(
                     self.preview.codes(),
                     self.menu.selected(),
-                    self.tasks.task_statuses(),
-                    self.theme.clone(),
-                    self.config.keymap.dependencies(),
-                ));
-                self.mode = Mode::Dependencies;
-                None
-            }
-            Action::ShowWorkflowDeps => {
-                let graph = self
-                    .workflow
-                    .as_ref()
-                    .map(|workflow| workflow.graph().clone());
-                self.deps = Some(dependencies::Dependencies::for_workflow(
-                    self.preview.codes(),
-                    graph,
                     self.tasks.task_statuses(),
                     self.theme.clone(),
                     self.config.keymap.dependencies(),
@@ -1128,10 +1137,16 @@ impl App {
             return;
         }
         self.footer_right_text = Self::build_footer_right_text(&theme);
-        self.theme = theme.clone();
-        self.preview.set_theme(theme.clone());
-        self.menu.set_theme(theme.clone());
-        self.envs.set_theme(theme);
+        self.preview.set_theme(&theme);
+        self.menu.set_theme(&theme);
+        if let Some(deps) = &mut self.deps {
+            deps.set_theme(&theme);
+        }
+        if let Some(graph) = &mut self.graph_inline {
+            graph.set_theme(&theme);
+        }
+        self.envs.set_theme(&theme);
+        self.theme = theme;
         self.preview.rebuild_view(self.tasks.buffers());
     }
 
@@ -1539,6 +1554,7 @@ impl App {
         );
         self.workflow = None;
         self.deps = None;
+        self.graph_inline = None;
         self.pending_states.clear();
         self.started = false;
 
@@ -1801,11 +1817,38 @@ impl Output for App {
         let mut layout = self.layout.borrow_mut();
         layout.update(area, self.menu_width(area.width));
 
+        let (preview_area, graph_area) = if let Some(ref deps) = self.graph_inline {
+            let graph_rows = deps
+                .graph_rows()
+                .min(layout.preview.height.saturating_sub(2));
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Min(0),
+                    Constraint::Length(graph_rows.saturating_add(2)),
+                ])
+                .spacing(Spacing::Overlap(1))
+                .split(layout.preview);
+            (chunks[0], Some(chunks[1]))
+        } else {
+            (layout.preview, None)
+        };
+        self.preview.render(frame, preview_area);
+        if let (Some(deps), Some(graph_area)) = (&self.graph_inline, graph_area) {
+            let block = self
+                .theme
+                .block()
+                .borders(Borders::ALL)
+                .border_style(self.theme.inactive_style())
+                .merge_borders(MergeStrategy::Exact);
+            let graph_inner = block.inner(graph_area);
+            frame.render_widget(block, graph_area);
+            deps.render_inline(frame, graph_inner);
+        }
+        // Render the menu last so its right border merges with both content panes.
         if !self.zen {
             self.menu.render(frame, layout.menu);
         }
-
-        self.preview.render(frame, layout.preview);
         self.render_footer(frame, layout.footer);
 
         match self.mode {
@@ -2132,10 +2175,18 @@ mod tests {
             true,
             Some("setup"),
         );
+        app.graph_inline = Some(dependencies::Dependencies::for_target(
+            app.preview.codes(),
+            Some(2),
+            HashMap::new(),
+            app.theme.clone(),
+            app.config.keymap.dependencies(),
+        ));
 
         app.reload();
 
         assert!(app.workflow.is_none());
+        assert!(app.graph_inline.is_none());
         assert!(!app.started);
         assert_eq!(app.menu.selected(), Some(2));
     }
@@ -2197,5 +2248,43 @@ mod tests {
         assert!(entered_alternate_screen);
         assert_eq!(app.tasks.get(1).unwrap().parser.screen().size().0, 35);
         app.tasks.send_input(1, b"\x03");
+    }
+    #[test]
+    fn inline_dependency_graph_preserves_collapsed_pane_borders() {
+        let markdown = "\
+```sh [name:prepare]\n:\n```\n\
+```sh [name:build]\n:\n```\n\
+```sh [name:target, deps:\"prepare|build\"]\n:\n```\n";
+        let mut app = App::new(
+            upmd_parser::new().parse(markdown),
+            AppConfig {
+                block: Some("target".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        app.graph_inline = Some(dependencies::Dependencies::for_target(
+            app.preview.codes(),
+            Some(3),
+            HashMap::new(),
+            app.theme.clone(),
+            app.config.keymap.dependencies(),
+        ));
+
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| app.render(frame, frame.area()))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let mut rows: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+        insta::assert_snapshot!(rows.join("\n"));
     }
 }

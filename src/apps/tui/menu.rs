@@ -119,8 +119,8 @@ impl Menu {
         self.code_statuses = statuses;
     }
 
-    pub fn set_theme(&mut self, theme: Theme) {
-        self.theme = theme;
+    pub fn set_theme(&mut self, theme: &Theme) {
+        self.theme.clone_from(theme);
     }
 
     pub fn selected(&self) -> Option<CodeId> {

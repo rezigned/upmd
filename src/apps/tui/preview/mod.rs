@@ -430,8 +430,8 @@ impl Preview {
         self.search.matches(&self.visual_lines.borrow())
     }
 
-    pub fn set_theme(&mut self, theme: Theme) {
-        self.theme = theme;
+    pub fn set_theme(&mut self, theme: &Theme) {
+        self.theme.clone_from(theme);
         self.logical_lines.iter().for_each(|l| l.clear_cache());
     }
 

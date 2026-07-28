@@ -179,6 +179,7 @@ impl Workflow {
         self.graph.target()
     }
 
+    #[allow(dead_code)]
     pub fn graph(&self) -> &DependencyGraph {
         &self.graph
     }

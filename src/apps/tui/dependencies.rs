@@ -79,25 +79,7 @@ impl Dependencies {
         )
     }
 
-    pub fn for_workflow(
-        codes: &Codes,
-        graph: Option<DependencyGraph>,
-        statuses: HashMap<CodeId, TaskStatus>,
-        theme: Theme,
-        keymap: DerivedConfig<Action>,
-    ) -> Self {
-        Self::new(
-            "Workflow Dependencies",
-            codes,
-            graph.map(Ok),
-            "No active workflow",
-            statuses,
-            theme,
-            keymap,
-        )
-    }
-
-    fn new(
+    pub(crate) fn new(
         title: &'static str,
         codes: &Codes,
         graph: Option<Result<DependencyGraph, String>>,
@@ -141,6 +123,9 @@ impl Dependencies {
         self.statuses = statuses;
         self.spinner.tick();
     }
+    pub fn set_theme(&mut self, theme: &Theme) {
+        self.theme.clone_from(theme);
+    }
 
     fn name_of(&self, id: CodeId) -> String {
         self.names
@@ -176,7 +161,7 @@ impl Dependencies {
             .unwrap_or(1)
             .saturating_mul(2)
             .saturating_sub(1);
-        let conn_w = 6usize;
+        let conn_w = 5usize;
         let mut rows: Vec<Vec<(String, Style)>> =
             (0..canvas_rows.max(1)).map(|_| Vec::new()).collect();
 
@@ -219,13 +204,14 @@ impl Dependencies {
 
             let next_layer = &layers[column + 1];
             let merge_col = 2usize;
+            let empty_conn = " ".repeat(conn_w);
             for (row_index, row) in rows.iter_mut().enumerate() {
                 let item_row = row_index / 2;
                 let connector = if layer.len() <= 1 && next_layer.len() <= 1 {
                     if row_index == 0 {
-                        "─────→".to_string()
+                        "────→".to_string()
                     } else {
-                        "      ".to_string()
+                        empty_conn.clone()
                     }
                 } else if row_index % 2 == 0 && item_row < layer.len() {
                     if item_row == 0 {
@@ -284,7 +270,7 @@ impl Dependencies {
                         }
                         connector
                     } else {
-                        "      ".to_string()
+                        empty_conn.clone()
                     }
                 };
                 row.push((connector, conn_style));
@@ -331,6 +317,100 @@ impl Dependencies {
             .scroll((scroll_y, scroll_x));
         frame.render_widget(paragraph, area);
     }
+
+    /// Renders the dependency graph inline (no popup frame) at the given area.
+    pub fn render_inline(&self, frame: &mut Frame, area: Rect) {
+        frame.render_widget(Clear, area);
+        if let Some(graph) = &self.graph {
+            let lines = self.graph_lines(graph);
+            let rows: Vec<Line> = lines
+                .into_iter()
+                .map(|row| {
+                    Line::from(
+                        row.into_iter()
+                            .map(|(text, style)| Span::styled(text, style))
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect();
+            let paragraph = Paragraph::new(Text::from(rows)).style(self.theme.global_style());
+            frame.render_widget(paragraph, area);
+        } else if let Some(message) = &self.message {
+            frame.render_widget(Paragraph::new(message.clone()), area);
+        }
+    }
+
+    /// Number of text rows the graph renders to.
+    pub fn graph_rows(&self) -> u16 {
+        self.graph.as_ref().map_or(1, |g| {
+            let layers = g.layers();
+            let h = layers.iter().map(Vec::len).max().unwrap_or(1);
+            (h * 2 - 1).max(1) as u16
+        })
+    }
+}
+
+impl Shortcut for Dependencies {
+    fn footer_shortcuts(&self) -> Line<'static> {
+        self.theme.shortcuts(&[
+            ("↑↓←→".to_string(), "scroll".to_string()),
+            ("pgup/pgdn".to_string(), "page".to_string()),
+            ("home".to_string(), "reset".to_string()),
+            ("esc/q".to_string(), "close".to_string()),
+        ])
+    }
+}
+
+impl Component for Dependencies {
+    type Msg = Action;
+
+    fn update(&mut self, msg: Self::Msg) -> Option<Cmd<Self::Msg>> {
+        match msg {
+            Action::Up => self.scroll_y = self.scroll_y.saturating_sub(1),
+            Action::Down => self.scroll_y = self.scroll_y.saturating_add(1),
+            Action::Left => self.scroll_x = self.scroll_x.saturating_sub(2),
+            Action::Right => self.scroll_x = self.scroll_x.saturating_add(2),
+            Action::PageUp => self.scroll_y = self.scroll_y.saturating_sub(10),
+            Action::PageDown => self.scroll_y = self.scroll_y.saturating_add(10),
+            Action::Reset => {
+                self.scroll_x = 0;
+                self.scroll_y = 0;
+            }
+            Action::Quit => return Some(Cmd::msg(Action::Quit)),
+            Action::Exit => return Some(Cmd::quit()),
+        }
+        None
+    }
+}
+
+impl Input for Dependencies {
+    fn action(&self, event: crossterm::event::Event) -> Option<Self::Msg> {
+        let crossterm::event::Event::Key(key) = event else {
+            return None;
+        };
+        self.keymap.get_bound(&key)
+    }
+}
+
+impl Output for Dependencies {
+    fn render(&self, frame: &mut Frame, area: Rect) {
+        let popup_height = if self.graph.is_some() { 40 } else { 20 };
+        let popup_area = centered_rect(60, popup_height, area);
+        frame.render_widget(Clear, popup_area);
+
+        let block = self.theme.popup_block(self.title);
+        let inner = block.inner(popup_area);
+        frame.render_widget(block, popup_area);
+        let [content_area, footer_area] =
+            Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(inner);
+        frame.render_widget(self.theme.footer(self.footer_shortcuts()), footer_area);
+
+        if let Some(graph) = &self.graph {
+            self.render_graph(frame, content_area, graph);
+        } else if let Some(message) = &self.message {
+            frame.render_widget(Paragraph::new(message.clone()), content_area);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -361,9 +441,11 @@ mod tests {
             .map(|id| DependencyGraph::for_target(&codes, id))
             .unwrap_or_else(|| DependencyGraph::for_all(&codes))
             .unwrap();
-        Dependencies::for_workflow(
+        Dependencies::new(
+            "Dependencies",
             &codes,
-            Some(graph),
+            Some(Ok(graph)),
+            "No block selected",
             HashMap::new(),
             Theme::default(),
             empty_keymap(),
@@ -471,6 +553,21 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_mixed_top_target() {
+        let src = std::fs::read_to_string("deps-test.md").unwrap();
+        let codes = upmd_parser::new().parse(&src).codes;
+        let deps = Dependencies::for_target(
+            &codes,
+            Some(26),
+            HashMap::new(),
+            Theme::default(),
+            empty_keymap(),
+        );
+        let lines = row_text(&deps.graph_lines(deps.graph.as_ref().unwrap()));
+        insta::assert_snapshot!("mixed_top_target", lines.join("\n"));
+    }
+
+    #[test]
     fn uses_workflow_validation() {
         let markdown = "\
 ```sh [name:dup]\n:\n```\n\
@@ -497,9 +594,11 @@ mod tests {
 ```sh [name:independent]\n:\n```\n";
         let codes = upmd_parser::new().parse(markdown).codes;
         let graph = DependencyGraph::for_all(&codes).unwrap();
-        let deps = Dependencies::for_workflow(
+        let deps = Dependencies::new(
+            "Dependencies",
             &codes,
-            Some(graph),
+            Some(Ok(graph)),
+            "No block selected",
             HashMap::new(),
             Theme::default(),
             empty_keymap(),
@@ -514,9 +613,11 @@ mod tests {
         let markdown = "```sh [name:a]\n:\n```\n";
         let codes = upmd_parser::new().parse(markdown).codes;
         let graph = DependencyGraph::for_all(&codes).unwrap();
-        let mut deps = Dependencies::for_workflow(
+        let mut deps = Dependencies::new(
+            "Dependencies",
             &codes,
-            Some(graph),
+            Some(Ok(graph)),
+            "No block selected",
             HashMap::new(),
             Theme::default(),
             empty_keymap(),
@@ -535,68 +636,5 @@ mod tests {
         Component::update(&mut deps, Action::Reset);
         assert_eq!(deps.scroll_x, 0);
         assert_eq!(deps.scroll_y, 0);
-    }
-}
-
-impl Shortcut for Dependencies {
-    fn footer_shortcuts(&self) -> Line<'static> {
-        self.theme.shortcuts(&[
-            ("↑↓←→".to_string(), "scroll".to_string()),
-            ("pgup/pgdn".to_string(), "page".to_string()),
-            ("home".to_string(), "reset".to_string()),
-            ("esc/q".to_string(), "close".to_string()),
-        ])
-    }
-}
-
-impl Component for Dependencies {
-    type Msg = Action;
-
-    fn update(&mut self, msg: Self::Msg) -> Option<Cmd<Self::Msg>> {
-        match msg {
-            Action::Up => self.scroll_y = self.scroll_y.saturating_sub(1),
-            Action::Down => self.scroll_y = self.scroll_y.saturating_add(1),
-            Action::Left => self.scroll_x = self.scroll_x.saturating_sub(2),
-            Action::Right => self.scroll_x = self.scroll_x.saturating_add(2),
-            Action::PageUp => self.scroll_y = self.scroll_y.saturating_sub(10),
-            Action::PageDown => self.scroll_y = self.scroll_y.saturating_add(10),
-            Action::Reset => {
-                self.scroll_x = 0;
-                self.scroll_y = 0;
-            }
-            Action::Quit => return Some(Cmd::msg(Action::Quit)),
-            Action::Exit => return Some(Cmd::quit()),
-        }
-        None
-    }
-}
-
-impl Input for Dependencies {
-    fn action(&self, event: crossterm::event::Event) -> Option<Self::Msg> {
-        let crossterm::event::Event::Key(key) = event else {
-            return None;
-        };
-        self.keymap.get_bound(&key)
-    }
-}
-
-impl Output for Dependencies {
-    fn render(&self, frame: &mut Frame, area: Rect) {
-        let popup_height = if self.graph.is_some() { 40 } else { 20 };
-        let popup_area = centered_rect(60, popup_height, area);
-        frame.render_widget(Clear, popup_area);
-
-        let block = self.theme.popup_block(self.title);
-        let inner = block.inner(popup_area);
-        frame.render_widget(block, popup_area);
-        let [content_area, footer_area] =
-            Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(inner);
-        frame.render_widget(self.theme.footer(self.footer_shortcuts()), footer_area);
-
-        if let Some(graph) = &self.graph {
-            self.render_graph(frame, content_area, graph);
-        } else if let Some(message) = &self.message {
-            frame.render_widget(Paragraph::new(message.clone()), content_area);
-        }
     }
 }
