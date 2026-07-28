@@ -246,7 +246,7 @@ exit $RET";
         let plan = Fish::new().plan(&input).unwrap();
         let script = assemble(&plan, "/tmp/ws");
 
-        // Fish uses `source`, `$status`, and `begin … end` for POSIX-compatible output.
+        // Fish uses `source`, `$status`, and `begin ... end` for POSIX-compatible output.
         let expected = "\
 source /tmp/ws/script_2.fish\n\
 set RET $status\n\

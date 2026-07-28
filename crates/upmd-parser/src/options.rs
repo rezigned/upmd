@@ -39,12 +39,12 @@ pub fn parse(input: &str) -> Options {
     let (language, attrs_input) = split_language(input);
     let (attrs, errors) = parse_attrs(attrs_input);
     let name = attrs.get("name").cloned().unwrap_or_default();
-    let dependencies = Dependencies(parse_dependencies(attrs.get("deps").map(String::as_str)));
+    let deps = Dependencies(parse_deps(attrs.get("deps").map(String::as_str)));
 
     Options {
         language: language.to_string(),
         name,
-        deps: dependencies,
+        deps,
         attrs,
         errors,
     }
@@ -103,7 +103,7 @@ fn parse_attrs(input: &str) -> (HashMap<String, String>, Vec<String>) {
 /// ```
 ///
 /// Example: `"B | C, A"` → `[[B, C], [A]]`.
-pub(crate) fn parse_dependencies(input: Option<&str>) -> Result<DepsGroups, String> {
+pub(crate) fn parse_deps(input: Option<&str>) -> Result<DepsGroups, String> {
     let Some(input) = input else {
         return Ok(Vec::new());
     };
@@ -131,7 +131,7 @@ pub(crate) fn parse_dependencies(input: Option<&str>) -> Result<DepsGroups, Stri
         .collect()
 }
 
-/// Splits a fence info string into (language, attrs_section).
+/// Splits a fence info string into (language, attrs).
 ///
 /// The language is everything before the first `[`. Both halves are trimmed.
 fn split_language(input: &str) -> (&str, &str) {
@@ -253,11 +253,11 @@ mod tests {
                 vec![vec!["setup"], vec!["build", "lint"]],
             ),
         ] {
-            assert_eq!(parse_dependencies(input).unwrap(), expected);
+            assert_eq!(parse_deps(input).unwrap(), expected);
         }
 
         for input in ["setup, , build", "setup || build", "setup build"] {
-            assert!(parse_dependencies(Some(input)).is_err(), "{input:?}");
+            assert!(parse_deps(Some(input)).is_err(), "{input:?}");
         }
     }
 }

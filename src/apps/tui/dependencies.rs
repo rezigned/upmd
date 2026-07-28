@@ -149,32 +149,11 @@ impl Dependencies {
             .unwrap_or_else(|| id.to_string())
     }
 
-    #[cfg(test)]
-    pub(crate) fn graph(&self) -> Option<&DependencyGraph> {
-        self.graph.as_ref()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn message(&self) -> Option<&str> {
-        self.message.as_deref()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn scroll_offset(&self) -> (u16, u16) {
-        (self.scroll_x, self.scroll_y)
-    }
-
-    fn render_graph(&self, frame: &mut Frame, area: Rect, graph: &DependencyGraph) {
+    fn graph_lines(&self, graph: &DependencyGraph) -> Vec<Vec<(String, Style)>> {
         let layers = graph.layers();
-        if graph.target().is_some() && layers.len() <= 1 {
-            frame.render_widget(Paragraph::new("No dependencies"), area);
-            return;
-        }
-
         let spinner_char = self.spinner.render();
-        let global = self.theme.global_style();
-        let conn_style = global.fg(self.theme.muted);
         let default_style = self.theme.style();
+        let conn_style = self.theme.global_style().fg(self.theme.muted);
         let running_style = self.theme.warning_fg_style();
         let success_style = self.theme.success_style();
         let error_style = self.theme.error_style();
@@ -312,6 +291,18 @@ impl Dependencies {
             }
         }
 
+        rows
+    }
+
+    fn render_graph(&self, frame: &mut Frame, area: Rect, graph: &DependencyGraph) {
+        let layers = graph.layers();
+        if graph.target().is_some() && layers.len() <= 1 {
+            frame.render_widget(Paragraph::new("No dependencies"), area);
+            return;
+        }
+
+        let global = self.theme.global_style();
+        let rows = self.graph_lines(graph);
         let content_width = rows
             .iter()
             .map(|row| {
@@ -339,6 +330,211 @@ impl Dependencies {
             .style(global)
             .scroll((scroll_y, scroll_x));
         frame.render_widget(paragraph, area);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use insta::assert_snapshot;
+    use keymap::DerivedConfig;
+    use upmd_parser::Parser;
+    use upmd_runtime::Component;
+
+    use super::*;
+    use crate::apps::workflow::DependencyGraph;
+
+    fn empty_keymap() -> DerivedConfig<Action> {
+        toml::from_str("").unwrap()
+    }
+
+    fn row_text(rows: &[Vec<(String, Style)>]) -> Vec<String> {
+        rows.iter()
+            .map(|row| row.iter().map(|(text, _)| text.clone()).collect::<String>())
+            .collect()
+    }
+
+    fn deps_from(markdown: &str, target: Option<CodeId>) -> Dependencies {
+        let codes = upmd_parser::new().parse(markdown).codes;
+        let graph = target
+            .map(|id| DependencyGraph::for_target(&codes, id))
+            .unwrap_or_else(|| DependencyGraph::for_all(&codes))
+            .unwrap();
+        Dependencies::for_workflow(
+            &codes,
+            Some(graph),
+            HashMap::new(),
+            Theme::default(),
+            empty_keymap(),
+        )
+    }
+
+    #[test]
+    fn snapshot_single_block() {
+        let deps = deps_from("```sh [name:a]\n:\n```\n", None);
+        let lines = row_text(&deps.graph_lines(deps.graph.as_ref().unwrap()));
+        assert_snapshot!("single_block", lines.join("\n"));
+    }
+
+    #[test]
+    fn snapshot_linear_chain() {
+        let deps = deps_from(
+            "\
+```sh [name:a]\n:\n```\n\
+```sh [name:b, deps:a]\n:\n```\n",
+            None,
+        );
+        let lines = row_text(&deps.graph_lines(deps.graph.as_ref().unwrap()));
+        assert_snapshot!("linear_chain", lines.join("\n"));
+    }
+
+    #[test]
+    fn snapshot_linear_chain_3() {
+        let deps = deps_from(
+            "\
+```sh [name:a]\n:\n```\n\
+```sh [name:b, deps:a]\n:\n```\n\
+```sh [name:c, deps:b]\n:\n```\n",
+            None,
+        );
+        let lines = row_text(&deps.graph_lines(deps.graph.as_ref().unwrap()));
+        assert_snapshot!("linear_chain_3", lines.join("\n"));
+    }
+
+    #[test]
+    fn snapshot_fan_in() {
+        let deps = deps_from(
+            "\
+```sh [name:a]\n:\n```\n\
+```sh [name:b]\n:\n```\n\
+```sh [name:c, deps:\"a|b\"]\n:\n```\n",
+            None,
+        );
+        let lines = row_text(&deps.graph_lines(deps.graph.as_ref().unwrap()));
+        assert_snapshot!("fan_in", lines.join("\n"));
+    }
+
+    #[test]
+    fn snapshot_fan_out() {
+        let deps = deps_from(
+            "\
+```sh [name:a]\n:\n```\n\
+```sh [name:b, deps:a]\n:\n```\n\
+```sh [name:c, deps:a]\n:\n```\n",
+            None,
+        );
+        let lines = row_text(&deps.graph_lines(deps.graph.as_ref().unwrap()));
+        assert_snapshot!("fan_out", lines.join("\n"));
+    }
+
+    #[test]
+    fn snapshot_diamond() {
+        let deps = deps_from(
+            "\
+```sh [name:a]\n:\n```\n\
+```sh [name:b, deps:a]\n:\n```\n\
+```sh [name:c, deps:a]\n:\n```\n\
+```sh [name:d, deps:\"b|c\"]\n:\n```\n",
+            None,
+        );
+        let lines = row_text(&deps.graph_lines(deps.graph.as_ref().unwrap()));
+        assert_snapshot!("diamond", lines.join("\n"));
+    }
+
+    #[test]
+    fn snapshot_3_fan_out() {
+        let deps = deps_from(
+            "\
+```sh [name:a]\n:\n```\n\
+```sh [name:b, deps:a]\n:\n```\n\
+```sh [name:c, deps:a]\n:\n```\n\
+```sh [name:d, deps:a]\n:\n```\n",
+            None,
+        );
+        let lines = row_text(&deps.graph_lines(deps.graph.as_ref().unwrap()));
+        assert_snapshot!("3_fan_out", lines.join("\n"));
+    }
+
+    #[test]
+    fn snapshot_3_fan_in() {
+        let deps = deps_from(
+            "\
+```sh [name:a]\n:\n```\n\
+```sh [name:b]\n:\n```\n\
+```sh [name:c]\n:\n```\n\
+```sh [name:d, deps:\"a|b|c\"]\n:\n```\n",
+            None,
+        );
+        let lines = row_text(&deps.graph_lines(deps.graph.as_ref().unwrap()));
+        assert_snapshot!("3_fan_in", lines.join("\n"));
+    }
+
+    #[test]
+    fn uses_workflow_validation() {
+        let markdown = "\
+```sh [name:dup]\n:\n```\n\
+```sh [name:dup]\n:\n```\n\
+```sh [name:target, deps:dup]\n:\n```\n";
+        let codes = upmd_parser::new().parse(markdown).codes;
+        let deps = Dependencies::for_target(
+            &codes,
+            Some(3),
+            HashMap::new(),
+            Theme::default(),
+            empty_keymap(),
+        );
+
+        let error = deps.message.as_ref().unwrap();
+        assert!(error.contains("ambiguous"));
+    }
+
+    #[test]
+    fn keeps_all_mode_graph() {
+        let markdown = "\
+```sh [name:a]\n:\n```\n\
+```sh [name:b, deps:a]\n:\n```\n\
+```sh [name:independent]\n:\n```\n";
+        let codes = upmd_parser::new().parse(markdown).codes;
+        let graph = DependencyGraph::for_all(&codes).unwrap();
+        let deps = Dependencies::for_workflow(
+            &codes,
+            Some(graph),
+            HashMap::new(),
+            Theme::default(),
+            empty_keymap(),
+        );
+
+        let graph = deps.graph.as_ref().unwrap();
+        assert_eq!(graph.layers(), &[vec![1, 3], vec![2]]);
+    }
+
+    #[test]
+    fn handles_both_scroll_axes() {
+        let markdown = "```sh [name:a]\n:\n```\n";
+        let codes = upmd_parser::new().parse(markdown).codes;
+        let graph = DependencyGraph::for_all(&codes).unwrap();
+        let mut deps = Dependencies::for_workflow(
+            &codes,
+            Some(graph),
+            HashMap::new(),
+            Theme::default(),
+            empty_keymap(),
+        );
+
+        assert_eq!(
+            deps.footer_shortcuts().to_string(),
+            "↑↓←→ scroll  pgup/pgdn page  home reset  esc/q close"
+        );
+
+        Component::update(&mut deps, Action::Right);
+        Component::update(&mut deps, Action::Down);
+        assert_eq!(deps.scroll_x, 2);
+        assert_eq!(deps.scroll_y, 1);
+
+        Component::update(&mut deps, Action::Reset);
+        assert_eq!(deps.scroll_x, 0);
+        assert_eq!(deps.scroll_y, 0);
     }
 }
 

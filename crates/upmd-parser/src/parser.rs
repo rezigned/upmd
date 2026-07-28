@@ -355,10 +355,8 @@ impl<'a> Parser<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Code, Parser};
+    use crate::{Code, Parser as _};
 
-    /// Retrieves the Code for a Node::Code variant by resolving its CodeId
-    /// against the Document's codes.
     fn code_from_node<'a>(doc: &'a crate::Document, node: &'a Node) -> &'a Code {
         match node {
             Node::Code(id) => doc.codes.by_id(*id).unwrap(),
@@ -367,34 +365,185 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_table() {
-        let text = "| Header 1 | Header 2 |\n|----------|----------|\n| Cell 1   | Cell 2   |\n| Cell 3   | Cell 4   |\n";
+    fn test_parse_code_blocks() {
+        for (input, expected_node_count, expected_checks) in [
+            (
+                "### Hello\n\nWorld\n\n```bash\necho 1\n```\n",
+                3usize,
+                vec![(2usize, "bash", "echo 1", "")],
+            ),
+            (
+                "```bash [name:setup]\necho \"hello\"\n```\n",
+                1,
+                vec![(0, "bash", "echo \"hello\"", "setup")],
+            ),
+            (
+                "```bash\necho \"hello\"\n```\n",
+                1,
+                vec![(0, "bash", "echo \"hello\"", "")],
+            ),
+            (
+                "Example 2\n\n```sh\necho first\n```\n\n```sh\necho second\n```\n",
+                3,
+                vec![(1, "sh", "echo first", ""), (2, "sh", "echo second", "")],
+            ),
+            (
+                "Some text\n\n    echo hello\n    world\n",
+                2,
+                vec![(1, "", "echo hello\nworld", "")],
+            ),
+            (
+                "    just code\n    no lang\n",
+                1,
+                vec![(0, "", "just code\nno lang", "")],
+            ),
+            (
+                "```rust\nfn main() {}\n```\n\n    some indented code\n",
+                2,
+                vec![
+                    (0, "rust", "fn main() {}", ""),
+                    (1, "", "some indented code", ""),
+                ],
+            ),
+        ] {
+            let doc = Cmark::new().parse(input);
+            let nodes = &doc.nodes;
+            assert_eq!(nodes.len(), expected_node_count, "input: {input:?}");
+            for &(node_idx, lang, content, name) in &expected_checks {
+                let c = code_from_node(&doc, &nodes[node_idx]);
+                assert_eq!(c.language, lang, "node {node_idx}, input: {input:?}");
+                assert_eq!(c.content, content, "node {node_idx}, input: {input:?}");
+                assert_eq!(c.name, name, "node {node_idx}, input: {input:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_code_block_whitespace_and_recovery() {
+        // Leading indentation preserved.
+        let doc = Cmark::new().parse("```python\n    def foo():\n        pass\n```\n");
+        let c = doc.codes.first().unwrap();
+        assert_eq!(c.content, "    def foo():\n        pass");
+
+        // Leading blank lines preserved.
+        let doc = Cmark::new().parse("```bash\n\necho hello\n```\n");
+        let c = doc.codes.first().unwrap();
+        assert_eq!(c.content, "\necho hello");
+
+        // Whitespace-only blocks are empty (no Code node).
+        let text = "```bash\n   \n```\n";
         let nodes = Cmark::new().parse(text).nodes;
-        assert_eq!(nodes.len(), 1);
-        match &nodes[0] {
-            Node::Table(t) => {
-                assert_eq!(t.headers, vec!["Header 1", "Header 2"]);
-                assert_eq!(t.rows.len(), 2);
+        assert!(!nodes.iter().any(|n| matches!(n, Node::Code(_))));
+
+        // Bad attrs recover valid metadata.
+        let text = "```bash [name:foo bad, bin:zsh]\necho hi\n```\n";
+        let doc = Cmark::new().parse(text);
+        let code = doc.codes.first().unwrap();
+        assert_eq!(code.language, "bash");
+        assert_eq!(code.name, "foo");
+        assert_eq!(code.attrs.get("bin").map(String::as_str), Some("zsh"));
+        assert!(code.errors.iter().any(|e| e.contains("bad")));
+    }
+
+    #[test]
+    fn test_parse_lists() {
+        for (input, expected_checks) in [
+            (
+                "- Item 1\n- Item 2\n- Item 3\n",
+                vec![
+                    (0usize, "Item 1", ListKind::Bullet),
+                    (1, "Item 2", ListKind::Bullet),
+                    (2, "Item 3", ListKind::Bullet),
+                ],
+            ),
+            (
+                "1. First\n2. Second\n3. Third\n",
+                vec![
+                    (0, "First", ListKind::Ordered(1)),
+                    (1, "Second", ListKind::Ordered(2)),
+                    (2, "Third", ListKind::Ordered(3)),
+                ],
+            ),
+            (
+                "- [ ] Unchecked task\n",
+                vec![(0, "Unchecked task", ListKind::Task(TaskStatus::Unchecked))],
+            ),
+            (
+                "- [x] Completed task\n",
+                vec![(0, "Completed task", ListKind::Task(TaskStatus::Checked))],
+            ),
+            (
+                "- [-] In progress task\n",
+                vec![(0, "[-] In progress task", ListKind::Bullet)],
+            ),
+        ] {
+            let nodes = Cmark::new().parse(input).nodes;
+            assert_eq!(nodes.len(), 1, "input: {input:?}");
+            match &nodes[0] {
+                Node::List(items) => {
+                    for &(idx, expected_text, ref expected_kind) in &expected_checks {
+                        assert_eq!(
+                            items[idx].text, expected_text,
+                            "item {idx}, input: {input:?}"
+                        );
+                        assert_eq!(
+                            items[idx].kind, *expected_kind,
+                            "item {idx}, input: {input:?}"
+                        );
+                    }
+                }
+                _ => panic!("Expected List, input: {input:?}"),
             }
-            _ => panic!("Expected Table"),
         }
     }
 
     #[test]
-    fn test_parse_heading() {
-        let nodes = Cmark::new().parse("### My Heading").nodes;
-        assert_eq!(nodes.len(), 1);
-        match &nodes[0] {
-            Node::Heading { level, text } => {
-                assert_eq!(*level, 3);
-                assert_eq!(text, "My Heading");
+    fn test_parse_tables() {
+        for (input, expected_headers, expected_rows, expected_alignments) in [
+            (
+                "| Header 1 | Header 2 |\n|----------|----------|\n| Cell 1   | Cell 2   |\n| Cell 3   | Cell 4   |\n",
+                &["Header 1", "Header 2"] as &[&str],
+                2usize,
+                &[Alignment::None, Alignment::None] as &[Alignment],
+            ),
+            (
+                "| A | B |\n|---|---|\n| 1 | 2 |\n",
+                &["A", "B"],
+                1,
+                &[Alignment::None, Alignment::None],
+            ),
+        ] {
+            let nodes = Cmark::new().parse(input).nodes;
+            assert_eq!(nodes.len(), 1, "input: {input:?}");
+            match &nodes[0] {
+                Node::Table(t) => {
+                    assert_eq!(t.headers, expected_headers, "input: {input:?}");
+                    assert_eq!(t.rows.len(), expected_rows, "input: {input:?}");
+                    assert_eq!(t.alignments, expected_alignments, "input: {input:?}");
+                }
+                _ => panic!("Expected Table, input: {input:?}"),
             }
-            _ => panic!("Expected Heading"),
         }
     }
 
     #[test]
-    fn test_document_headings_are_collected() {
+    fn test_parse_headings() {
+        for (input, expected_level, expected_text) in [
+            ("### My Heading", 3u8, "My Heading"),
+            ("# Title\n\n## Run `make`\n", 1, "Title"),
+        ] {
+            let doc = Cmark::new().parse(input);
+            let node = &doc.nodes[0];
+            match node {
+                Node::Heading { level, text } => {
+                    assert_eq!(*level, expected_level);
+                    assert_eq!(text, expected_text);
+                }
+                _ => panic!("Expected Heading"),
+            }
+        }
+
+        // headings collection
         let doc = Cmark::new().parse("# Title\n\n## Run `make`\n");
         assert_eq!(doc.headings.len(), 2);
         assert_eq!(doc.headings[0].level, 1);
@@ -406,71 +555,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_code_metadata_is_no_longer_stored() {
-        let text = "### Hello\n\nWorld\n\n```bash\necho 1\n```\n";
-        let doc = Cmark::new().parse(text);
-        let nodes = &doc.nodes;
-        assert_eq!(nodes.len(), 3);
-        if let Node::Code(_) = &nodes[2] {
-            let c = code_from_node(&doc, &nodes[2]);
-            assert_eq!(c.content, "echo 1");
-            assert_eq!(c.language, "bash");
-        } else {
-            panic!("Expected Code");
-        }
-    }
-
-    #[test]
-    fn test_parse_named_code_block() {
-        let text = "```bash [name:setup]\necho \"hello\"\n```\n";
-        let doc = Cmark::new().parse(text);
-        let nodes = &doc.nodes;
-        assert_eq!(nodes.len(), 1);
-        if let Node::Code(_) = &nodes[0] {
-            let c = code_from_node(&doc, &nodes[0]);
-            assert_eq!(c.name, "setup");
-            assert_eq!(c.language, "bash");
-        } else {
-            panic!("Expected Code");
-        }
-    }
-
-    #[test]
-    fn test_parse_code_block_without_name_is_empty() {
-        let doc = Cmark::new().parse("```bash\necho \"hello\"\n```\n");
-        let nodes = &doc.nodes;
-        if let Node::Code(_) = &nodes[0] {
-            let c = code_from_node(&doc, &nodes[0]);
-            assert!(c.name.is_empty());
-        } else {
-            panic!("Expected Code");
-        }
-    }
-
-    #[test]
-    fn test_consecutive_code_blocks_dont_inherit_title_desc() {
-        // Title/desc were removed (C5); this test verifies code blocks still
-        // resolve correctly without title/desc fields.
-        let text = "Example 2\n\n```sh\necho first\n```\n\n```sh\necho second\n```\n";
-        let doc = Cmark::new().parse(text);
-        let nodes = &doc.nodes;
-        assert_eq!(nodes.len(), 3);
-        if let Node::Code(_) = &nodes[1] {
-            let c = code_from_node(&doc, &nodes[1]);
-            assert_eq!(c.content, "echo first");
-        } else {
-            panic!();
-        }
-        if let Node::Code(_) = &nodes[2] {
-            let c = code_from_node(&doc, &nodes[2]);
-            assert_eq!(c.content, "echo second");
-        } else {
-            panic!();
-        }
-    }
-
-    #[test]
-    fn test_parse_blockquote() {
+    fn test_parse_blockquote_and_thematic_break() {
         let text = "> This is a blockquote\n> with multiple lines\n";
         let nodes = Cmark::new().parse(text).nodes;
         assert_eq!(nodes.len(), 1);
@@ -484,170 +569,12 @@ mod tests {
             }
             _ => panic!("Expected BlockQuote"),
         }
-    }
 
-    #[test]
-    fn test_parse_bullet_list() {
-        let text = "- Item 1\n- Item 2\n- Item 3\n";
-        let nodes = Cmark::new().parse(text).nodes;
-        assert_eq!(nodes.len(), 1);
-        match &nodes[0] {
-            Node::List(items) => {
-                assert_eq!(items.len(), 3);
-                assert!(matches!(items[0].kind, ListKind::Bullet));
-                assert_eq!(items[0].text, "Item 1");
-            }
-            _ => panic!("Expected List"),
-        }
-    }
-
-    #[test]
-    fn test_parse_ordered_list() {
-        let text = "1. First\n2. Second\n3. Third\n";
-        let nodes = Cmark::new().parse(text).nodes;
-        assert_eq!(nodes.len(), 1);
-        match &nodes[0] {
-            Node::List(items) => {
-                assert_eq!(items.len(), 3);
-                assert!(matches!(items[0].kind, ListKind::Ordered(1)));
-                assert_eq!(items[0].text, "First");
-            }
-            _ => panic!("Expected List"),
-        }
-    }
-
-    #[test]
-    fn test_parse_task_list_unchecked() {
-        let nodes = Cmark::new().parse("- [ ] Unchecked task\n").nodes;
-        assert_eq!(nodes.len(), 1);
-        match &nodes[0] {
-            Node::List(items) => {
-                assert_eq!(items.len(), 1);
-                assert!(matches!(
-                    items[0].kind,
-                    ListKind::Task(TaskStatus::Unchecked)
-                ));
-                assert_eq!(items[0].text, "Unchecked task");
-            }
-            _ => panic!("Expected List"),
-        }
-    }
-
-    #[test]
-    fn test_parse_task_list_checked() {
-        let nodes = Cmark::new().parse("- [x] Completed task\n").nodes;
-        assert_eq!(nodes.len(), 1);
-        match &nodes[0] {
-            Node::List(items) => {
-                assert!(matches!(items[0].kind, ListKind::Task(TaskStatus::Checked)));
-                assert_eq!(items[0].text, "Completed task");
-            }
-            _ => panic!("Expected List"),
-        }
-    }
-
-    #[test]
-    fn test_parse_task_list_in_progress() {
-        let nodes = Cmark::new().parse("- [-] In progress task\n").nodes;
-        assert_eq!(nodes.len(), 1);
-        match &nodes[0] {
-            Node::List(items) => {
-                assert_eq!(items.len(), 1);
-                assert_eq!(items[0].text, "[-] In progress task");
-            }
-            _ => panic!("Expected List"),
-        }
-    }
-
-    #[test]
-    fn test_parse_thematic_break() {
-        let nodes = Cmark::new().parse("Some text\n\n---\n\nMore text\n").nodes;
-        assert!(nodes.iter().any(|n| matches!(n, Node::ThematicBreak)));
-    }
-
-    #[test]
-    fn test_parse_indented_code_block() {
-        let text = "Some text\n\n    echo hello\n    world\n";
-        let doc = Cmark::new().parse(text);
-        let nodes = &doc.nodes;
-        assert_eq!(nodes.len(), 2);
-        match &nodes[1] {
-            Node::Code(_) => {
-                let c = code_from_node(&doc, &nodes[1]);
-                assert_eq!(c.content, "echo hello\nworld");
-            }
-            _ => panic!("Expected Code, got {:?}", nodes[1]),
-        }
-    }
-
-    #[test]
-    fn test_parse_indented_code_block_no_language() {
-        let text = "    just code\n    no lang\n";
-        let doc = Cmark::new().parse(text);
-        let nodes = &doc.nodes;
-        assert_eq!(nodes.len(), 1);
-        match &nodes[0] {
-            Node::Code(_) => {
-                let c = code_from_node(&doc, &nodes[0]);
-                assert_eq!(c.language, "");
-                assert_eq!(c.content, "just code\nno lang");
-            }
-            _ => panic!("Expected Code, got {:?}", nodes[0]),
-        }
-    }
-
-    #[test]
-    fn test_parse_fenced_and_indented_code_blocks() {
-        let text = "```rust\nfn main() {}\n```\n\n    some indented code\n";
-        let doc = Cmark::new().parse(text);
-        let nodes = &doc.nodes;
-        assert_eq!(nodes.len(), 2);
-        match &nodes[0] {
-            Node::Code(_) => {
-                let c = code_from_node(&doc, &nodes[0]);
-                assert_eq!(c.language, "rust");
-                assert_eq!(c.content, "fn main() {}");
-            }
-            _ => panic!(),
-        }
-        match &nodes[1] {
-            Node::Code(_) => {
-                let c = code_from_node(&doc, &nodes[1]);
-                assert_eq!(c.language, "");
-                assert_eq!(c.content, "some indented code");
-            }
-            _ => panic!(),
-        }
-    }
-
-    #[test]
-    fn test_parse_nested_list_trailing_content() {
-        let text = "- Item with\n  - nested\n\n  trailing text\n";
-        let nodes = Cmark::new().parse(text).nodes;
-        assert_eq!(nodes.len(), 1);
-        match &nodes[0] {
-            Node::List(items) => {
-                let outer = items.iter().find(|i| i.depth == 1).expect("depth-1 item");
-                assert!(outer.text.contains("Item with"));
-                assert!(outer.text.contains("trailing text"));
-            }
-            _ => panic!("Expected List"),
-        }
-    }
-
-    #[test]
-    fn test_parse_alignment_none() {
-        let text = "| A | B |\n|---|---|\n| 1 | 2 |\n";
-        let nodes = Cmark::new().parse(text).nodes;
-        assert_eq!(nodes.len(), 1);
-        match &nodes[0] {
-            Node::Table(t) => {
-                assert_eq!(t.alignments.len(), 2);
-                assert_eq!(t.alignments[0], Alignment::None);
-                assert_eq!(t.alignments[1], Alignment::None);
-            }
-            _ => panic!(),
-        }
+        assert!(Cmark::new()
+            .parse("Some text\n\n---\n\nMore text\n")
+            .nodes
+            .iter()
+            .any(|n| matches!(n, Node::ThematicBreak)));
     }
 
     #[test]
@@ -666,35 +593,5 @@ mod tests {
         assert_eq!(items[0].children.len(), 1);
         assert!(matches!(&items[0].children[0], Node::Code(code_id)
             if doc.codes.iter().any(|c| c.id == *code_id && c.content.trim() == "echo hi")));
-    }
-
-    #[test]
-    fn test_parse_code_block_preserves_leading_whitespace() {
-        // Leading indentation (Python-style) is no longer stripped by trim().
-        let doc = Cmark::new().parse("```python\n    def foo():\n        pass\n```\n");
-        let c = doc.codes.first().unwrap();
-        assert_eq!(c.content, "    def foo():\n        pass");
-
-        // Leading blank lines between opening fence and content are preserved.
-        let doc = Cmark::new().parse("```bash\n\necho hello\n```\n");
-        let c = doc.codes.first().unwrap();
-        assert_eq!(c.content, "\necho hello");
-
-        // Whitespace-only blocks are still treated as empty (no Code node).
-        let text = "```bash\n   \n```\n";
-        let nodes = Cmark::new().parse(text).nodes;
-        assert!(!nodes.iter().any(|n| matches!(n, Node::Code(_))));
-    }
-
-    #[test]
-    fn test_parse_code_block_recovers_valid_metadata_around_bad_attrs() {
-        let text = "```bash [name:foo bad, bin:zsh]\necho hi\n```\n";
-        let doc = Cmark::new().parse(text);
-        let code = doc.codes.first().unwrap();
-
-        assert_eq!(code.language, "bash");
-        assert_eq!(code.name, "foo");
-        assert_eq!(code.attrs.get("bin").map(String::as_str), Some("zsh"));
-        assert!(code.errors.iter().any(|error| error.contains("bad")));
     }
 }

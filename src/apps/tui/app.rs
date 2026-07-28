@@ -67,7 +67,7 @@ pub struct App {
     help: Option<tui::help::Help>,
     search: Option<tui::search::Search>,
     goto: Option<tui::goto::Goto>,
-    dependencies: Option<dependencies::Dependencies>,
+    deps: Option<dependencies::Dependencies>,
     file_picker: Option<file_picker::FilePicker>,
     /// When true, picker cancel quits the app (startup mode).
     /// When false, picker cancel returns to the active document.
@@ -156,7 +156,7 @@ impl App {
         config: AppConfig,
     ) -> Self {
         let theme = config.theme.clone();
-        let mut app = Self::new(upmd_parser::new().parse(""), config.clone());
+        let mut app = Self::build(upmd_parser::Document::default(), config.clone(), None);
         app.file_picker = Some(file_picker::FilePicker::new(
             files,
             theme,
@@ -168,7 +168,12 @@ impl App {
         app
     }
 
-    pub fn new(doc: upmd_parser::Document, config: AppConfig) -> Self {
+    pub fn new(doc: upmd_parser::Document, config: AppConfig) -> std::result::Result<Self, String> {
+        let selected = crate::apps::initial_code_id(&doc.codes, config.block.as_deref())?;
+        Ok(Self::build(doc, config, selected))
+    }
+
+    fn build(doc: upmd_parser::Document, config: AppConfig, selected: Option<CodeId>) -> Self {
         let upmd_parser::Document {
             nodes,
             codes,
@@ -177,10 +182,6 @@ impl App {
         } = doc;
         let theme = config.theme.clone();
         let tasks = Tasks::new();
-        let selected = config
-            .block
-            .as_deref()
-            .and_then(|spec| codes.resolve(spec).first().copied());
 
         let mut menu = menu::Menu::new(
             &codes,
@@ -191,7 +192,6 @@ impl App {
         if let Some(id) = selected {
             menu.select_by_id(id);
         }
-
         let mut preview = preview::Preview::new(
             nodes,
             codes,
@@ -237,7 +237,7 @@ impl App {
             last_cwd: None,
             notification: None,
             started: false,
-            dependencies: None,
+            deps: None,
             footer_right_text: Self::build_footer_right_text(&theme),
         }
     }
@@ -466,7 +466,7 @@ impl App {
     }
 
     fn select_batch(&mut self, batch: &[CodeId]) {
-        // Don't auto-navigate when running a specific target — stay on the
+        // Don't auto-navigate when running a specific target (stay on the
         // block the user originally selected.  In for_all mode (no target)
         // navigation follows the execution order.
         let has_target = self.workflow.as_ref().and_then(Workflow::target).is_some();
@@ -622,7 +622,7 @@ pub enum Msg {
 }
 
 impl crate::RunApp for App {
-    fn from_input(input: &str, config: AppConfig) -> Self {
+    fn from_input(input: &str, config: AppConfig) -> std::result::Result<Self, String> {
         let doc = tracing::info_span!("parse").in_scope(|| upmd_parser::new().parse(input));
         tracing::info_span!("build").in_scope(|| Self::new(doc, config))
     }
@@ -696,7 +696,7 @@ impl Component for App {
                 self.preview.tick();
                 self.output.tick();
                 let statuses = self.tasks.task_statuses();
-                if let Some(dependencies) = &mut self.dependencies {
+                if let Some(dependencies) = &mut self.deps {
                     dependencies.tick(statuses);
                 }
 
@@ -877,7 +877,7 @@ impl App {
                 None
             }
             Action::ShowDeps => {
-                self.dependencies = Some(dependencies::Dependencies::for_target(
+                self.deps = Some(dependencies::Dependencies::for_target(
                     self.preview.codes(),
                     self.menu.selected(),
                     self.tasks.task_statuses(),
@@ -892,7 +892,7 @@ impl App {
                     .workflow
                     .as_ref()
                     .map(|workflow| workflow.graph().clone());
-                self.dependencies = Some(dependencies::Dependencies::for_workflow(
+                self.deps = Some(dependencies::Dependencies::for_workflow(
                     self.preview.codes(),
                     graph,
                     self.tasks.task_statuses(),
@@ -951,8 +951,8 @@ impl App {
                 Some(cmd.map(Msg::Goto))
             }
             Mode::Dependencies => {
-                let action = self.dependencies.as_ref()?.action(event)?;
-                let cmd = self.dependencies.as_mut()?.update(action)?;
+                let action = self.deps.as_ref()?.action(event)?;
+                let cmd = self.deps.as_mut()?.update(action)?;
                 Some(cmd.map(Msg::Dependencies))
             }
             Mode::FilePicker => {
@@ -1494,11 +1494,15 @@ impl App {
         match crate::reader::read_from_path(&path) {
             Ok(input) => {
                 let doc = upmd_parser::new().parse(&input);
-                self.config.file = Some(path.display().to_string());
-                self.file_picker = None;
-                self.file_picker_started_app = false;
-                self.load_document(doc);
-                self.mode = Mode::Home;
+                match self.load_document(doc) {
+                    Ok(()) => {
+                        self.config.file = Some(path.display().to_string());
+                        self.file_picker = None;
+                        self.file_picker_started_app = false;
+                        self.mode = Mode::Home;
+                    }
+                    Err(error) => self.notify_error(error),
+                }
             }
             Err(err) => {
                 self.notify_error(format!("Failed to open {}: {err}", path.display()));
@@ -1507,7 +1511,8 @@ impl App {
         None
     }
     /// Replaces the document and resets document-derived execution and UI state.
-    fn load_document(&mut self, doc: upmd_parser::Document) {
+    fn load_document(&mut self, doc: upmd_parser::Document) -> Result<(), String> {
+        let selected = crate::apps::initial_code_id(&doc.codes, self.config.block.as_deref())?;
         let upmd_parser::Document {
             nodes,
             codes,
@@ -1533,23 +1538,19 @@ impl App {
             self.config.keymap.preview::<preview::Action>(),
         );
         self.workflow = None;
-        self.dependencies = None;
+        self.deps = None;
         self.pending_states.clear();
         self.started = false;
 
-        // Reapply --block selection when a new document is loaded after
-        // startup (e.g. from the directory file picker).
-        if let Some(ref spec) = self.config.block {
-            if let Some(&id) = self.preview.codes().resolve(spec).first() {
-                self.menu.select_by_id(id);
-                self.navigate_to_code(id);
-            }
+        if let Some(id) = selected {
+            self.navigate_to_code(id);
         }
+        Ok(())
     }
 
     fn handle_dependencies_msg(&mut self, action: dependencies::Action) -> Option<Cmd<Msg>> {
         if action == dependencies::Action::Quit {
-            self.dependencies = None;
+            self.deps = None;
             self.mode = Mode::Home;
         }
         None
@@ -1735,9 +1736,13 @@ impl App {
             }
         };
 
-        self.load_document(doc);
-        self.mode = Mode::Home;
-        tracing::info!("File reloaded successfully");
+        match self.load_document(doc) {
+            Ok(()) => {
+                self.mode = Mode::Home;
+                tracing::info!("File reloaded successfully");
+            }
+            Err(error) => self.notify_error(error),
+        }
         None
     }
 }
@@ -1833,7 +1838,7 @@ impl Output for App {
                 }
             }
             Mode::Dependencies => {
-                if let Some(dependencies) = &self.dependencies {
+                if let Some(dependencies) = &self.deps {
                     dependencies.render(frame, area);
                 }
             }
@@ -2028,6 +2033,7 @@ mod tests {
                 ..Default::default()
             },
         )
+        .unwrap()
     }
 
     #[test]
@@ -2059,7 +2065,8 @@ mod tests {
                 file: Some("README.md".to_string()),
                 ..Default::default()
             },
-        );
+        )
+        .unwrap();
 
         app.handle_action(Action::OpenFilePicker);
 
@@ -2121,7 +2128,7 @@ mod tests {
         .unwrap();
         let mut app = app_for_reload(
             &path,
-            "# Original\n\n```sh\necho old\n```\n",
+            "# Original\n\n```sh [name:first]\necho old\n```\n\n```sh [name:setup]\necho setup\n```\n",
             true,
             Some("setup"),
         );
@@ -2149,82 +2156,12 @@ mod tests {
         assert_eq!(notification.kind, tui::notification::FlashKind::Error);
         assert_eq!(notification.text, "No file path in config, cannot reload");
     }
-    #[test]
-    fn dependency_popup_uses_workflow_validation() {
-        let markdown = "\
-```sh [name:dup]\n:\n```\n\
-```sh [name:dup]\n:\n```\n\
-```sh [name:target, deps:dup]\n:\n```\n";
-        let mut app = App::new(
-            upmd_parser::new().parse(markdown),
-            AppConfig {
-                block: Some("target".to_string()),
-                ..Default::default()
-            },
-        );
-
-        app.handle_action(Action::ShowDeps);
-
-        let error = app
-            .dependencies
-            .as_ref()
-            .and_then(dependencies::Dependencies::message)
-            .unwrap();
-        assert!(error.contains("ambiguous"));
-    }
-
-    #[test]
-    fn workflow_popup_keeps_all_mode_graph() {
-        let markdown = "\
-```sh [name:a]\n:\n```\n\
-```sh [name:b, deps:a]\n:\n```\n\
-```sh [name:independent]\n:\n```\n";
-        let mut app = App::new(upmd_parser::new().parse(markdown), AppConfig::default());
-        app.start_all();
-
-        app.handle_action(Action::ShowWorkflowDeps);
-
-        let graph = app
-            .dependencies
-            .as_ref()
-            .and_then(dependencies::Dependencies::graph)
-            .unwrap();
-        assert_eq!(graph.layers(), &[vec![1, 3], vec![2]]);
-    }
-
-    #[test]
-    fn dependency_popup_handles_both_scroll_axes() {
-        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
-
-        let mut app = App::new(
-            upmd_parser::new().parse("```sh [name:a]\n:\n```\n"),
-            AppConfig::default(),
-        );
-        app.handle_action(Action::ShowDeps);
-        let shortcuts = app.dependencies.as_ref().unwrap().footer_shortcuts();
-        let shortcuts = shortcuts.to_string();
-        assert!(shortcuts.contains("scroll"));
-        assert!(shortcuts.contains("page"));
-        assert!(shortcuts.contains("reset"));
-        assert!(shortcuts.contains("close"));
-
-        app.handle_event(Event::Key(KeyEvent::new(
-            KeyCode::Right,
-            KeyModifiers::NONE,
-        )));
-        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)));
-        assert_eq!(app.dependencies.as_ref().unwrap().scroll_offset(), (2, 1));
-
-        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)));
-        assert_eq!(app.dependencies.as_ref().unwrap().scroll_offset(), (0, 0));
-    }
-
     #[cfg(unix)]
     #[test]
     fn alternate_screen_is_resized_to_rows_below_source_block() {
         let markdown =
             "```bash\nprintf '\\033[?1049h'\nprintf 'TUI'\nsleep 1\nprintf '\\033[?1049l'\n```\n";
-        let mut app = App::new(upmd_parser::new().parse(markdown), AppConfig::default());
+        let mut app = App::new(upmd_parser::new().parse(markdown), AppConfig::default()).unwrap();
         let area = Rect::new(0, 0, 80, 43);
         let menu_width = app.menu_width(area.width);
         app.layout.borrow_mut().update(area, menu_width);

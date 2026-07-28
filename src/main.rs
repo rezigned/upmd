@@ -13,8 +13,11 @@ mod pty;
 mod reader;
 mod utils;
 
-trait RunApp {
-    fn from_input(input: &str, config: crate::apps::config::Config) -> Self;
+trait RunApp: Sized {
+    fn from_input(
+        input: &str,
+        config: crate::apps::config::Config,
+    ) -> std::result::Result<Self, String>;
 
     fn from_picker(
         root: std::path::PathBuf,
@@ -58,7 +61,9 @@ fn run<App: RunApp>(config: crate::apps::config::Config) -> Result<ExitCode> {
     match crate::reader::resolve_input_target(&config.file)? {
         crate::reader::InputTarget::Stdin | crate::reader::InputTarget::File(_) => {
             let input = crate::reader::read_input(&config.file)?;
-            App::from_input(&input, config).run()
+            App::from_input(&input, config)
+                .map_err(|error| color_eyre::eyre::eyre!(error))?
+                .run()
         }
         crate::reader::InputTarget::Directory(path) => {
             let files = crate::markdown_files::find_markdown_files(

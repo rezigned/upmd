@@ -127,7 +127,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_new_message_not_expired_immediately() {
+    fn test_message_expiry() {
         let now = Instant::now();
         let msg = FlashMessage::new(
             "hello",
@@ -136,75 +136,46 @@ mod tests {
             FlashMessage::DEFAULT_DURATION,
         );
         assert!(!msg.is_expired(now));
-    }
-
-    #[test]
-    fn test_new_message_expired_after_duration() {
-        let now = Instant::now();
-        let msg = FlashMessage::new(
-            "hello",
-            FlashKind::Info,
-            now,
-            FlashMessage::DEFAULT_DURATION,
-        );
         assert!(msg.is_expired(now + FlashMessage::DEFAULT_DURATION));
-    }
 
-    #[test]
-    fn test_new_message_respects_custom_duration() {
-        let now = Instant::now();
         let msg = FlashMessage::new("slow", FlashKind::Info, now, Duration::from_millis(100));
         assert!(!msg.is_expired(now + Duration::from_millis(50)));
         assert!(msg.is_expired(now + Duration::from_millis(100)));
     }
 
     #[test]
-    fn test_latest_message_replaces() {
-        let old = FlashMessage::info("old");
-        let new = FlashMessage::success("new");
-        // The app stores a single Option<FlashMessage>; setting it to
-        // `Some(new)` drops `old` – simulated here by checking we
-        // track only the latest.
-        let current = Some(new.clone());
-        assert_eq!(current.as_ref().unwrap().text, "new");
-        assert_eq!(current.as_ref().unwrap().kind, FlashKind::Success);
-        // old is gone.
-        drop(old);
-    }
-
-    #[test]
-    fn test_notification_area_bottom_right() {
+    fn test_notification_area() {
         let msg = FlashMessage::info("Saved");
         let area = Rect::new(0, 0, 80, 24);
         let rect = notification_area(&msg, area).unwrap();
-
         assert_eq!(rect.y, 23);
         assert_eq!(rect.x + rect.width, 80);
         assert_eq!(rect.height, 1);
         assert_eq!(rect.width, 7);
-    }
 
-    #[test]
-    fn test_notification_area_clips_to_terminal_width() {
         let msg = FlashMessage::info("A very long flash message");
         let area = Rect::new(0, 0, 10, 3);
         let rect = notification_area(&msg, area).unwrap();
-
         assert_eq!(rect, Rect::new(0, 2, 10, 1));
-    }
-
-    #[test]
-    fn test_notification_area_empty_terminal_is_none() {
-        let msg = FlashMessage::info("Saved");
 
         assert_eq!(notification_area(&msg, Rect::new(0, 0, 0, 3)), None);
         assert_eq!(notification_area(&msg, Rect::new(0, 0, 10, 0)), None);
     }
 
     #[test]
-    fn test_kinds_have_distinct_labels() {
+    fn test_message_kinds() {
         assert_eq!(FlashMessage::info("x").kind, FlashKind::Info);
         assert_eq!(FlashMessage::success("x").kind, FlashKind::Success);
         assert_eq!(FlashMessage::error("x").kind, FlashKind::Error);
+    }
+
+    #[test]
+    fn test_latest_replaces() {
+        let old = FlashMessage::info("old");
+        let new = FlashMessage::success("new");
+        let current = Some(new.clone());
+        assert_eq!(current.as_ref().unwrap().text, "new");
+        assert_eq!(current.as_ref().unwrap().kind, FlashKind::Success);
+        drop(old);
     }
 }

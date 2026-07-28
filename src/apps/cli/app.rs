@@ -30,12 +30,12 @@ use crate::{
 };
 use color_eyre::Result;
 use keymap::{DerivedConfig, KeyMap};
-use upmd_parser::{CodeId, Codes, Parser};
+use upmd_parser::{Code, CodeId, Codes, Parser};
 
 /// For the CLI, manages code block execution and navigation.
 pub struct App {
     codes: Codes,
-    selected: usize,
+    selected: Option<CodeId>,
     config: AppConfig,
     outputs: RefCell<HashMap<CodeId, task::Task>>,
     theme: Theme,
@@ -73,20 +73,14 @@ pub enum Msg {
 }
 
 impl App {
-    pub fn new(doc: upmd_parser::Document, config: AppConfig) -> Self {
+    pub fn new(doc: upmd_parser::Document, config: AppConfig) -> std::result::Result<Self, String> {
         let upmd_parser::Document { codes, .. } = doc;
+        let selected = crate::apps::initial_code_id(&codes, config.block.as_deref())?;
+        Ok(Self::build(codes, config, selected))
+    }
 
-        let selected = match &config.block {
-            Some(spec) => codes
-                .resolve(spec)
-                .first()
-                .and_then(|&id| codes.index_of(id))
-                .unwrap_or(0),
-            None => 0,
-        };
-
+    fn build(codes: Codes, config: AppConfig, selected: Option<CodeId>) -> Self {
         let failed = Rc::new(Cell::new(false));
-
         let keymap: DerivedConfig<Action> = config.keymap.cli::<Action>();
 
         // Seed env and cwd from the parent process so consecutive blocks
@@ -116,12 +110,24 @@ impl App {
         }
     }
 
+    fn selected_code(&self) -> Option<&Code> {
+        self.selected.and_then(|id| self.codes.by_id(id))
+    }
+
+    fn selected_index(&self) -> Option<usize> {
+        self.selected.and_then(|id| self.codes.index_of(id))
+    }
+
+    fn select_index(&mut self, index: usize) {
+        self.selected = self.codes.get(index).map(|code| code.id);
+    }
+
     /// Creates the app in file-picker mode before a document is loaded.
     pub fn from_file_picker(
         files: Vec<crate::markdown_files::MarkdownFile>,
         config: AppConfig,
     ) -> Self {
-        let mut app = Self::new(upmd_parser::new().parse(""), config);
+        let mut app = Self::build(Codes::default(), config, None);
         app.picker = Some(crate::apps::picker::PickerState::new(files));
         app
     }
@@ -131,35 +137,34 @@ impl App {
         match crate::reader::read_from_path(path) {
             Ok(input) => {
                 let doc = upmd_parser::new().parse(&input);
-                self.load_document(doc);
+                if let Err(error) = self.load_document(doc) {
+                    eprintln!("{error}");
+                    self.failed.set(true);
+                    return Some(Cmd::quit());
+                }
                 self.picker = None;
             }
             Err(err) => {
                 // In picker mode, errors are fatal since there's no
                 // notification system like the TUI.
                 eprintln!("Failed to open {}: {err}", path.display());
+                self.failed.set(true);
                 return Some(Cmd::quit());
             }
         }
         None
     }
 
-    fn load_document(&mut self, doc: upmd_parser::Document) {
+    fn load_document(&mut self, doc: upmd_parser::Document) -> Result<(), String> {
         let upmd_parser::Document { codes, .. } = doc;
+        let selected = crate::apps::initial_code_id(&codes, self.config.block.as_deref())?;
         self.codes = codes;
-        self.selected = match &self.config.block {
-            Some(spec) => self
-                .codes
-                .resolve(spec)
-                .first()
-                .and_then(|&id| self.codes.index_of(id))
-                .unwrap_or(0),
-            None => 0,
-        };
+        self.selected = selected;
         self.workflow = None;
         self.outputs.borrow_mut().clear();
         self.batch_output.reset();
         self.pending_states.clear();
+        Ok(())
     }
 
     fn launch_batch(&mut self, batch: Vec<CodeId>) -> Option<Cmd<Msg>> {
@@ -338,22 +343,18 @@ impl App {
 
     fn select_batch(&mut self, batch: &[CodeId]) {
         self.batch_output.select(batch);
-        if let Some(first) = batch.first() {
-            if let Some(index) = self.codes.index_of(*first) {
-                self.selected = index;
-            }
-        }
+        self.selected = batch
+            .first()
+            .copied()
+            .filter(|&id| self.codes.by_id(id).is_some());
     }
 
     fn focus_next_batch_block(&mut self) {
-        let Some(selected) = self.codes.get(self.selected).map(|code| code.id) else {
+        let Some(selected) = self.selected else {
             return;
         };
-        let Some(next) = self.batch_output.focus_next(selected) else {
-            return;
-        };
-        if let Some(index) = self.codes.index_of(next) {
-            self.selected = index;
+        if let Some(next) = self.batch_output.focus_next(selected) {
+            self.selected = Some(next);
         }
     }
 
@@ -384,10 +385,7 @@ impl App {
     /// writing PTY output directly to the terminal when in the alternate
     /// screen and resizing the PTY on alternate-screen transitions.
     fn apply_stream_to_output(&mut self, id: CodeId, stream: &Stream) {
-        let focused = self
-            .codes
-            .get(self.selected)
-            .is_some_and(|code| code.id == id);
+        let focused = self.selected == Some(id);
         let mut outputs = self.outputs.borrow_mut();
         let Some(state) = outputs.get_mut(&id) else {
             return;
@@ -500,10 +498,7 @@ impl App {
 
     fn handle_action(&mut self, action: Action) -> Option<Cmd<Msg>> {
         match action {
-            Action::Run => {
-                let id = self.codes.get(self.selected)?.id;
-                self.execute(id)
-            }
+            Action::Run => self.execute(self.selected?),
             Action::FocusNext => {
                 self.focus_next_batch_block();
                 None
@@ -514,33 +509,24 @@ impl App {
 
     fn handle_nav(&mut self, nav: Navigation) -> Option<Cmd<Msg>> {
         let total = self.codes.len();
-        match nav {
-            Navigation::Next if self.selected + 1 < total => {
-                self.selected += 1;
-            }
-            Navigation::Prev if self.selected > 0 => {
-                self.selected -= 1;
-            }
-            Navigation::First => {
-                self.selected = 0;
-            }
-            Navigation::Last => {
-                self.selected = total.saturating_sub(1);
-            }
-            Navigation::PageUp => {
-                self.selected = self.selected.saturating_sub(5);
-            }
-            Navigation::PageDown => {
-                self.selected = (self.selected + 5).min(total.saturating_sub(1));
-            }
-            _ => {}
+        if total == 0 {
+            return None;
         }
+
+        let current = self.selected_index().unwrap_or(0);
+        let last = total - 1;
+        let next = match nav {
+            Navigation::Next => current.saturating_add(1).min(last),
+            Navigation::Prev => current.saturating_sub(1),
+            Navigation::First => 0,
+            Navigation::Last => last,
+            Navigation::PageUp => current.saturating_sub(5),
+            Navigation::PageDown => current.saturating_add(5).min(last),
+        };
+        self.select_index(next);
+
         if self.config.yes {
-            if let Some(id) = self.codes.get(self.selected).map(|c| c.id) {
-                self.execute(id)
-            } else {
-                None
-            }
+            self.selected.and_then(|id| self.execute(id))
         } else {
             None
         }
@@ -548,7 +534,7 @@ impl App {
 }
 
 impl crate::RunApp for App {
-    fn from_input(input: &str, config: AppConfig) -> Self {
+    fn from_input(input: &str, config: AppConfig) -> std::result::Result<Self, String> {
         let doc = upmd_parser::new().parse(input);
         Self::new(doc, config)
     }
@@ -582,8 +568,7 @@ impl Component for App {
             return None;
         }
         if self.config.block.is_some() && self.config.yes {
-            let id = self.codes.get(self.selected)?.id;
-            self.execute(id)
+            self.execute(self.selected?)
         } else if self.config.all {
             self.start_all()
         } else {
@@ -620,7 +605,7 @@ impl Input for App {
 
             // Forward input to process if one is running. Write directly
             // via RefCell so keystrokes don't trigger a render cycle.
-            let Some(code) = self.codes.get(self.selected) else {
+            let Some(code) = self.selected_code() else {
                 // No code blocks; only quit actions are meaningful.
                 if let Some(action) = self.keymap.get(&key) {
                     if action == &Action::Quit {
@@ -819,7 +804,7 @@ impl App {
             return Ok(());
         }
 
-        let selected = self.codes.get(self.selected).map(|code| code.id);
+        let selected = self.selected;
         let outputs = self.outputs.borrow();
         let active = ansi_fg(self.theme.active);
         let muted = ansi_fg(self.theme.muted);
@@ -849,10 +834,9 @@ impl Output for App {
         if !self.batch_output.is_terminal() {
             return false;
         }
-        if self.codes.is_empty() {
+        let Some(id) = self.selected else {
             return false;
-        }
-        let id = self.codes[self.selected].id;
+        };
         self.outputs
             .borrow()
             .get(&id)
@@ -894,15 +878,17 @@ impl Output for App {
         }
 
         let mut counter = LineCounter::new(out, term_width as u16);
-        if self.codes.is_empty() {
-            writeln!(counter, "No code blocks found.")?;
+        let Some(code) = self.selected_code() else {
+            let message = if self.codes.is_empty() {
+                "No code blocks found."
+            } else {
+                "No code block selected."
+            };
+            writeln!(counter, "{message}")?;
             self.batch_output.set_previous_lines(counter.lines);
             return Ok(());
-        }
-
-        let code = &self.codes[self.selected];
+        };
         let total = self.codes.len();
-        let index = self.selected;
         let info_bg = ansi_bg(self.theme.info_background);
         let info_fg = ansi_fg(self.theme.info_foreground);
         let active_fg = ansi_fg(self.theme.active);
@@ -922,8 +908,8 @@ impl Output for App {
         let language = upmd_runner::find_language(&code.language);
         write!(
             counter,
-            "{info_bg}{info_fg} [{active_fg}{idx}{reset}{info_bg}{info_fg}/{total}]{info_fg} {lang}{deps}{reset}",
-            idx = index + 1,
+            "{info_bg}{info_fg} [{active_fg}{id}{reset}{info_bg}{info_fg}/{total}]{info_fg} {lang}{deps}{reset}",
+            id = code.id,
             total = total,
             lang = language.name,
             deps = deps_str,
@@ -1170,7 +1156,7 @@ echo world
 ```
 "#;
         let doc = upmd_parser::new().parse(input);
-        App::new(doc, make_config())
+        App::new(doc, make_config()).unwrap()
     }
 
     fn make_parallel_app() -> App {
@@ -1178,7 +1164,7 @@ echo world
 ```sh [name:a]\n:\n```\n\
 ```sh [name:b]\n:\n```\n\
 ```sh [name:target, deps:\"a | b\"]\n:\n```\n";
-        App::new(upmd_parser::new().parse(input), make_config())
+        App::new(upmd_parser::new().parse(input), make_config()).unwrap()
     }
 
     fn insert_completed_output(app: &App, id: CodeId, text: &str, exit_code: i32) {
@@ -1220,7 +1206,8 @@ echo world
                 nodes_state: upmd_parser::NodesState::Full,
             },
             make_config(),
-        );
+        )
+        .unwrap();
         let _ = app.create();
         assert_eq!(app.codes.len(), 0);
     }
@@ -1239,23 +1226,23 @@ echo world
     #[test]
     fn test_navigation_updates_selected() {
         let mut app = make_two_block_app();
-        assert_eq!(app.selected, 0, "starts at first block");
+        assert_eq!(app.selected, Some(1), "starts at first block");
 
         app.handle_nav(Navigation::Next);
-        assert_eq!(app.selected, 1, "navigates to second block");
+        assert_eq!(app.selected, Some(2), "navigates to second block");
 
         app.handle_nav(Navigation::Prev);
-        assert_eq!(app.selected, 0, "navigates back to first block");
+        assert_eq!(app.selected, Some(1), "navigates back to first block");
     }
 
     #[test]
     fn test_navigation_first_and_last() {
         let mut app = make_two_block_app();
         app.handle_nav(Navigation::Last);
-        assert_eq!(app.selected, 1, "goes to last block");
+        assert_eq!(app.selected, Some(2), "goes to last block");
 
         app.handle_nav(Navigation::First);
-        assert_eq!(app.selected, 0, "goes to first block");
+        assert_eq!(app.selected, Some(1), "goes to first block");
     }
 
     #[test]
@@ -1263,12 +1250,12 @@ echo world
         let mut app = make_two_block_app();
         // Already at 0, prev should stay
         app.handle_nav(Navigation::Prev);
-        assert_eq!(app.selected, 0);
+        assert_eq!(app.selected, Some(1));
 
         // Go to last, next should stay
         app.handle_nav(Navigation::Last);
         app.handle_nav(Navigation::Next);
-        assert_eq!(app.selected, 1);
+        assert_eq!(app.selected, Some(2));
     }
 
     #[test]
@@ -1281,7 +1268,8 @@ echo world
                 nodes_state: upmd_parser::NodesState::Full,
             },
             make_config(),
-        );
+        )
+        .unwrap();
         let result = app.create();
         assert!(result.is_none(), "empty codes returns None");
     }
@@ -1299,7 +1287,7 @@ print("3")
 ```
 "#;
         let doc = upmd_parser::new().parse(input);
-        let app = App::new(doc, config);
+        let app = App::new(doc, config).unwrap();
         let mut buf = Vec::new();
         app.render(&mut buf).unwrap();
         let out = String::from_utf8(buf).unwrap();
@@ -1322,7 +1310,7 @@ print("2")
 ```
 "#;
         let doc = upmd_parser::new().parse(input);
-        let app = App::new(doc, config);
+        let app = App::new(doc, config).unwrap();
         let mut buf = Vec::new();
         app.render(&mut buf).unwrap();
         let out = String::from_utf8(buf).unwrap();
@@ -1351,7 +1339,8 @@ print("2")
                 nodes_state: upmd_parser::NodesState::Full,
             },
             make_config(),
-        );
+        )
+        .unwrap();
         // Simulate a quit keypress on an empty document.
         let event = crossterm::event::Event::Key(crossterm::event::KeyEvent::new(
             crossterm::event::KeyCode::Char('q'),
@@ -1370,7 +1359,8 @@ print("2")
                 nodes_state: upmd_parser::NodesState::Full,
             },
             make_config(),
-        );
+        )
+        .unwrap();
         assert!(app.start_all().is_none());
     }
 
@@ -1386,7 +1376,8 @@ print("2")
                 nodes_state: upmd_parser::NodesState::Full,
             },
             config,
-        );
+        )
+        .unwrap();
         let result = app.create();
         assert!(
             result.is_none(),
@@ -1421,7 +1412,7 @@ print("2")
         let card1 = String::from_utf8(buf1).unwrap();
 
         // Navigate to second block and get its card
-        app.selected = 1;
+        app.selected = Some(2);
         let mut buf2 = Vec::new();
         app.render(&mut buf2).unwrap();
         let card2 = String::from_utf8(buf2).unwrap();
@@ -1472,9 +1463,9 @@ print("2")
         let live = String::from_utf8(live).unwrap();
         assert!(live.contains("Parallel:"));
         assert!(live.contains("tab"));
-        assert_eq!(app.codes[app.selected].id, 1);
+        assert_eq!(app.selected, Some(1));
         app.focus_next_batch_block();
-        assert_eq!(app.codes[app.selected].id, 2);
+        assert_eq!(app.selected, Some(2));
 
         app.batch_output
             .complete(&WorkflowTransition::Finished { failed: false });

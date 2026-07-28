@@ -88,6 +88,18 @@ help = "search"
 keys = ["/"]
 symbol = "/"
 
+[keymap.home.ShowDeps]
+description = "Show dependency diagram"
+help = "deps"
+keys = [";"]
+symbol = ";"
+
+[keymap.home.ShowWorkflowDeps]
+description = "Show workflow's dependency diagram"
+help = "workflow deps"
+keys = ["'"]
+symbol = "'"
+
 [keymap.home.SwitchTheme]
 description = "Switch theme"
 help = "theme"
@@ -352,7 +364,7 @@ help = "go"
 keys = ["enter"]
 symbol = "enter"
 
-[keymap.dependencies.Down]
+[keymap.deps.Down]
 help = "down"
 keys = [
     "down",
@@ -360,11 +372,11 @@ keys = [
 ]
 symbol = "down"
 
-[keymap.dependencies.Exit]
+[keymap.deps.Exit]
 keys = ["ctrl-c"]
 symbol = "ctrl-c"
 
-[keymap.dependencies.Left]
+[keymap.deps.Left]
 help = "left"
 keys = [
     "left",
@@ -372,17 +384,17 @@ keys = [
 ]
 symbol = "left"
 
-[keymap.dependencies.PageDown]
+[keymap.deps.PageDown]
 help = "page down"
 keys = ["pagedown"]
 symbol = "pagedown"
 
-[keymap.dependencies.PageUp]
+[keymap.deps.PageUp]
 help = "page up"
 keys = ["pageup"]
 symbol = "pageup"
 
-[keymap.dependencies.Quit]
+[keymap.deps.Quit]
 help = "close"
 keys = [
     "esc",
@@ -390,12 +402,12 @@ keys = [
 ]
 symbol = "esc"
 
-[keymap.dependencies.Reset]
+[keymap.deps.Reset]
 help = "reset"
 keys = ["home"]
 symbol = "home"
 
-[keymap.dependencies.Right]
+[keymap.deps.Right]
 help = "right"
 keys = [
     "right",
@@ -403,7 +415,7 @@ keys = [
 ]
 symbol = "right"
 
-[keymap.dependencies.Up]
+[keymap.deps.Up]
 help = "up"
 keys = [
     "up",

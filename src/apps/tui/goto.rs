@@ -10,6 +10,7 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::Paragraph;
 
+use upmd_parser::CodeId;
 use upmd_runtime::{
     runtimes::tui::{Input, Output},
     Cmd, Component,
@@ -36,10 +37,10 @@ pub(crate) enum StatusKind {
 pub struct Goto {
     query: String,
     selected: usize,
-    matches: Vec<(u32, String, StatusKind)>,
-    all_blocks: Vec<(u32, String, StatusKind)>,
+    matches: Vec<(CodeId, String, StatusKind)>,
+    all_blocks: Vec<(CodeId, String, StatusKind)>,
     /// Raw code content and language keyed by code ID, shown as a mini-preview.
-    previews: HashMap<u32, (String, String)>,
+    previews: HashMap<CodeId, (String, String)>,
     spinner: Spinner,
     theme: Theme,
     keymap: DerivedConfig<Action>,
@@ -65,8 +66,8 @@ impl Goto {
     pub fn new(
         theme: Theme,
         keymap: DerivedConfig<Action>,
-        all_blocks: Vec<(u32, String, StatusKind)>,
-        previews: HashMap<u32, (String, String)>,
+        all_blocks: Vec<(CodeId, String, StatusKind)>,
+        previews: HashMap<CodeId, (String, String)>,
     ) -> Self {
         let mut s = Self {
             query: String::new(),
@@ -82,7 +83,7 @@ impl Goto {
         s
     }
 
-    pub fn selected_code_id(&self) -> Option<u32> {
+    pub fn selected_code_id(&self) -> Option<CodeId> {
         self.matches.get(self.selected).map(|(id, _, _)| *id)
     }
 
@@ -95,7 +96,7 @@ impl Goto {
         self.selected = self.selected.min(self.matches.len().saturating_sub(1));
     }
 
-    fn build_matches(&self) -> Vec<(u32, String, StatusKind)> {
+    fn build_matches(&self) -> Vec<(CodeId, String, StatusKind)> {
         let query_lower = self.query.to_lowercase();
 
         self.all_blocks
