@@ -10,7 +10,6 @@ use ratatui::{
     widgets::{Borders, List, ListItem, Paragraph},
     Frame,
 };
-use upmd_parser::nodes::Code;
 
 use crate::apps::theme::Theme;
 use crate::apps::tui::widgets::Spinner;
@@ -72,7 +71,7 @@ fn toc_items(headings: &[upmd_parser::Heading]) -> Vec<(u8, String)> {
 impl Menu {
     /// Creates a menu from parsed code blocks and headings.
     pub fn new(
-        codes: &[Code],
+        codes: &upmd_parser::Codes,
         headings: &[upmd_parser::Heading],
         theme: Theme,
         nav_keymap: DerivedConfig<Navigation>,
@@ -594,12 +593,15 @@ mod tests {
 
     #[test]
     fn test_menu_page_up_down() {
-        let codes: Vec<upmd_parser::nodes::Code> = (1..=20u32)
-            .map(|id| upmd_parser::nodes::Code {
-                id,
-                ..Default::default()
-            })
-            .collect();
+        let codes = upmd_parser::Codes::try_from(
+            (1..=20u32)
+                .map(|id| upmd_parser::nodes::Code {
+                    id,
+                    ..Default::default()
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
         let nav_keymap: keymap::DerivedConfig<Navigation> = toml::from_str("").unwrap();
         let mut menu = Menu::new(
             &codes,
@@ -649,13 +651,16 @@ mod tests {
         );
     }
 
-    fn codes(n: u32) -> Vec<upmd_parser::nodes::Code> {
-        (1..=n)
-            .map(|id| upmd_parser::nodes::Code {
-                id,
-                ..Default::default()
-            })
-            .collect()
+    fn codes(n: u32) -> upmd_parser::Codes {
+        upmd_parser::Codes::try_from(
+            (1..=n)
+                .map(|id| upmd_parser::nodes::Code {
+                    id,
+                    ..Default::default()
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap()
     }
 
     fn render_vertical_text(menu: &Menu, width: u16) -> String {

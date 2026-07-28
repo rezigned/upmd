@@ -30,12 +30,11 @@ use crate::{
 };
 use color_eyre::Result;
 use keymap::{DerivedConfig, KeyMap};
-use upmd_parser::nodes::{Code, CodeId};
-use upmd_parser::{resolve_code_block, Parser};
+use upmd_parser::{CodeId, Codes, Parser};
 
 /// For the CLI, manages code block execution and navigation.
 pub struct App {
-    codes: Vec<Code>,
+    codes: Codes,
     selected: usize,
     config: AppConfig,
     outputs: RefCell<HashMap<CodeId, task::Task>>,
@@ -78,10 +77,11 @@ impl App {
         let upmd_parser::Document { codes, .. } = doc;
 
         let selected = match &config.block {
-            Some(spec) => {
-                let ids = resolve_code_block(&codes, spec);
-                codes.iter().position(|c| ids.contains(&c.id)).unwrap_or(0)
-            }
+            Some(spec) => codes
+                .resolve(spec)
+                .first()
+                .and_then(|&id| codes.index_of(id))
+                .unwrap_or(0),
             None => 0,
         };
 
@@ -148,13 +148,12 @@ impl App {
         let upmd_parser::Document { codes, .. } = doc;
         self.codes = codes;
         self.selected = match &self.config.block {
-            Some(spec) => {
-                let ids = resolve_code_block(&self.codes, spec);
-                self.codes
-                    .iter()
-                    .position(|c| ids.contains(&c.id))
-                    .unwrap_or(0)
-            }
+            Some(spec) => self
+                .codes
+                .resolve(spec)
+                .first()
+                .and_then(|&id| self.codes.index_of(id))
+                .unwrap_or(0),
             None => 0,
         };
         self.workflow = None;
@@ -241,7 +240,7 @@ impl App {
         {
             self.batch_output.track(id);
         }
-        let code = self.codes.iter().find(|code| code.id == id)?;
+        let code = self.codes.by_id(id)?;
         let (cols, rows) =
             crossterm::terminal::size().unwrap_or((PTY_DEFAULT_COLS, PTY_DEFAULT_ROWS));
         let pty_rows = rows
@@ -340,7 +339,7 @@ impl App {
     fn select_batch(&mut self, batch: &[CodeId]) {
         self.batch_output.select(batch);
         if let Some(first) = batch.first() {
-            if let Some(index) = self.codes.iter().position(|code| code.id == *first) {
+            if let Some(index) = self.codes.index_of(*first) {
                 self.selected = index;
             }
         }
@@ -353,7 +352,7 @@ impl App {
         let Some(next) = self.batch_output.focus_next(selected) else {
             return;
         };
-        if let Some(index) = self.codes.iter().position(|code| code.id == next) {
+        if let Some(index) = self.codes.index_of(next) {
             self.selected = index;
         }
     }
@@ -737,8 +736,7 @@ impl App {
 
     fn code_label(&self, id: CodeId) -> String {
         self.codes
-            .iter()
-            .find(|code| code.id == id)
+            .by_id(id)
             .map(|code| {
                 if code.name.is_empty() {
                     code.id.to_string()
@@ -1217,7 +1215,7 @@ echo world
         let mut app = App::new(
             upmd_parser::Document {
                 nodes: vec![],
-                codes: Vec::new(),
+                codes: Codes::default(),
                 headings: Vec::new(),
                 nodes_state: upmd_parser::NodesState::Full,
             },
@@ -1278,7 +1276,7 @@ echo world
         let mut app = App::new(
             upmd_parser::Document {
                 nodes: vec![],
-                codes: Vec::new(),
+                codes: Codes::default(),
                 headings: Vec::new(),
                 nodes_state: upmd_parser::NodesState::Full,
             },
@@ -1348,7 +1346,7 @@ print("2")
         let app = App::new(
             upmd_parser::Document {
                 nodes: vec![],
-                codes: Vec::new(),
+                codes: Codes::default(),
                 headings: Vec::new(),
                 nodes_state: upmd_parser::NodesState::Full,
             },
@@ -1367,7 +1365,7 @@ print("2")
         let mut app = App::new(
             upmd_parser::Document {
                 nodes: vec![],
-                codes: Vec::new(),
+                codes: Codes::default(),
                 headings: Vec::new(),
                 nodes_state: upmd_parser::NodesState::Full,
             },
@@ -1383,7 +1381,7 @@ print("2")
         let mut app = App::new(
             upmd_parser::Document {
                 nodes: vec![],
-                codes: Vec::new(),
+                codes: Codes::default(),
                 headings: Vec::new(),
                 nodes_state: upmd_parser::NodesState::Full,
             },

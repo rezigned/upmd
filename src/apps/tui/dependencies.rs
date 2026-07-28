@@ -9,7 +9,7 @@ use ratatui::{
     Frame,
 };
 use unicode_width::UnicodeWidthStr;
-use upmd_parser::{nodes::Code, CodeId};
+use upmd_parser::{CodeId, Codes};
 use upmd_runtime::{
     runtimes::tui::{Input, Output},
     Cmd, Component,
@@ -61,7 +61,7 @@ pub enum Action {
 
 impl Dependencies {
     pub fn for_target(
-        codes: &[Code],
+        codes: &Codes,
         target: Option<CodeId>,
         statuses: HashMap<CodeId, TaskStatus>,
         theme: Theme,
@@ -80,7 +80,7 @@ impl Dependencies {
     }
 
     pub fn for_workflow(
-        codes: &[Code],
+        codes: &Codes,
         graph: Option<DependencyGraph>,
         statuses: HashMap<CodeId, TaskStatus>,
         theme: Theme,
@@ -99,7 +99,7 @@ impl Dependencies {
 
     fn new(
         title: &'static str,
-        codes: &[Code],
+        codes: &Codes,
         graph: Option<Result<DependencyGraph, String>>,
         empty_message: &'static str,
         statuses: HashMap<CodeId, TaskStatus>,

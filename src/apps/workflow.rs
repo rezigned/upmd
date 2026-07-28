@@ -19,7 +19,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use upmd_parser::{resolve_code_block, Code, CodeId};
+use upmd_parser::{Code, CodeId, Codes};
 
 /// A block that failed during execution.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -65,7 +65,7 @@ pub struct Workflow {
 impl Workflow {
     /// Runs all blocks sequentially, one at a time, preserving source order.
     /// Failed blocks skip their dependents but do not stop other blocks.
-    pub fn for_all(codes: &[Code], auto_run: bool) -> Result<Self, String> {
+    pub fn for_all(codes: &Codes, auto_run: bool) -> Result<Self, String> {
         let graph = DependencyGraph::for_all(codes)?;
         let pending = graph
             .layers()
@@ -86,16 +86,16 @@ impl Workflow {
     /// Runs the dependency chain of `target`.
     /// Blocks in the same group run concurrently; groups are sequential.
     /// On failure, remaining groups are cancelled and `Stopped` is returned.
-    pub fn for_target(codes: &[Code], target: CodeId) -> Result<Self, String> {
+    pub fn for_target(codes: &Codes, target: CodeId) -> Result<Self, String> {
         Self::build_target(codes, target, true)
     }
 
     /// Runs the dependency chain of `target`, re-executing all prerequisites.
-    pub fn for_target_rerun(codes: &[Code], target: CodeId) -> Result<Self, String> {
+    pub fn for_target_rerun(codes: &Codes, target: CodeId) -> Result<Self, String> {
         Self::build_target(codes, target, false)
     }
 
-    fn build_target(codes: &[Code], target: CodeId, skip_succeeded: bool) -> Result<Self, String> {
+    fn build_target(codes: &Codes, target: CodeId, skip_succeeded: bool) -> Result<Self, String> {
         let graph = DependencyGraph::for_target(codes, target)?;
         let pending = graph.layers().iter().cloned().collect();
         Ok(Self::new(
@@ -241,12 +241,12 @@ pub struct DependencyGraph {
 }
 
 impl DependencyGraph {
-    pub fn for_all(codes: &[Code]) -> Result<Self, String> {
+    pub fn for_all(codes: &Codes) -> Result<Self, String> {
         let ids = codes.iter().map(|code| code.id).collect::<HashSet<_>>();
         build_dependency_graph(codes, &ids, None)
     }
 
-    pub fn for_target(codes: &[Code], target: CodeId) -> Result<Self, String> {
+    pub fn for_target(codes: &Codes, target: CodeId) -> Result<Self, String> {
         let ids = collect_dependencies(codes, target)?;
         build_dependency_graph(codes, &ids, Some(target))
     }
@@ -261,8 +261,8 @@ impl DependencyGraph {
 }
 
 /// Walks the dependency tree of `target` and returns all reachable block IDs.
-fn collect_dependencies(codes: &[Code], target: CodeId) -> Result<HashSet<CodeId>, String> {
-    if !codes.iter().any(|code| code.id == target) {
+fn collect_dependencies(codes: &Codes, target: CodeId) -> Result<HashSet<CodeId>, String> {
+    if codes.by_id(target).is_none() {
         return Err(format!("target block {target} not found"));
     }
 
@@ -270,8 +270,7 @@ fn collect_dependencies(codes: &[Code], target: CodeId) -> Result<HashSet<CodeId
     let mut stack = vec![target];
     while let Some(id) = stack.pop() {
         let code = codes
-            .iter()
-            .find(|code| code.id == id)
+            .by_id(id)
             .ok_or_else(|| format!("block {id} not found"))?;
         for dependency in resolve_dependencies_for(codes, code)?.into_iter().flatten() {
             if selected.insert(dependency) {
@@ -284,7 +283,7 @@ fn collect_dependencies(codes: &[Code], target: CodeId) -> Result<HashSet<CodeId
 
 /// Builds a `DependencyGraph` via topological sort from a selected subset of blocks.
 fn build_dependency_graph(
-    codes: &[Code],
+    codes: &Codes,
     selected: &HashSet<CodeId>,
     target: Option<CodeId>,
 ) -> Result<DependencyGraph, String> {
@@ -363,7 +362,7 @@ fn build_dependency_graph(
 }
 
 /// Resolves a block's dependency names and numeric IDs while preserving groups.
-fn resolve_dependencies_for(codes: &[Code], code: &Code) -> Result<Vec<Vec<CodeId>>, String> {
+fn resolve_dependencies_for(codes: &Codes, code: &Code) -> Result<Vec<Vec<CodeId>>, String> {
     let groups = code
         .deps
         .groups()
@@ -376,7 +375,7 @@ fn resolve_dependencies_for(codes: &[Code], code: &Code) -> Result<Vec<Vec<CodeI
             group
                 .iter()
                 .map(|dependency| {
-                    let matches = resolve_code_block(codes, dependency);
+                    let matches = codes.resolve(dependency);
                     let id = match matches.as_slice() {
                         [] => {
                             return Err(format!(
@@ -440,41 +439,45 @@ mod tests {
         Code::new(id, String::new(), options::parse(&info))
     }
 
+    fn codes(items: Vec<Code>) -> Codes {
+        Codes::try_from(items).unwrap()
+    }
+
     #[test]
     fn dependency_groups_resolve_names_and_numeric_ids() {
-        let codes = vec![
+        let codes = codes(vec![
             code(1, "setup", None),
             code(2, "build", None),
             code(3, "test", None),
-            code(10, "", None),
-            code(20, "", None),
-        ];
+            code(4, "", None),
+            code(5, "", None),
+        ]);
 
         for (dependencies, expected) in [
             ("setup", vec![vec![1]]),
             ("test", vec![vec![3]]),
-            ("10, 20", vec![vec![10], vec![20]]),
+            ("4, 5", vec![vec![4], vec![5]]),
             ("build", vec![vec![2]]),
         ] {
-            let target = code(30, "target", Some(dependencies));
+            let target = code(6, "target", Some(dependencies));
             assert_eq!(resolve_dependencies_for(&codes, &target).unwrap(), expected);
         }
 
-        let target = code(30, "target", Some("missing"));
+        let target = code(6, "target", Some("missing"));
         assert!(resolve_dependencies_for(&codes, &target)
             .unwrap_err()
-            .starts_with("block 30:"));
+            .starts_with("block 6:"));
     }
 
     #[test]
     fn target_batches_preserve_sequential_and_parallel_groups() {
-        let codes = vec![
+        let codes = codes(vec![
             code(1, "setup", None),
             code(2, "build", None),
             code(3, "lint", None),
             code(4, "test", None),
             code(5, "target", Some("setup, build | lint, test")),
-        ];
+        ]);
 
         let mut workflow = Workflow::for_target(&codes, 5).unwrap();
         assert_eq!(workflow.start(), Some(vec![1]));
@@ -499,7 +502,10 @@ mod tests {
 
     #[test]
     fn target_rerun_executes_successful_dependencies_again() {
-        let codes = vec![code(1, "setup", None), code(2, "target", Some("setup"))];
+        let codes = codes(vec![
+            code(1, "setup", None),
+            code(2, "target", Some("setup")),
+        ]);
 
         let normal = Workflow::for_target(&codes, 2).unwrap();
         assert!(!normal.should_execute(1, true));
@@ -512,11 +518,11 @@ mod tests {
 
     #[test]
     fn nested_dependencies_are_ordered_before_the_target() {
-        let codes = vec![
+        let codes = codes(vec![
             code(1, "target", Some("build")),
             code(2, "build", Some("setup")),
             code(3, "setup", None),
-        ];
+        ]);
 
         let mut workflow = Workflow::for_target(&codes, 1).unwrap();
         assert_eq!(workflow.start(), Some(vec![3]));
@@ -536,11 +542,11 @@ mod tests {
 
     #[test]
     fn all_mode_is_sequential_and_stably_sorted() {
-        let codes = vec![
+        let codes = codes(vec![
             code(1, "target", Some("setup")),
             code(2, "unrelated", None),
             code(3, "setup", None),
-        ];
+        ]);
 
         let mut workflow = Workflow::for_all(&codes, false).unwrap();
         assert_eq!(workflow.start(), Some(vec![2]));
@@ -560,11 +566,11 @@ mod tests {
 
     #[test]
     fn graph_uses_workflow_validation() {
-        let codes = vec![
+        let codes = codes(vec![
             code(1, "same", None),
             code(2, "same", None),
             code(3, "target", Some("same")),
-        ];
+        ]);
         assert!(DependencyGraph::for_target(&codes, 3)
             .unwrap_err()
             .contains("ambiguous"));
@@ -572,22 +578,22 @@ mod tests {
 
     #[test]
     fn graph_layers_contain_each_block_once() {
-        let codes = vec![
+        let codes = codes(vec![
             code(1, "a", None),
             code(2, "b", Some("a")),
             code(3, "target", Some("a, b")),
-        ];
+        ]);
         let graph = DependencyGraph::for_target(&codes, 3).unwrap();
         assert_eq!(graph.layers(), &[vec![1], vec![2], vec![3]]);
     }
 
     #[test]
     fn all_mode_retains_its_complete_graph() {
-        let codes = vec![
+        let codes = codes(vec![
             code(1, "a", None),
             code(2, "b", Some("a")),
             code(3, "independent", None),
-        ];
+        ]);
         let workflow = Workflow::for_all(&codes, false).unwrap();
         assert_eq!(workflow.graph().layers(), &[vec![1, 3], vec![2]]);
         assert_eq!(workflow.graph().target(), None);
@@ -595,16 +601,16 @@ mod tests {
 
     #[test]
     fn cycles_and_ambiguous_names_are_rejected() {
-        let cycle = vec![code(1, "a", Some("b")), code(2, "b", Some("a"))];
+        let cycle = codes(vec![code(1, "a", Some("b")), code(2, "b", Some("a"))]);
         assert!(Workflow::for_all(&cycle, false)
             .unwrap_err()
             .contains("cycle"));
 
-        let ambiguous = vec![
+        let ambiguous = codes(vec![
             code(1, "same", None),
             code(2, "same", None),
             code(3, "target", Some("same")),
-        ];
+        ]);
         assert!(Workflow::for_target(&ambiguous, 3)
             .unwrap_err()
             .contains("ambiguous"));
@@ -612,18 +618,21 @@ mod tests {
 
     #[test]
     fn target_validation_ignores_unrelated_blocks() {
-        let codes = vec![code(1, "target", None), code(2, "broken", Some("missing"))];
+        let codes = codes(vec![
+            code(1, "target", None),
+            code(2, "broken", Some("missing")),
+        ]);
         assert!(Workflow::for_target(&codes, 1).is_ok());
         assert!(Workflow::for_all(&codes, false).is_err());
     }
 
     #[test]
     fn target_failure_waits_for_its_parallel_batch() {
-        let codes = vec![
+        let codes = codes(vec![
             code(1, "a", None),
             code(2, "b", None),
             code(3, "target", Some("a | b")),
-        ];
+        ]);
         let mut workflow = Workflow::for_target(&codes, 3).unwrap();
 
         assert_eq!(workflow.start(), Some(vec![1, 2]));
@@ -639,11 +648,11 @@ mod tests {
 
     #[test]
     fn all_mode_skips_failed_dependents_but_runs_other_blocks() {
-        let codes = vec![
+        let codes = codes(vec![
             code(1, "fail", None),
             code(2, "dependent", Some("fail")),
             code(3, "independent", None),
-        ];
+        ]);
         let mut workflow = Workflow::for_all(&codes, true).unwrap();
 
         assert_eq!(workflow.start(), Some(vec![1]));

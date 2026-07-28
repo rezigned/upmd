@@ -2,7 +2,7 @@ pub mod nodes;
 pub mod options;
 pub mod parser;
 
-pub use nodes::{resolve_code_block, Code, CodeId, Dependencies, Heading, Node};
+pub use nodes::{Code, CodeId, Codes, Dependencies, Heading, Node};
 
 /// Completeness of [`Document::nodes`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -32,7 +32,7 @@ pub enum PartialReason {
 #[derive(Clone, Debug)]
 pub struct Document {
     pub nodes: Vec<Node>,
-    pub codes: Vec<Code>,
+    pub codes: Codes,
     pub headings: Vec<Heading>,
     pub nodes_state: NodesState,
 }

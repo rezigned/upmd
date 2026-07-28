@@ -3,7 +3,7 @@ use pulldown_cmark::{
     Parser as CmarkParser, Tag, TagEnd,
 };
 
-use super::nodes::{Alignment, Code, ListItem, ListKind, Node, Table, TaskStatus};
+use super::nodes::{Alignment, Codes, ListItem, ListKind, Node, Table, TaskStatus};
 use super::options;
 
 pub struct Cmark;
@@ -29,8 +29,7 @@ impl super::Parser for Cmark {
         let line_starts = line_starts(text);
         let mut p = Parser {
             iter: parser.peekable(),
-            code_id_counter: 1,
-            codes: Vec::new(),
+            codes: Codes::default(),
             headings: Vec::new(),
             line_starts,
         };
@@ -48,8 +47,7 @@ impl super::Parser for Cmark {
 
 struct Parser<'a> {
     iter: std::iter::Peekable<pulldown_cmark::OffsetIter<'a>>,
-    code_id_counter: u32,
-    codes: Vec<Code>,
+    codes: Codes,
     headings: Vec<super::Heading>,
     line_starts: Vec<usize>,
 }
@@ -184,10 +182,7 @@ impl<'a> Parser<'a> {
             return None;
         }
         let options = options::parse(&opts);
-        let code = Code::new(self.code_id_counter, content, options);
-        self.code_id_counter += 1;
-        let code_id = code.id;
-        self.codes.push(code);
+        let code_id = self.codes.push(content, options);
         Some(Node::Code(code_id))
     }
 
@@ -360,13 +355,13 @@ impl<'a> Parser<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Parser;
+    use crate::{Code, Parser};
 
     /// Retrieves the Code for a Node::Code variant by resolving its CodeId
     /// against the Document's codes.
     fn code_from_node<'a>(doc: &'a crate::Document, node: &'a Node) -> &'a Code {
         match node {
-            Node::Code(id) => doc.codes.iter().find(|c| c.id == *id).unwrap(),
+            Node::Code(id) => doc.codes.by_id(*id).unwrap(),
             _ => panic!("Expected Code"),
         }
     }

@@ -193,19 +193,72 @@ impl Code {
     }
 }
 
-/// Resolves a block name or numeric ID.
-pub fn resolve_code_block(codes: &[Code], spec: &str) -> Vec<CodeId> {
-    match spec.parse::<CodeId>() {
-        Ok(id) => codes
-            .iter()
-            .filter(|code| code.id == id)
-            .map(|code| code.id)
-            .collect(),
-        Err(_) => codes
-            .iter()
-            .filter(|code| code.name == spec)
-            .map(|code| code.id)
-            .collect(),
+/// Code blocks in document order, with each ID equal to its one-based position.
+#[derive(Clone, Debug, Default)]
+pub struct Codes(Vec<Code>);
+
+impl Codes {
+    pub(crate) fn push(&mut self, content: String, options: Options) -> CodeId {
+        let id = CodeId::try_from(self.len() + 1)
+            .expect("document contains more code blocks than CodeId supports");
+        self.0.push(Code::new(id, content, options));
+        id
+    }
+
+    pub fn by_id(&self, id: CodeId) -> Option<&Code> {
+        self.index_of(id).and_then(|index| self.0.get(index))
+    }
+
+    pub fn index_of(&self, id: CodeId) -> Option<usize> {
+        let index = usize::try_from(id.checked_sub(1)?).ok()?;
+        self.0.get(index).map(|_| index)
+    }
+
+    pub fn resolve(&self, spec: &str) -> Vec<CodeId> {
+        match spec.parse::<CodeId>() {
+            Ok(id) => self.by_id(id).map(|code| vec![code.id]).unwrap_or_default(),
+            Err(_) => self
+                .0
+                .iter()
+                .filter(|code| code.name == spec)
+                .map(|code| code.id)
+                .collect(),
+        }
+    }
+}
+
+impl std::ops::Deref for Codes {
+    type Target = [Code];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<'a> IntoIterator for &'a Codes {
+    type Item = &'a Code;
+    type IntoIter = std::slice::Iter<'a, Code>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+impl TryFrom<Vec<Code>> for Codes {
+    type Error = String;
+
+    fn try_from(codes: Vec<Code>) -> Result<Self, Self::Error> {
+        for (index, code) in codes.iter().enumerate() {
+            let expected = CodeId::try_from(index + 1)
+                .map_err(|_| "code collection exceeds CodeId capacity".to_string())?;
+            if code.id != expected {
+                return Err(format!(
+                    "code at index {index} has ID {}, expected {expected}",
+                    code.id
+                ));
+            }
+        }
+        Ok(Self(codes))
     }
 }
 
@@ -215,7 +268,7 @@ mod tests {
 
     #[test]
     fn test_resolve_code_block() {
-        let codes = vec![
+        let codes = Codes::try_from(vec![
             Code {
                 id: 1,
                 name: "".into(),
@@ -239,7 +292,8 @@ mod tests {
                 name: "2".into(),
                 ..Default::default()
             },
-        ];
+        ])
+        .unwrap();
         for (spec, expected) in [
             ("1", &[1u32] as &[u32]),
             ("2", &[2u32]),
@@ -248,7 +302,7 @@ mod tests {
             ("99", &[] as &[u32]),
             ("nonexistent", &[] as &[u32]),
         ] {
-            assert_eq!(resolve_code_block(&codes, spec), expected);
+            assert_eq!(codes.resolve(spec), expected);
         }
     }
 

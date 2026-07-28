@@ -21,6 +21,7 @@ use crate::runner::CodeId;
 use upmd_parser::nodes::{
     Alignment, Code, DepsToken, ListKind, Table as MarkdownTable, TaskStatus,
 };
+use upmd_parser::Codes;
 
 use crate::apps::task::Task;
 
@@ -717,7 +718,7 @@ pub struct RenderedMarkdown {
 pub struct MarkdownRenderer<'a> {
     theme: &'a Theme,
     outputs: &'a HashMap<u32, Task>,
-    codes: &'a [upmd_parser::nodes::Code],
+    codes: &'a Codes,
     inline_max_lines: usize,
     viewport_width: usize,
 }
@@ -726,7 +727,7 @@ impl<'a> MarkdownRenderer<'a> {
     pub fn new(
         theme: &'a Theme,
         outputs: &'a HashMap<u32, Task>,
-        codes: &'a [upmd_parser::nodes::Code],
+        codes: &'a Codes,
         inline_max_lines: usize,
         viewport_width: usize,
     ) -> Self {
@@ -826,8 +827,7 @@ impl<'a> MarkdownRenderer<'a> {
             Node::Code(code_id) => {
                 let code = self
                     .codes
-                    .iter()
-                    .find(|c| c.id == *code_id)
+                    .by_id(*code_id)
                     .expect("CodeId must resolve to a Code in Document.codes");
                 let is_start = match state.snap.take_target() {
                     Some(idx) => {

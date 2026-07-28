@@ -26,7 +26,7 @@ use std::{
     thread,
     time::Duration,
 };
-use upmd_parser::{resolve_code_block, CodeId, Parser};
+use upmd_parser::{CodeId, Parser};
 use upmd_runtime::{
     runtimes::tui::{Input, Output},
     Cmd, Component,
@@ -180,7 +180,7 @@ impl App {
         let selected = config
             .block
             .as_deref()
-            .and_then(|spec| resolve_code_block(&codes, spec).first().copied());
+            .and_then(|spec| codes.resolve(spec).first().copied());
 
         let mut menu = menu::Menu::new(
             &codes,
@@ -1526,7 +1526,7 @@ impl App {
         );
         self.preview = preview::Preview::new(
             nodes,
-            codes.clone(),
+            codes,
             self.theme.clone(),
             self.tasks.buffers(),
             self.config.tui.inline_max_lines(),
@@ -1540,8 +1540,7 @@ impl App {
         // Reapply --block selection when a new document is loaded after
         // startup (e.g. from the directory file picker).
         if let Some(ref spec) = self.config.block {
-            let ids = upmd_parser::resolve_code_block(&codes, spec);
-            if let Some(&id) = ids.first() {
+            if let Some(&id) = self.preview.codes().resolve(spec).first() {
                 self.menu.select_by_id(id);
                 self.navigate_to_code(id);
             }

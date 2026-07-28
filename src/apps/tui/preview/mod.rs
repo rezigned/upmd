@@ -47,6 +47,7 @@ use crate::apps::theme::Theme;
 use crate::runner::CodeId;
 use keymap::{DerivedConfig, KeyMap};
 use upmd_parser::nodes::Node;
+use upmd_parser::Codes;
 
 use super::markdown::{
     apply_gutter, highlight_line, Content, LineKind, MarkdownRenderer, RenderContext, ViewLine,
@@ -95,8 +96,8 @@ pub struct Preview {
     target_block: Cell<Option<CodeId>>,
     /// Transient: prefer this block's task status over active gutter.
     prefer_status_gutter: Cell<Option<CodeId>>,
-    /// Flat Vec of Code nodes indexed by (CodeId - 1).
-    code_index: Vec<upmd_parser::nodes::Code>,
+    /// Code blocks in document order with dense one-based IDs.
+    code_index: Codes,
     /// Transient result of the last clipboard copy attempt (None = no copy).
     copy_result: Cell<Option<bool>>,
     /// Prefix overhead in chars per code block (non-zero only for blockquote-nested blocks).
@@ -132,14 +133,14 @@ impl Preview {
     /// Creates a preview from parsed AST nodes and code blocks.
     pub fn new(
         nodes: Vec<Node>,
-        codes: Vec<upmd_parser::nodes::Code>,
+        codes: Codes,
         theme: Theme,
         outputs: &HashMap<CodeId, Task>,
         inline_max_lines_cap: usize,
         keymap: DerivedConfig<Action>,
     ) -> Self {
-        let preview = Self {
-            nodes: vec![],
+        let mut preview = Self {
+            nodes,
             logical_lines: vec![],
             visual_lines: VisualLines::new(),
             state: RefCell::new(ListState::default()),
@@ -157,23 +158,11 @@ impl Preview {
             code_index: codes,
             code_prefix_overhead: HashMap::new(),
         };
-        let mut preview = preview;
-        preview.set_nodes(nodes, preview.code_index.clone(), outputs);
+        preview.rebuild_view(outputs);
         if !preview.visual_lines.is_empty() {
             preview.state.borrow_mut().select(Some(0));
         }
         preview
-    }
-
-    pub fn set_nodes(
-        &mut self,
-        nodes: Vec<Node>,
-        codes: Vec<upmd_parser::nodes::Code>,
-        outputs: &HashMap<CodeId, Task>,
-    ) {
-        self.code_index = codes;
-        self.nodes = nodes;
-        self.rebuild_view(outputs);
     }
 
     pub fn prefer_status_gutter_for(&self, id: CodeId) {
@@ -492,12 +481,12 @@ impl Preview {
 
     /// Looks up the raw `Code` node by ID from the flat Vec index.
     /// Returns all code blocks in document order.
-    pub fn codes(&self) -> &[upmd_parser::nodes::Code] {
+    pub fn codes(&self) -> &Codes {
         &self.code_index
     }
 
     pub fn code_by_id(&self, id: CodeId) -> Option<&upmd_parser::nodes::Code> {
-        self.code_index.get(id as usize - 1)
+        self.code_index.by_id(id)
     }
 
     /// Converts a mouse click on the selected code block into PTY-relative
