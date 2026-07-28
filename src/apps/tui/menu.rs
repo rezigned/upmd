@@ -1,5 +1,5 @@
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use ratatui::{
@@ -10,7 +10,6 @@ use ratatui::{
     widgets::{Borders, List, ListItem, Paragraph},
     Frame,
 };
-use upmd_parser::nodes::Code;
 
 use crate::apps::theme::Theme;
 use crate::apps::tui::widgets::Spinner;
@@ -36,6 +35,7 @@ pub struct Menu {
     model: Model,
     theme: Theme,
     code_statuses: HashMap<CodeId, MenuTaskStatus>,
+    code_dependencies: HashSet<CodeId>,
     mode: MenuMode,
     toc_items: Vec<(u8, String)>,
     nav_keymap: DerivedConfig<Navigation>,
@@ -71,7 +71,7 @@ fn toc_items(headings: &[upmd_parser::Heading]) -> Vec<(u8, String)> {
 impl Menu {
     /// Creates a menu from parsed code blocks and headings.
     pub fn new(
-        codes: &[Code],
+        codes: &upmd_parser::Codes,
         headings: &[upmd_parser::Heading],
         theme: Theme,
         nav_keymap: DerivedConfig<Navigation>,
@@ -82,10 +82,16 @@ impl Menu {
         if !items.is_empty() {
             state.select(Some(0));
         }
+        let code_dependencies = codes
+            .iter()
+            .filter(|code| !code.deps.is_empty())
+            .map(|code| code.id)
+            .collect();
         Self {
             model: Model { items, state },
             theme,
             code_statuses: HashMap::new(),
+            code_dependencies,
             mode: MenuMode::CodeBlocks,
             toc_items,
             nav_keymap,
@@ -113,8 +119,8 @@ impl Menu {
         self.code_statuses = statuses;
     }
 
-    pub fn set_theme(&mut self, theme: Theme) {
-        self.theme = theme;
+    pub fn set_theme(&mut self, theme: &Theme) {
+        self.theme.clone_from(theme);
     }
 
     pub fn selected(&self) -> Option<CodeId> {
@@ -303,6 +309,9 @@ impl Menu {
             _ => {}
         }
 
+        if self.code_dependencies.contains(&id) {
+            content.push_str(" ▸");
+        }
         if Some(i) == self.model.state.selected() {
             (content, self.theme.active_style())
         } else {
@@ -584,12 +593,15 @@ mod tests {
 
     #[test]
     fn test_menu_page_up_down() {
-        let codes: Vec<upmd_parser::nodes::Code> = (1..=20u32)
-            .map(|id| upmd_parser::nodes::Code {
-                id,
-                ..Default::default()
-            })
-            .collect();
+        let codes = upmd_parser::Codes::try_from(
+            (1..=20u32)
+                .map(|id| upmd_parser::nodes::Code {
+                    id,
+                    ..Default::default()
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
         let nav_keymap: keymap::DerivedConfig<Navigation> = toml::from_str("").unwrap();
         let mut menu = Menu::new(
             &codes,
@@ -639,13 +651,16 @@ mod tests {
         );
     }
 
-    fn codes(n: u32) -> Vec<upmd_parser::nodes::Code> {
-        (1..=n)
-            .map(|id| upmd_parser::nodes::Code {
-                id,
-                ..Default::default()
-            })
-            .collect()
+    fn codes(n: u32) -> upmd_parser::Codes {
+        upmd_parser::Codes::try_from(
+            (1..=n)
+                .map(|id| upmd_parser::nodes::Code {
+                    id,
+                    ..Default::default()
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap()
     }
 
     fn render_vertical_text(menu: &Menu, width: u16) -> String {

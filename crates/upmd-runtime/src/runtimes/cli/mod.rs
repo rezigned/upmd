@@ -112,6 +112,11 @@ impl Runtime {
         runtime
     }
 
+    /// Whether stdout supports interactive terminal rendering.
+    pub fn is_terminal(&self) -> bool {
+        self.terminal
+    }
+
     /// Configures the runtime with custom settings.
     pub fn config(mut self, config: Config) -> Self {
         self.config = config;

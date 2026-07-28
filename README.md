@@ -4,7 +4,7 @@
   <img src=".github/pages/upmd-logo.png" alt="upmd" width="250">
 </p>
 
-<p align="center">Run Markdown code blocks interactively in your terminal.</p>
+<p align="center">Run tasks and workflows from Markdown.</p>
 
 <p align="center">
   <a href="https://github.com/rezigned/upmd/releases/latest"><img src="https://img.shields.io/github/v/release/rezigned/upmd?include_prereleases&style=flat-square" alt="Release"></a>
@@ -14,18 +14,17 @@
 </p>
 
 <p align="center">
-  <img src=".github/pages/demos/overview.gif" width="500" alt="upmd overview">
+  <img src=".github/pages/demos/overview.gif" width="600" alt="upmd overview">
 </p>
 
-`upmd` runs code blocks directly from Markdown in a real terminal, keeping commands, context, and output together.
+`upmd` turns Markdown code blocks into runnable tasks and dependency-aware workflows. Run them interactively in a real terminal, with instructions, commands, and output kept together.
 
 ## What it does
 
-- Opens a file, reads from stdin, or lets you browse Markdown files in a directory.
-- Renders the document and keeps its code blocks, output, and terminal sessions together.
-- Runs one block or a whole document from the TUI, the lightweight CLI, or CI.
-- Carries exported shell variables and working-directory changes into the next block. Python, Go, Rust, and TypeScript can opt into experimental state capture.
-- Lets you change runners, arguments, environment variables, themes, transparency, and key bindings.
+- Treats fenced code blocks as named tasks with dependencies.
+- Runs one task or a workflow from the TUI, lightweight CLI, or CI.
+- Gives each task a real pseudo-terminal, including prompts, colors, editors, and pagers.
+- Shows output beside the source and can pass shell environment and working-directory changes to later tasks.
 
 ## Installation
 
@@ -41,158 +40,95 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/rezigned/upmd/releases/
 brew install rezigned/tap/upmd
 ```
 
-**Windows and manual downloads:** Download an archive and checksum from the [latest release](https://github.com/rezigned/upmd/releases/latest). Prebuilt binaries are available for macOS (Apple Silicon and Intel), Linux (x86_64 and ARM64), and Windows (x86_64).
+**Windows and archives:** Download a prebuilt archive and checksum from the [latest release](https://github.com/rezigned/upmd/releases/latest). Builds are available for macOS, Linux, and Windows on supported x86_64 and ARM64 platforms.
 
-**From source** — requires Rust 1.82 or newer:
+**From source** (requires Rust 1.82 or newer):
 
 ```bash
-git clone https://github.com/rezigned/upmd.git
-cd upmd
-cargo install --path .
+cargo install --git https://github.com/rezigned/upmd.git
 ```
 
 ## Quick start
 
 ```bash
-# Browse Markdown files under the current directory
+# Open up.md or UP.md when present, otherwise browse the current directory
 upmd
 
-# Browse Markdown files under another directory
-upmd ./docs
-
-# Open one file in the TUI
+# Open a document in the TUI
 upmd README.md
 
-# Read Markdown from stdin
-curl -s https://raw.githubusercontent.com/rezigned/upmd/main/README.md | upmd
+# Run one named task and its dependencies
+upmd DEMO.md --block lint --yes
 
-# Open the lightweight CLI
-upmd --cli README.md
-
-# Execute every block without prompts
-upmd --cli --all --yes DEMO.md
-
-# Select a named or numbered block
-upmd README.md --block setup
-upmd README.md -b 3
-
-# Select and immediately execute one block
-upmd README.md --block setup --yes
+# Run every task without prompts
+upmd --cli --all --yes README.md
 ```
 
-When stdin is an interactive terminal and no file is supplied, `upmd` opens the current-directory file picker. Piped stdin remains Markdown input.
+> [!TIP]
+> With no path, `upmd` opens `up.md` or `UP.md` from the current directory when either is present. Otherwise, it opens the current-directory file picker. Directories are searched recursively, while piped stdin is read as Markdown. A failed task or startup error produces a non-zero exit status.
 
-## Command-line reference
+Run `upmd --help` for all command-line options.
 
-```text
-Usage: upmd [OPTIONS] [FILE]
+## Tasks and workflows
 
-Arguments:
-  [FILE]  Markdown file or directory. Omit to browse the current directory.
-
-Options:
-      --all                  Auto-advance through all code blocks
-      --cli                  Use the lightweight CLI instead of the full-screen TUI
-  -d, --working-dir <DIR>    Working directory for code execution
-  -y, --yes                  Run without confirmation; use with --all or --block
-      --theme <THEME>        Syntax-highlight theme
-      --capture-state        Enable experimental non-shell state capture
-  -b, --block <NAME|ID>      Select a named or numbered code block
-      --dump-default-config  Print every default config key and exit
-      --transparent          Use the terminal's default background
-      --tick-rate <MS>       UI refresh interval in milliseconds
-  -h, --help                 Print help
-  -V, --version              Print version
-```
-
-Run `upmd --help` for the authoritative help generated by the installed version.
-
-## File picker
-
-Run `upmd` with a directory to browse its Markdown files. With no arguments, an interactive terminal starts the picker in the current directory; piped stdin is treated as Markdown instead.
-
-The picker searches recursively, filters as you type, and shows a bounded syntax-highlighted preview. An unreadable entry does not stop the scan. In the TUI, press `f` to reopen the picker beside the active document.
-
-## TUI shortcuts
-
-Press `?` inside upmd for searchable help. For the full default keymap, see [`src/apps/config.toml`](src/apps/config.toml).
-
-| Key | Context | Action |
-|---|---|---|
-| `up` / `k`, `down` / `j` | Menu | Move between blocks |
-| `Enter` | Home or CLI | Run selected block |
-| `/` | Home | Search document text |
-| `ctrl-g` | Home | Filter and jump to a block |
-| `o` | Home | Open full output view |
-| `i` | Home | Enter input mode for the selected running block |
-| `ctrl-o` | Input or output | Return to Home |
-| `z` | Home | Toggle zen mode |
-| `c` | Home | Toggle table of contents |
-| `?` | Home | Open keymap help |
-| `q` / `ctrl-c` | Home or CLI | Quit |
-
-### Full output and interactive mouse support
-
-Press `o` on the selected block to open its terminal screen and scrollback.
-
-- Wheel, click, release, and drag events are forwarded when the running application enables SGR mouse reporting.
-- Otherwise the wheel scrolls local output history and drag selection copies text on release.
-- `y` or `Y` copies completed output.
-- `ctrl-v` pastes into a running process.
-- `Esc` returns after execution is complete; while a program is running it remains available to that program.
-- `ctrl-o` always returns to Home.
-
-## CLI and automation
-
-```bash
-# Interactive CLI navigation
-upmd --cli DEMO.md
-
-# Deterministic CI execution
-upmd --cli --all --yes DEMO.md
-
-# Execute one named block
-upmd --cli DEMO.md --block verify --yes
-```
-
-Exit status is non-zero when execution cannot start or a selected block fails.
-
-## Code block attributes
-
-Attributes follow the language token in square brackets:
+The workflow in [`DEMO.md`](DEMO.md) uses `name` and `deps` attributes after the language token:
 
 ````markdown
-```bash [name:setup]
-echo "setup"
+```bash [name:build]
+cargo build
 ```
 
-```shell [name:portable bin:dash]
-echo "using dash"
+```bash [name:lint, deps:build]
+cargo clippy
+```
+
+```bash [name:test, deps:build]
+cargo test
+```
+
+```bash [name:verify, deps:"lint | test"]
+echo "verified ✅"
 ```
 ````
 
-### Named blocks
-
-`name` makes a block addressable from `--block` and the goto interface:
+`name` makes a task addressable from `--block` and the goto menu. Numeric IDs also work:
 
 ```bash
-upmd runbook.md --block setup
-upmd runbook.md -b setup --yes
+upmd DEMO.md --block verify
 ```
 
-Numeric IDs are also accepted.
+### Dependencies
 
-### Runner precedence
+```text
+· build ──┬─→ · lint ──┬─→ · verify
+          │            │
+          └─→ · test ──┘
+```
 
-Executable settings resolve in this order:
+`lint` and `test` each use `deps:build`, so they start together after `build` succeeds. `verify` uses `deps:"lint | test"` and waits for both. Within `deps`, `|` puts tasks in the same stage and `,` starts the next stage.
 
-1. Code block attribute, such as `[bin:zsh]`
-2. User config, such as `[binaries.bash]`
-3. Runner default candidates
+If a task fails, later stages are skipped. Under `--all`, unrelated tasks continue and the command exits non-zero.
+
+Override a task runner with an attribute such as `[bin:zsh]`. Runner settings resolve in this order: block attribute, user configuration, then built-in defaults.
+
+## TUI shortcuts
+
+| Key | Action |
+|---|---|
+| `up` / `k`, `down` / `j` | Move between tasks |
+| `Enter` | Run the selected task |
+| `/` | Search document text |
+| `ctrl-g` | Find and jump to a task |
+| `o` | Open the full terminal output |
+| `i` | Send input to the selected running task |
+| `?` | Search all shortcuts |
+| `q` / `ctrl-c` | Quit |
+
+Press `o` for the full terminal screen and scrollback. Running programs receive keyboard, paste, and SGR mouse input directly. Press `ctrl-o` to return home. Default bindings are listed in [`src/apps/config.toml`](src/apps/config.toml).
 
 ## State persistence
 
-Shell languages automatically capture exported environment variables and the final working directory after each successful execution:
+Successful shell tasks pass exported variables and working-directory changes to later tasks:
 
 ````markdown
 ```bash [name:prepare]
@@ -200,115 +136,43 @@ export API_URL="http://127.0.0.1:8080"
 cd /tmp
 ```
 
-```bash [name:inspect]
+```bash [name:inspect, deps:prepare]
 printf 'API_URL=%s\n' "$API_URL"
 pwd
 ```
 ````
 
-Python, Go, Rust, and TypeScript support experimental capture when `--capture-state` is supplied:
-
-```bash
-upmd --capture-state DEMO.md
-```
-
-Use `e` to inspect or edit the environment before running the next block.
+Python, Go, Rust, and TypeScript can opt into experimental state capture with `--capture-state`. Press `e` to inspect or edit the environment before running the next task.
 
 ## Supported languages
 
-| Language | Fence aliases | Default executables |
-|---|---|---|
-| Bash | `bash` | `bash` |
-| POSIX shell | `sh`, `shell` | `sh` |
-| Zsh | `zsh` | `zsh` |
-| Fish | `fish` | `fish` |
-| Cmd | `cmd`, `bat`, `batch` | `cmd` |
-| PowerShell | `powershell`, `ps1`, `pwsh` | `powershell`, `pwsh` |
-| Python | `py`, `python`, `python3` | `python3`, `python` |
-| JavaScript | `js`, `javascript`, `node` | `node` |
-| TypeScript | `ts`, `typescript` | `node --experimental-strip-types`, `npx tsx`, `ts-node` |
-| Ruby | `rb`, `ruby` | `ruby` |
-| PHP | `php` | `php` |
-| C | `c` | `gcc`, `clang` |
-| Go | `go`, `golang` | `go` |
-| Rust | `rs`, `rust` | `rustc`, `cargo rustc --` |
-| Zig | `zig` | `zig` |
+Built-in runners cover Bash, POSIX shell, Zsh, Fish, Cmd, PowerShell, Python, JavaScript, TypeScript, Ruby, PHP, C, Go, Rust, and Zig.
 
-TypeScript tries Node.js native strip-types (22.6+), `npx tsx`, then `ts-node`. Rust uses `rustc` directly or `cargo rustc --` when only Cargo is available. Override any runner with `[bin:...]` or `binaries.<language>` in the config.
+TypeScript tries Node.js native strip-types, `npx tsx`, then `ts-node`. Rust uses `rustc` or `cargo rustc --`. Override a binary with `[bin:...]` on a task or `binaries.<language>` in the configuration. Compiled runners use isolated temporary workspaces.
 
-Compiled runners use isolated temporary workspaces and remove them after execution.
-
-## Themes
-
-Switch themes with `t` or choose one at startup:
-
-```bash
-upmd --theme tokyo-night README.md
-```
-
-Custom `.tmTheme` files under `~/.config/upmd/themes/` are discovered automatically.
-
-## Configuration
+## Configuration and diagnostics
 
 Persistent settings live at `~/.config/upmd/config.toml`:
 
 ```toml
 theme = "catppuccin-mocha"
 transparent = true
-tick_rate = 66
 
 [tui]
 inline_max_lines = 20
-
-[cli]
-preview_lines = 8
 ```
 
-Override a runner globally:
-
-```toml
-[binaries.python]
-bin = "python3.12"
-extra_args = ["-X", "dev"]
-env = { PYTHONUNBUFFERED = "1" }
-```
-
-Override component keymaps:
-
-```toml
-[keymap.home.Execute]
-keys = ["x"]
-symbol = "x"
-help = "run"
-
-[keymap.menu.Next]
-keys = ["down", "j"]
-```
-
-Print the complete default configuration and every keymap section with:
+Runner binaries and key bindings can also be overridden. Print every available setting and keymap section with:
 
 ```bash
 upmd --dump-default-config
 ```
 
-## Diagnostics
-
-Set `RUST_LOG` to enable file-based tracing. Logs are written to the platform cache directory, for example `~/.cache/upmd/upmd.log` on Linux:
+Set `RUST_LOG` to write tracing output to the platform cache directory:
 
 ```bash
 RUST_LOG=upmd=debug upmd README.md
 ```
-
-## Repository layout
-
-The root crate contains the TUI and CLI frontends. Four workspace crates keep the reusable pieces separate:
-
-- `upmd-parser` parses Markdown and fenced-code attributes.
-- `upmd-pty` manages PTY processes, terminal state, and mouse input.
-- `upmd-runner` chooses language runners and builds execution plans.
-- `upmd-runtime` provides the component engine used by both frontends.
-
-Both frontends share parsing, runner selection, PTY execution, and input resolution. Runner configuration resolves in this order: block attribute, user config, then built-in default.
 
 ## License
 

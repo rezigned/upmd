@@ -79,7 +79,7 @@ pub fn execute(
 
     // Shell languages always capture. Non-shell languages require the explicit
     // --capture-state flag and must also be supported by the runner.
-    let runner = resolve_runner(&language, binaries, code.options.attrs.get("bin").cloned())?;
+    let runner = resolve_runner(&language, binaries, code.attrs.get("bin").cloned())?;
 
     let should_capture_state = match language.kind {
         Kind::Shell => true,
@@ -466,10 +466,7 @@ print("python ran")
                 id: 1,
                 language: "bash".into(),
                 content: "echo hello".into(),
-                options: upmd_parser::nodes::Options {
-                    attrs: [("bin".into(), "/bin/bash".into())].into(),
-                    ..Default::default()
-                },
+                attrs: [("bin".into(), "/bin/bash".into())].into(),
                 ..Default::default()
             };
             let mut binaries: HashMap<String, upmd_runner::RunnerOptions> = HashMap::new();
@@ -507,10 +504,7 @@ print("python ran")
                 id: 2,
                 language: "bash".into(),
                 content: "echo hello".into(),
-                options: upmd_parser::nodes::Options {
-                    attrs: [("bin".into(), "/bin/bash".into())].into(),
-                    ..Default::default()
-                },
+                attrs: [("bin".into(), "/bin/bash".into())].into(),
                 ..Default::default()
             };
 

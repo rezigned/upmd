@@ -2,12 +2,13 @@ pub mod nodes;
 pub mod options;
 pub mod parser;
 
-pub use nodes::{resolve_code_block, Code, CodeId, Heading, Node};
+pub use nodes::{Code, CodeId, Codes, Dependencies, Heading, Node};
 
 /// Completeness of [`Document::nodes`].
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum NodesState {
     /// No preview AST nodes were retained.
+    #[default]
     NotParsed,
     /// Preview AST nodes cover a bounded source window.
     Partial {
@@ -29,10 +30,10 @@ pub enum PartialReason {
 ///
 /// `codes` and `headings` describe the source document. `nodes` may be full,
 /// partial, or absent depending on `nodes_state`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Document {
     pub nodes: Vec<Node>,
-    pub codes: Vec<Code>,
+    pub codes: Codes,
     pub headings: Vec<Heading>,
     pub nodes_state: NodesState,
 }

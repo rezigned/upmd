@@ -3,7 +3,8 @@
 This document is both a demo and an executable smoke test.
 
 Open it in the TUI with `upmd DEMO.md` and press Enter on any block to run it.
-Run every block headlessly with `upmd --cli --all --yes DEMO.md`.
+Run with `upmd` (no args) to auto-open `up.md`, or use the file picker to
+select a different file. Headless execution: `upmd --all --yes DEMO.md`.
 
 ## Getting started
 
@@ -26,14 +27,8 @@ Full terminal applications work inside the preview. Press `i` to interact, `o` f
 nvim
 ```
 
-Select a block by name with `--block`:
-
-```sh
-upmd DEMO.md --block verify --yes
-```
-
 > [!TIP]
-> Run `upmd` with no arguments to open the Markdown file picker, type `DEMO`, and press Enter.
+> Run `upmd` with no arguments to auto-open `up.md`, or browse the file picker.
 
 ## 1. Streamed output
 
@@ -114,48 +109,45 @@ printf 'Jump to it with: upmd DEMO.md --block named\n'
 printf 'Or press ctrl-g in the TUI and type "named".\n'
 ```
 
-## 6. Markdown rendering
+## 6. Workflow dependencies
 
-The preview renders standard Markdown, including headings, paragraphs, lists, blockquotes, tables, and thematic breaks.
+Blocks can declare dependencies on other blocks. Deps run first, and their captured environment (exported variables, working directory) is inherited by dependents.
 
-### Lists
+```bash [name:build]
+sleep 1; export BIN_PATH="/tmp/demo"
+printf 'build: BIN_PATH=%s\n' "$BIN_PATH"
+```
 
-- Syntax-highlighted fenced code
-- Inline **bold**, *emphasis*, and `code`
-- Nested lists and blockquotes
+```bash [name:lint, deps:build]
+sleep 0.3; export LINT_REPORT="all clean"
+printf 'lint: %s\n' "$LINT_REPORT"
+```
 
-> A blockquote can contain prose and code while preserving its visual prefix.
+```bash [name:test, deps:build]
+sleep 0.6; export TEST_STATUS="47 passed, 0 failed"
+printf 'test: %s\n' "$TEST_STATUS"
+```
 
-### Tables
+```bash [name:verify, deps:"lint | test"]
+read CONFIRM
+printf 'BIN_PATH=%s\n' "$BIN_PATH"
+printf 'LINT_REPORT=%s\n' "$LINT_REPORT"
+printf 'TEST_STATUS=%s\n' "$TEST_STATUS"
+printf 'verify: complete (%s).\n' "$CONFIRM"
+```
 
-| Workflow | Command | Result |
-|---|---|---|
-| Browse files | `upmd` | Opens the current-directory picker |
-| Interactive TUI | `upmd DEMO.md` | Navigation, search, PTY input, and inline output |
-| Lightweight CLI | `upmd --cli DEMO.md` | Terminal navigation without the full-screen layout |
-| Automation | `upmd --cli --all --yes DEMO.md` | Executes every block sequentially |
-| One block | `upmd DEMO.md --block verify --yes` | Selects and runs a named block |
+`lint` and `test` run in parallel after `build` finishes. Once both pass, `verify` runs and reads their captured state.
 
-## 7. Search and navigation
+Press `'` while a workflow runs to toggle the inline dependency graph below the preview.
 
-While this file is open in the TUI:
-
-- `/` then type `SHOWCASE` to highlight search results.
-- `ctrl-g` then type `verify` to jump to the final block.
-- `0` through `9` to jump to a numeric block ID.
-- `pageup` / `pagedown` to scroll the preview.
-- `c` to toggle table-of-contents mode.
-- `<` / `>` to resize the table of contents.
-- `z` to toggle zen mode.
-
-## 8. File picker and reload
+## 7. File picker and reload
 
 - Press `f` to browse Markdown files relative to this document.
 - Type to filter matches while the selected file is previewed.
 - Press `ctrl-r` to reload the active file from disk and clear prior output.
 - Directory input works in both frontends: `upmd .` and `upmd --cli .`.
 
-## 9. Themes and help
+## 8. Themes and help
 
 - Press `t` to search and select a theme (tokyo-night, catppuccin-mocha, dracula, rose-pine, and more).
 - Press `ctrl-t` to toggle the terminal background.
@@ -167,7 +159,7 @@ Print every configurable key and default binding:
 upmd --dump-default-config 2>/dev/null | head -20 || echo "dump-default-config unavailable"
 ```
 
-## 10. Interactive PTY and full output
+## 9. Interactive PTY and full output
 
 Every block runs in a pseudo-terminal. While a long-running or full-screen program is active:
 
@@ -177,21 +169,3 @@ Every block runs in a pseudo-terminal. While a long-running or full-screen progr
 - Mouse input is forwarded when the child enables SGR mouse reporting.
 - Otherwise wheel input scrolls local history and drag selection copies text.
 - Press `ctrl-v` to paste clipboard text into the process.
-
-This block demonstrates a simple interactive prompt.
-
-```bash [name:interactive]
-printf 'Hello from the PTY.\n'
-printf 'Try pressing "i" then typing here, or "o" for full output.\n'
-```
-
-## 11. Final verification
-
-```bash [name:verify]
-printf 'upmd demo complete\n'
-printf 'Captured message: %s\n' "$UPMD_DEMO_MESSAGE"
-printf 'Captured count: %s\n' "$UPMD_DEMO_COUNT"
-printf 'Current directory: %s\n' "$PWD"
-```
-
-Expected final marker: `upmd demo complete`.

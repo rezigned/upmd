@@ -88,6 +88,12 @@ help = "search"
 keys = ["/"]
 symbol = "/"
 
+[keymap.home.ShowDeps]
+description = "Show dependency diagram"
+help = "deps"
+keys = [";"]
+symbol = ";"
+
 [keymap.home.SwitchTheme]
 description = "Switch theme"
 help = "theme"
@@ -99,6 +105,12 @@ description = "Toggle transparency"
 help = "transparent"
 keys = ["ctrl-t"]
 symbol = "ctrl-t"
+
+[keymap.home.ToggleWorkflowGraph]
+description = "Toggle the inline workflow dependency graph"
+help = "graph"
+keys = ["'"]
+symbol = "'"
 
 [keymap.home.ToggleZen]
 description = "Toggle zen mode"
@@ -138,6 +150,11 @@ description = "Paste clipboard content into the active PTY"
 help = "paste"
 keys = ["ctrl-v"]
 symbol = "ctrl-v"
+
+[keymap.cli.FocusNext]
+description = "Focuses the next block in a parallel batch."
+keys = ["tab"]
+symbol = "tab"
 
 [keymap.cli.Quit]
 description = "Quits the application."
@@ -346,6 +363,65 @@ symbol = "esc"
 help = "go"
 keys = ["enter"]
 symbol = "enter"
+
+[keymap.deps.Down]
+help = "down"
+keys = [
+    "down",
+    "j",
+]
+symbol = "down"
+
+[keymap.deps.Exit]
+keys = ["ctrl-c"]
+symbol = "ctrl-c"
+
+[keymap.deps.Left]
+help = "left"
+keys = [
+    "left",
+    "h",
+]
+symbol = "left"
+
+[keymap.deps.PageDown]
+help = "page down"
+keys = ["pagedown"]
+symbol = "pagedown"
+
+[keymap.deps.PageUp]
+help = "page up"
+keys = ["pageup"]
+symbol = "pageup"
+
+[keymap.deps.Quit]
+help = "close"
+keys = [
+    "esc",
+    "q",
+]
+symbol = "esc"
+
+[keymap.deps.Reset]
+help = "reset"
+keys = ["home"]
+symbol = "home"
+
+[keymap.deps.Right]
+help = "right"
+keys = [
+    "right",
+    "l",
+]
+symbol = "right"
+
+[keymap.deps.Up]
+help = "up"
+keys = [
+    "up",
+    "k",
+]
+symbol = "up"
 
 [keymap.file_picker.Delete]
 description = "Delete the last character from the filter query."

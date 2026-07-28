@@ -1,8 +1,10 @@
 use std::{
     cell::{Cell, RefCell},
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     io::{self, Write},
     path::PathBuf,
+    process::ExitCode,
+    rc::Rc,
 };
 
 use upmd_runtime::{
@@ -10,6 +12,7 @@ use upmd_runtime::{
     Cmd, Component,
 };
 
+use super::output::BatchOutput;
 use crate::{
     apps::config::Config as AppConfig,
     apps::config::{
@@ -20,43 +23,32 @@ use crate::{
     apps::navigation::Navigation,
     apps::task,
     apps::theme::{ansi_bg, ansi_fg, ansi_style, Theme},
+    apps::workflow::{Workflow, WorkflowTransition},
     pty::process::Size,
     pty::stream::Stream,
     utils::key_to_bytes,
 };
 use color_eyre::Result;
 use keymap::{DerivedConfig, KeyMap};
-use upmd_parser::nodes::{Code, CodeId};
-use upmd_parser::{resolve_code_block, Parser};
+use upmd_parser::{Code, CodeId, Codes, Parser};
 
 /// For the CLI, manages code block execution and navigation.
 pub struct App {
-    codes: Vec<Code>,
-    selected: usize,
+    codes: Codes,
+    selected: Option<CodeId>,
     config: AppConfig,
     outputs: RefCell<HashMap<CodeId, task::Task>>,
     theme: Theme,
     keymap: DerivedConfig<Action>,
     nav_keymap: DerivedConfig<Navigation>,
-    /// Advance to the next block after each completes (--all).
-    auto_advance: Vec<CodeId>,
-    /// Captured environment variables, seeded from the parent process and
-    /// updated incrementally as each code block runs.
+    workflow: Option<Workflow>,
     envs: Envs,
-    /// Captured working directory, seeded from the parent process and
-    /// updated incrementally as each code block runs.
     cwd: PathBuf,
-    /// Lines written by the last render pass. Used to emit a move-up/clear
-    /// escape sequence so the next render replaces the card in-place.
-    prev_lines: Cell<u16>,
-    /// When true, the next render skips the move-up/clear, leaving previous
-    /// execution output on screen. Set after execution completes, cleared
-    /// after one render cycle.
-    reset_anchor: Cell<bool>,
-    /// When set, the app starts in file-picker mode and transitions to
-    /// code-block mode after the user selects a file.
+    batch_output: BatchOutput,
     picker: Option<crate::apps::picker::PickerState>,
     picker_keymap: DerivedConfig<crate::apps::picker::PickerAction>,
+    pending_states: BTreeMap<CodeId, (Option<Envs>, Option<PathBuf>)>,
+    failed: Rc<Cell<bool>>,
 }
 
 #[derive(Clone, KeyMap, Debug, PartialEq, Eq, Hash)]
@@ -64,6 +56,9 @@ pub enum Action {
     /// Executes the selected code block.
     #[key("enter")]
     Run,
+    /// Focuses the next block in a parallel batch.
+    #[key("tab")]
+    FocusNext,
     /// Quits the application.
     #[key("q", "ctrl-c")]
     Quit,
@@ -78,23 +73,14 @@ pub enum Msg {
 }
 
 impl App {
-    pub fn new(doc: upmd_parser::Document, config: AppConfig) -> Self {
+    pub fn new(doc: upmd_parser::Document, config: AppConfig) -> std::result::Result<Self, String> {
         let upmd_parser::Document { codes, .. } = doc;
+        let selected = crate::apps::initial_code_id(&codes, config.block.as_deref())?;
+        Ok(Self::build(codes, config, selected))
+    }
 
-        let selected = match &config.block {
-            Some(spec) => {
-                let ids = resolve_code_block(&codes, spec);
-                codes.iter().position(|c| ids.contains(&c.id)).unwrap_or(0)
-            }
-            None => 0,
-        };
-
-        let auto_advance = if config.all {
-            codes.iter().map(|c| c.id).collect()
-        } else {
-            Vec::new()
-        };
-
+    fn build(codes: Codes, config: AppConfig, selected: Option<CodeId>) -> Self {
+        let failed = Rc::new(Cell::new(false));
         let keymap: DerivedConfig<Action> = config.keymap.cli::<Action>();
 
         // Seed env and cwd from the parent process so consecutive blocks
@@ -113,14 +99,27 @@ impl App {
             theme: config.theme.clone(),
             keymap,
             nav_keymap: config.keymap.cli::<Navigation>(),
-            auto_advance,
+            workflow: None,
             envs,
             cwd,
-            prev_lines: Cell::new(0),
-            reset_anchor: Cell::new(false),
+            batch_output: BatchOutput::new(),
             picker: None,
             picker_keymap: config.keymap.file_picker(),
+            pending_states: BTreeMap::new(),
+            failed,
         }
+    }
+
+    fn selected_code(&self) -> Option<&Code> {
+        self.selected.and_then(|id| self.codes.by_id(id))
+    }
+
+    fn selected_index(&self) -> Option<usize> {
+        self.selected.and_then(|id| self.codes.index_of(id))
+    }
+
+    fn select_index(&mut self, index: usize) {
+        self.selected = self.codes.get(index).map(|code| code.id);
     }
 
     /// Creates the app in file-picker mode before a document is loaded.
@@ -128,7 +127,7 @@ impl App {
         files: Vec<crate::markdown_files::MarkdownFile>,
         config: AppConfig,
     ) -> Self {
-        let mut app = Self::new(upmd_parser::new().parse(""), config);
+        let mut app = Self::build(Codes::default(), config, None);
         app.picker = Some(crate::apps::picker::PickerState::new(files));
         app
     }
@@ -138,69 +137,129 @@ impl App {
         match crate::reader::read_from_path(path) {
             Ok(input) => {
                 let doc = upmd_parser::new().parse(&input);
-                self.load_document(doc);
+                if let Err(error) = self.load_document(doc) {
+                    eprintln!("{error}");
+                    self.failed.set(true);
+                    return Some(Cmd::quit());
+                }
                 self.picker = None;
             }
             Err(err) => {
                 // In picker mode, errors are fatal since there's no
                 // notification system like the TUI.
                 eprintln!("Failed to open {}: {err}", path.display());
+                self.failed.set(true);
                 return Some(Cmd::quit());
             }
         }
         None
     }
 
-    fn load_document(&mut self, doc: upmd_parser::Document) {
+    fn load_document(&mut self, doc: upmd_parser::Document) -> Result<(), String> {
         let upmd_parser::Document { codes, .. } = doc;
+        let selected = crate::apps::initial_code_id(&codes, self.config.block.as_deref())?;
         self.codes = codes;
-        self.selected = match &self.config.block {
-            Some(spec) => {
-                let ids = resolve_code_block(&self.codes, spec);
-                self.codes
-                    .iter()
-                    .position(|c| ids.contains(&c.id))
-                    .unwrap_or(0)
-            }
-            None => 0,
-        };
-        self.auto_advance = if self.config.all {
-            self.codes.iter().map(|c| c.id).collect()
-        } else {
-            Vec::new()
-        };
+        self.selected = selected;
+        self.workflow = None;
         self.outputs.borrow_mut().clear();
-        self.prev_lines.set(0);
-        self.reset_anchor.set(false);
+        self.batch_output.reset();
+        self.pending_states.clear();
+        Ok(())
     }
 
-    fn auto_run_selected(&mut self) -> Option<Cmd<Msg>> {
-        let id = self.codes.get(self.selected)?.id;
-        self.execute(id)
+    fn launch_batch(&mut self, batch: Vec<CodeId>) -> Option<Cmd<Msg>> {
+        let mut commands = Vec::new();
+        let mut completed = None;
+
+        for id in batch {
+            let succeeded = self
+                .outputs
+                .borrow()
+                .get(&id)
+                .is_some_and(|task| task.exit_code == Some(0));
+            let should_execute = self
+                .workflow
+                .as_ref()
+                .is_none_or(|workflow| workflow.should_execute(id, succeeded));
+            if !should_execute {
+                completed = self.advance_workflow(id, Some(0));
+            } else if let Some(command) = self.execute_block(id) {
+                commands.push(command);
+            } else {
+                completed = self.advance_workflow(id, Some(1));
+            }
+        }
+
+        if let Some(result) = completed {
+            if let Some(command) = self.handle_advance(result) {
+                commands.push(command);
+            }
+        }
+
+        match commands.len() {
+            0 => None,
+            1 => commands.pop(),
+            _ => Some(Cmd::Batch(commands)),
+        }
     }
 
-    fn execute(&mut self, id: CodeId) -> Option<Cmd<Msg>> {
-        let code = self.codes.iter().find(|c| c.id == id)?;
+    fn start_plan(&mut self, mut workflow: Workflow) -> Option<Cmd<Msg>> {
+        let auto_run = workflow.auto_run();
+        let Some(batch) = workflow.start() else {
+            return auto_run.then(Cmd::quit);
+        };
+        self.workflow = Some(workflow);
+        self.select_batch(&batch);
+        auto_run.then(|| self.launch_batch(batch)).flatten()
+    }
 
+    fn start_all(&mut self) -> Option<Cmd<Msg>> {
+        match Workflow::for_all(&self.codes, self.config.yes) {
+            Ok(workflow) => self.start_plan(workflow),
+            Err(error) => self.plan_error(error),
+        }
+    }
+
+    fn start_target(&mut self, id: CodeId) -> Option<Cmd<Msg>> {
+        match Workflow::for_target(&self.codes, id) {
+            Ok(workflow) => self.start_plan(workflow),
+            Err(error) => self.plan_error(error),
+        }
+    }
+
+    fn plan_error(&self, error: String) -> Option<Cmd<Msg>> {
+        eprintln!("{error}");
+        if self.config.yes {
+            self.failed.set(true);
+            Some(Cmd::quit())
+        } else {
+            None
+        }
+    }
+
+    fn execute_block(&mut self, id: CodeId) -> Option<Cmd<Msg>> {
+        if self
+            .workflow
+            .as_ref()
+            .is_some_and(|workflow| workflow.is_running(id))
+        {
+            self.batch_output.track(id);
+        }
+        let code = self.codes.by_id(id)?;
         let (cols, rows) =
             crossterm::terminal::size().unwrap_or((PTY_DEFAULT_COLS, PTY_DEFAULT_ROWS));
-        // Limit PTY size to leave room for our UI and prevent scrolling issues
         let pty_rows = rows
             .saturating_sub(CLI_PTY_ROW_OVERHEAD)
             .max(CLI_PTY_MIN_ROWS);
         let pty_cols = cols
             .saturating_sub(CLI_PTY_COL_OVERHEAD)
             .max(CLI_PTY_MIN_COLS);
-
         let size = Size::from((pty_cols, pty_rows));
         let mut outputs = self.outputs.borrow_mut();
         let state = outputs
             .entry(id)
             .or_insert_with(|| task::Task::new(pty_cols, pty_rows, 1024));
-
-        // Pass the accumulated env/cwd so state capture from prior blocks
-        // is visible to later blocks in the same session.
-        exec::run_code(
+        let command = exec::run_code(
             code,
             size,
             self.envs.clone(),
@@ -209,29 +268,115 @@ impl App {
             state,
             Some(self.cwd.clone()),
         )
-        .map(|rx| exec::stream_rx(id, rx, Msg::StreamUpdate))
+        .map(|receiver| exec::stream_rx(id, receiver, Msg::StreamUpdate));
+        drop(outputs);
+
+        if command.is_none() {
+            eprintln!("Block {id} failed to start");
+        }
+        command
+    }
+
+    fn execute(&mut self, id: CodeId) -> Option<Cmd<Msg>> {
+        if let Some(workflow) = &self.workflow {
+            if !workflow.is_running(id) {
+                return None;
+            }
+            return self.execute_block(id).or_else(|| {
+                self.advance_workflow(id, Some(1))
+                    .and_then(|r| self.handle_advance(r))
+            });
+        }
+        self.start_target(id)
+    }
+
+    fn advance_workflow(
+        &mut self,
+        id: CodeId,
+        exit_code: Option<i32>,
+    ) -> Option<WorkflowTransition> {
+        let result = self
+            .workflow
+            .as_mut()
+            .map(|workflow| workflow.advance(id, exit_code));
+        if let Some(result) = &result {
+            self.batch_output.complete(result);
+        }
+        result
+    }
+
+    fn handle_advance(&mut self, result: WorkflowTransition) -> Option<Cmd<Msg>> {
+        match result {
+            WorkflowTransition::NextBatch(batch) => {
+                self.flush_pending_states();
+                self.select_batch(&batch);
+                self.workflow
+                    .as_ref()
+                    .is_some_and(Workflow::auto_run)
+                    .then(|| self.launch_batch(batch))
+                    .flatten()
+            }
+            WorkflowTransition::Pending | WorkflowTransition::Untracked => None,
+            WorkflowTransition::Stopped(failure) => {
+                self.flush_pending_states();
+                self.workflow = None;
+                eprintln!("Block {} failed - stopping dependency chain", failure.block);
+                if self.config.yes {
+                    self.failed.set(true);
+                    Some(Cmd::quit())
+                } else {
+                    None
+                }
+            }
+            WorkflowTransition::Finished { failed } => {
+                self.flush_pending_states();
+                self.workflow = None;
+                if self.config.yes {
+                    self.failed.set(failed);
+                    Some(Cmd::quit())
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    fn select_batch(&mut self, batch: &[CodeId]) {
+        self.batch_output.select(batch);
+        self.selected = batch
+            .first()
+            .copied()
+            .filter(|&id| self.codes.by_id(id).is_some());
+    }
+
+    fn focus_next_batch_block(&mut self) {
+        let Some(selected) = self.selected else {
+            return;
+        };
+        if let Some(next) = self.batch_output.focus_next(selected) {
+            self.selected = Some(next);
+        }
     }
 
     fn handle_stream_update(&mut self, id: CodeId, stream: Stream) -> Option<Cmd<Msg>> {
-        // Pre-classify the stream so we can inspect by reference before moving
-        // it into `exec::handle_stream`.
         let is_env = matches!(stream, Stream::Env(_));
         let is_cwd = matches!(stream, Stream::Cwd(_));
         let is_end = matches!(stream, Stream::End);
-        let is_done = matches!(stream, Stream::End | Stream::Exit(_));
 
         self.apply_stream_to_output(id, &stream);
         self.apply_captured_state(id, is_env, is_cwd);
 
-        // Execution finished. Reset the anchor so the next card renders
-        // below this block's output rather than overwriting it.
-        if is_done {
-            self.reset_anchor.set(true);
-        }
-
-        // On completion, auto-advance or quit.
-        if is_end && self.config.yes {
-            return self.maybe_auto_advance(id);
+        if is_end {
+            let exit_code = self
+                .outputs
+                .borrow()
+                .get(&id)
+                .and_then(|task| task.exit_code);
+            if exit_code != Some(0) {
+                self.pending_states.remove(&id);
+            }
+            let result = self.advance_workflow(id, exit_code)?;
+            return self.handle_advance(result);
         }
         None
     }
@@ -240,6 +385,7 @@ impl App {
     /// writing PTY output directly to the terminal when in the alternate
     /// screen and resizing the PTY on alternate-screen transitions.
     fn apply_stream_to_output(&mut self, id: CodeId, stream: &Stream) {
+        let focused = self.selected == Some(id);
         let mut outputs = self.outputs.borrow_mut();
         let Some(state) = outputs.get_mut(&id) else {
             return;
@@ -254,7 +400,7 @@ impl App {
         // real terminal so escape sequences (cursor positioning, alt
         // screen entry/exit) are processed natively.
         if let Stream::Out(s) = stream {
-            if was_alt || now_alt {
+            if self.batch_output.is_terminal() && focused && (was_alt || now_alt) {
                 let _ = io::stdout().write_all(s.as_bytes());
                 let _ = io::stdout().flush();
             }
@@ -266,7 +412,7 @@ impl App {
         if was_alt != now_alt {
             let (cols, rows) =
                 crossterm::terminal::size().unwrap_or((PTY_DEFAULT_COLS, PTY_DEFAULT_ROWS));
-            let pty_size = if now_alt {
+            let pty_size = if now_alt && self.batch_output.is_terminal() && focused {
                 Size::from((cols, rows))
             } else {
                 let pty_rows = rows
@@ -283,48 +429,47 @@ impl App {
         }
     }
 
-    /// Merges captured environment variables and cwd from a block into the
-    /// session-wide state so later blocks inherit them.
     fn apply_captured_state(&mut self, id: CodeId, is_env: bool, is_cwd: bool) {
-        if is_env {
-            let outputs = self.outputs.borrow();
-            if let Some(state) = outputs.get(&id) {
-                if let Some(captured) = &state.captured_envs {
-                    exec::merge_envs(&mut self.envs, captured);
-                }
-            }
+        if !is_env && !is_cwd {
+            return;
         }
-        if is_cwd {
-            let outputs = self.outputs.borrow();
-            if let Some(state) = outputs.get(&id) {
-                if let Some(captured) = &state.captured_cwd {
-                    self.cwd = PathBuf::from(captured);
-                }
+        let outputs = self.outputs.borrow();
+        let env = is_env
+            .then(|| outputs.get(&id)?.captured_envs.clone())
+            .flatten();
+        let cwd = is_cwd
+            .then(|| outputs.get(&id)?.captured_cwd.clone())
+            .flatten();
+        drop(outputs);
+
+        if self.workflow.is_none() {
+            if let Some(captured) = env {
+                exec::merge_envs(&mut self.envs, &captured);
             }
+            if let Some(captured) = cwd {
+                self.cwd = PathBuf::from(captured);
+            }
+            return;
+        }
+
+        let entry = self.pending_states.entry(id).or_default();
+        if let Some(env) = env {
+            entry.0 = Some(env);
+        }
+        if let Some(cwd) = cwd {
+            entry.1 = Some(PathBuf::from(cwd));
         }
     }
 
-    /// Auto-advances to the next pending block when `--yes` is enabled, or
-    /// quits when all blocks are finished.
-    fn maybe_auto_advance(&mut self, id: CodeId) -> Option<Cmd<Msg>> {
-        if self.auto_advance.is_empty() {
-            // Single block mode (--block --yes or --yes alone): quit when done.
-            return Some(Cmd::quit());
-        }
-        if let Some(pos) = self.auto_advance.iter().position(|&i| i == id) {
-            let next_pos = pos + 1;
-            if next_pos < self.auto_advance.len() {
-                let next = self.auto_advance[next_pos];
-                if let Some(idx) = self.codes.iter().position(|c| c.id == next) {
-                    self.selected = idx;
-                }
-                return self.execute(next);
-            } else {
-                // All blocks done. Auto-quit.
-                return Some(Cmd::quit());
+    fn flush_pending_states(&mut self) {
+        for (_, (env, cwd)) in std::mem::take(&mut self.pending_states) {
+            if let Some(captured) = env {
+                exec::merge_envs(&mut self.envs, &captured);
+            }
+            if let Some(captured) = cwd {
+                self.cwd = captured;
             }
         }
-        None
     }
 
     /// Handles picker actions when in file-picker mode.
@@ -353,9 +498,10 @@ impl App {
 
     fn handle_action(&mut self, action: Action) -> Option<Cmd<Msg>> {
         match action {
-            Action::Run => {
-                let id = self.codes.get(self.selected)?.id;
-                self.execute(id)
+            Action::Run => self.execute(self.selected?),
+            Action::FocusNext => {
+                self.focus_next_batch_block();
+                None
             }
             Action::Quit => Some(Cmd::quit()),
         }
@@ -363,29 +509,24 @@ impl App {
 
     fn handle_nav(&mut self, nav: Navigation) -> Option<Cmd<Msg>> {
         let total = self.codes.len();
-        match nav {
-            Navigation::Next if self.selected + 1 < total => {
-                self.selected += 1;
-            }
-            Navigation::Prev if self.selected > 0 => {
-                self.selected -= 1;
-            }
-            Navigation::First => {
-                self.selected = 0;
-            }
-            Navigation::Last => {
-                self.selected = total.saturating_sub(1);
-            }
-            Navigation::PageUp => {
-                self.selected = self.selected.saturating_sub(5);
-            }
-            Navigation::PageDown => {
-                self.selected = (self.selected + 5).min(total.saturating_sub(1));
-            }
-            _ => {}
+        if total == 0 {
+            return None;
         }
+
+        let current = self.selected_index().unwrap_or(0);
+        let last = total - 1;
+        let next = match nav {
+            Navigation::Next => current.saturating_add(1).min(last),
+            Navigation::Prev => current.saturating_sub(1),
+            Navigation::First => 0,
+            Navigation::Last => last,
+            Navigation::PageUp => current.saturating_sub(5),
+            Navigation::PageDown => current.saturating_add(5).min(last),
+        };
+        self.select_index(next);
+
         if self.config.yes {
-            self.auto_run_selected()
+            self.selected.and_then(|id| self.execute(id))
         } else {
             None
         }
@@ -393,7 +534,7 @@ impl App {
 }
 
 impl crate::RunApp for App {
-    fn from_input(input: &str, config: AppConfig) -> Self {
+    fn from_input(input: &str, config: AppConfig) -> std::result::Result<Self, String> {
         let doc = upmd_parser::new().parse(input);
         Self::new(doc, config)
     }
@@ -406,8 +547,16 @@ impl crate::RunApp for App {
         Self::from_file_picker(files, config)
     }
 
-    fn run(self) -> Result<()> {
-        Ok(upmd_runtime::runtimes::cli::run(self)?)
+    fn run(mut self) -> Result<ExitCode> {
+        let failed = Rc::clone(&self.failed);
+        let runtime = upmd_runtime::runtimes::cli::Runtime::new();
+        self.batch_output.set_terminal(runtime.is_terminal());
+        upmd_runtime::Runtime::run(runtime, upmd_runtime::Engine::new(self))?;
+        Ok(if failed.get() {
+            ExitCode::FAILURE
+        } else {
+            ExitCode::SUCCESS
+        })
     }
 }
 
@@ -419,10 +568,9 @@ impl Component for App {
             return None;
         }
         if self.config.block.is_some() && self.config.yes {
-            self.auto_run_selected()
-        } else if !self.auto_advance.is_empty() && self.config.yes {
-            let first = self.auto_advance[0];
-            self.execute(first)
+            self.execute(self.selected?)
+        } else if self.config.all {
+            self.start_all()
         } else {
             None
         }
@@ -449,9 +597,15 @@ impl Input for App {
                 return None;
             }
 
+            if self.batch_output.visible().len() > 1
+                && self.keymap.get(&key) == Some(&Action::FocusNext)
+            {
+                return Some(Msg::Action(Action::FocusNext));
+            }
+
             // Forward input to process if one is running. Write directly
             // via RefCell so keystrokes don't trigger a render cycle.
-            let Some(code) = self.codes.get(self.selected) else {
+            let Some(code) = self.selected_code() else {
                 // No code blocks; only quit actions are meaningful.
                 if let Some(action) = self.keymap.get(&key) {
                     if action == &Action::Quit {
@@ -493,7 +647,7 @@ impl App {
         out: &mut W,
         picker: &crate::apps::picker::PickerState,
     ) -> std::io::Result<()> {
-        let prev = self.prev_lines.get();
+        let prev = self.batch_output.previous_lines();
         if prev > 0 {
             write!(out, "\x1b[{prev}A\r\x1b[J")?;
         } else {
@@ -561,17 +715,128 @@ impl App {
         write!(out, "\r\n")?;
         lines += 1;
 
-        self.prev_lines.set(lines);
+        self.batch_output.set_previous_lines(lines);
+        Ok(())
+    }
+
+    fn code_label(&self, id: CodeId) -> String {
+        self.codes
+            .by_id(id)
+            .map(|code| {
+                if code.name.is_empty() {
+                    code.id.to_string()
+                } else {
+                    code.name.clone()
+                }
+            })
+            .unwrap_or_else(|| id.to_string())
+    }
+
+    fn render_plain_transcript<W: Write>(&self, out: &mut W, id: CodeId) -> io::Result<()> {
+        let label = self.code_label(id);
+        writeln!(out, "==> {label} [block {id}]")?;
+        if let Some(task) = self.outputs.borrow().get(&id) {
+            let text = task.parser.inline_contents(false);
+            for line in text.lines {
+                for span in line.spans {
+                    write!(out, "{}", span.content)?;
+                }
+                writeln!(out)?;
+            }
+            match task.exit_code {
+                Some(exit_code) => writeln!(out, "<== {label} exited with code {exit_code}")?,
+                None => writeln!(out, "<== {label} failed to start")?,
+            }
+        } else {
+            writeln!(out, "<== {label} produced no output")?;
+        }
+        Ok(())
+    }
+
+    fn render_terminal_transcript<W: Write>(&self, out: &mut W, id: CodeId) -> io::Result<()> {
+        let label = self.code_label(id);
+        let active = ansi_fg(self.theme.active);
+        let reset = "\x1b[0m";
+        writeln!(out, "\n{active}==> {label} [block {id}]{reset}")?;
+        if let Some(task) = self.outputs.borrow().get(&id) {
+            let text = task.parser.inline_contents(false);
+            for line in text.lines {
+                write!(out, "  ")?;
+                for span in line.spans {
+                    write!(out, "{}{}{}", ansi_style(span.style), span.content, reset)?;
+                }
+                writeln!(out)?;
+            }
+            let (symbol, color, result) = match task.exit_code {
+                Some(0) => (
+                    crate::apps::config::SUCCESS_SYMBOL,
+                    ansi_fg(self.theme.success),
+                    "exited with code 0".to_string(),
+                ),
+                Some(exit_code) => (
+                    crate::apps::config::ERROR_SYMBOL,
+                    ansi_fg(self.theme.error),
+                    format!("exited with code {exit_code}"),
+                ),
+                None => (
+                    crate::apps::config::ERROR_SYMBOL,
+                    ansi_fg(self.theme.error),
+                    "failed to start".to_string(),
+                ),
+            };
+            writeln!(out, "  {color}{symbol} {result}{reset}")?;
+        }
+        Ok(())
+    }
+
+    fn render_plain<W: Write>(&self, out: &mut W) -> io::Result<()> {
+        for batch in self.batch_output.take_pending() {
+            for id in batch {
+                self.render_plain_transcript(out, id)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn render_batch_tabs<W: Write>(&self, out: &mut W) -> io::Result<()> {
+        let visible = self.batch_output.visible();
+        if visible.len() <= 1 {
+            return Ok(());
+        }
+
+        let selected = self.selected;
+        let outputs = self.outputs.borrow();
+        let active = ansi_fg(self.theme.active);
+        let muted = ansi_fg(self.theme.muted);
+        let reset = "\x1b[0m";
+        write!(out, "  Parallel:")?;
+        for &id in visible {
+            let status = match outputs.get(&id) {
+                Some(task) if !task.done => "●",
+                Some(task) if task.exit_code == Some(0) => crate::apps::config::SUCCESS_SYMBOL,
+                Some(_) => crate::apps::config::ERROR_SYMBOL,
+                None => "·",
+            };
+            let color = if selected == Some(id) {
+                &active
+            } else {
+                &muted
+            };
+            write!(out, " {color}[{} {status}]{reset}", self.code_label(id))?;
+        }
+        writeln!(out, "  {active}tab{reset} {muted}switch{reset}")?;
         Ok(())
     }
 }
 
 impl Output for App {
     fn is_alternate_screen(&self) -> bool {
-        if self.codes.is_empty() {
+        if !self.batch_output.is_terminal() {
             return false;
         }
-        let id = self.codes[self.selected].id;
+        let Some(id) = self.selected else {
+            return false;
+        };
         self.outputs
             .borrow()
             .get(&id)
@@ -580,53 +845,75 @@ impl Output for App {
     }
 
     fn render<W: Write>(&self, out: &mut W) -> std::io::Result<()> {
-        // In picker mode, render the compact file picker list.
+        if !self.batch_output.is_terminal() {
+            return self.render_plain(out);
+        }
+
         if let Some(picker) = &self.picker {
             return self.render_picker(out, picker);
         }
 
-        // Always overwrite the previous card in-place, even on the final
-        // render after execution completes.  The reset_anchor flag tells
-        // us to set prev_lines to 0 afterwards, so the next navigation
-        // renders fresh below rather than overwriting the output.
-        let anchor_reset = self.reset_anchor.get();
-        let prev = self.prev_lines.get();
+        let prev = self.batch_output.previous_lines();
         if prev > 0 {
             write!(out, "\x1b[{prev}A\r\x1b[J")?;
         }
-        self.reset_anchor.set(false);
 
         let term_width = crossterm::terminal::size()
             .map(|(w, _)| w as usize)
             .unwrap_or(80);
+        let pending = self.batch_output.take_pending();
+        let committed = !pending.is_empty();
+        if committed {
+            let mut transcript = LineCounter::new(out, term_width as u16);
+            for batch in pending {
+                for id in batch {
+                    self.render_terminal_transcript(&mut transcript, id)?;
+                }
+            }
+        }
 
-        // Wrap the output in a line counter so we can track prev_lines
-        // for the next render.
-        let mut counter = LineCounter::new(out, term_width as u16);
-        if self.codes.is_empty() {
-            writeln!(counter, "No code blocks found.")?;
-            self.prev_lines
-                .set(if anchor_reset { 0 } else { counter.lines });
+        if committed && self.batch_output.visible().is_empty() {
+            self.batch_output.set_previous_lines(0);
             return Ok(());
         }
 
-        let code = &self.codes[self.selected];
+        let mut counter = LineCounter::new(out, term_width as u16);
+        let Some(code) = self.selected_code() else {
+            let message = if self.codes.is_empty() {
+                "No code blocks found."
+            } else {
+                "No code block selected."
+            };
+            writeln!(counter, "{message}")?;
+            self.batch_output.set_previous_lines(counter.lines);
+            return Ok(());
+        };
         let total = self.codes.len();
-        let index = self.selected;
         let info_bg = ansi_bg(self.theme.info_background);
         let info_fg = ansi_fg(self.theme.info_foreground);
         let active_fg = ansi_fg(self.theme.active);
         let reset = "\x1b[0m";
 
+        self.render_batch_tabs(&mut counter)?;
         writeln!(counter)?;
+        let deps_display = format!("{}", code.deps);
+        let deps_str = if deps_display.is_empty() {
+            String::new()
+        } else {
+            let muted = ansi_fg(self.theme.muted);
+            format!(" {muted}{deps_display}")
+        };
+        // Note: `deps_display` has no trailing reset so `info_bg` stays active.
+        // The `{reset}` in the write below closes all styles.
+        let language = upmd_runner::find_language(&code.language);
         write!(
             counter,
-            "{info_bg}{info_fg} [{active_fg}{}{reset}{info_bg}{info_fg}/{}] ",
-            index + 1,
-            total
+            "{info_bg}{info_fg} [{active_fg}{id}{reset}{info_bg}{info_fg}/{total}]{info_fg} {lang}{deps}{reset}",
+            id = code.id,
+            total = total,
+            lang = language.name,
+            deps = deps_str,
         )?;
-        let language = upmd_runner::find_language(&code.language);
-        writeln!(counter, "{info_fg} {} {reset}", language.name)?;
         writeln!(counter)?;
 
         // Code Preview
@@ -710,8 +997,7 @@ impl Output for App {
             )?;
         }
 
-        self.prev_lines
-            .set(if anchor_reset { 0 } else { counter.lines });
+        self.batch_output.set_previous_lines(counter.lines);
         Ok(())
     }
 }
@@ -870,7 +1156,23 @@ echo world
 ```
 "#;
         let doc = upmd_parser::new().parse(input);
-        App::new(doc, make_config())
+        App::new(doc, make_config()).unwrap()
+    }
+
+    fn make_parallel_app() -> App {
+        let input = "\
+```sh [name:a]\n:\n```\n\
+```sh [name:b]\n:\n```\n\
+```sh [name:target, deps:\"a | b\"]\n:\n```\n";
+        App::new(upmd_parser::new().parse(input), make_config()).unwrap()
+    }
+
+    fn insert_completed_output(app: &App, id: CodeId, text: &str, exit_code: i32) {
+        let mut output = task::Task::new(80, 24, 1024);
+        exec::handle_stream(&mut output, &Stream::Out(text.to_string()));
+        exec::handle_stream(&mut output, &Stream::Exit(exit_code));
+        exec::handle_stream(&mut output, &Stream::End);
+        app.outputs.borrow_mut().insert(id, output);
     }
 
     #[test]
@@ -899,12 +1201,13 @@ echo world
         let mut app = App::new(
             upmd_parser::Document {
                 nodes: vec![],
-                codes: Vec::new(),
+                codes: Codes::default(),
                 headings: Vec::new(),
                 nodes_state: upmd_parser::NodesState::Full,
             },
             make_config(),
-        );
+        )
+        .unwrap();
         let _ = app.create();
         assert_eq!(app.codes.len(), 0);
     }
@@ -923,23 +1226,23 @@ echo world
     #[test]
     fn test_navigation_updates_selected() {
         let mut app = make_two_block_app();
-        assert_eq!(app.selected, 0, "starts at first block");
+        assert_eq!(app.selected, Some(1), "starts at first block");
 
         app.handle_nav(Navigation::Next);
-        assert_eq!(app.selected, 1, "navigates to second block");
+        assert_eq!(app.selected, Some(2), "navigates to second block");
 
         app.handle_nav(Navigation::Prev);
-        assert_eq!(app.selected, 0, "navigates back to first block");
+        assert_eq!(app.selected, Some(1), "navigates back to first block");
     }
 
     #[test]
     fn test_navigation_first_and_last() {
         let mut app = make_two_block_app();
         app.handle_nav(Navigation::Last);
-        assert_eq!(app.selected, 1, "goes to last block");
+        assert_eq!(app.selected, Some(2), "goes to last block");
 
         app.handle_nav(Navigation::First);
-        assert_eq!(app.selected, 0, "goes to first block");
+        assert_eq!(app.selected, Some(1), "goes to first block");
     }
 
     #[test]
@@ -947,12 +1250,12 @@ echo world
         let mut app = make_two_block_app();
         // Already at 0, prev should stay
         app.handle_nav(Navigation::Prev);
-        assert_eq!(app.selected, 0);
+        assert_eq!(app.selected, Some(1));
 
         // Go to last, next should stay
         app.handle_nav(Navigation::Last);
         app.handle_nav(Navigation::Next);
-        assert_eq!(app.selected, 1);
+        assert_eq!(app.selected, Some(2));
     }
 
     #[test]
@@ -960,12 +1263,13 @@ echo world
         let mut app = App::new(
             upmd_parser::Document {
                 nodes: vec![],
-                codes: Vec::new(),
+                codes: Codes::default(),
                 headings: Vec::new(),
                 nodes_state: upmd_parser::NodesState::Full,
             },
             make_config(),
-        );
+        )
+        .unwrap();
         let result = app.create();
         assert!(result.is_none(), "empty codes returns None");
     }
@@ -983,7 +1287,7 @@ print("3")
 ```
 "#;
         let doc = upmd_parser::new().parse(input);
-        let app = App::new(doc, config);
+        let app = App::new(doc, config).unwrap();
         let mut buf = Vec::new();
         app.render(&mut buf).unwrap();
         let out = String::from_utf8(buf).unwrap();
@@ -1006,7 +1310,7 @@ print("2")
 ```
 "#;
         let doc = upmd_parser::new().parse(input);
-        let app = App::new(doc, config);
+        let app = App::new(doc, config).unwrap();
         let mut buf = Vec::new();
         app.render(&mut buf).unwrap();
         let out = String::from_utf8(buf).unwrap();
@@ -1030,12 +1334,13 @@ print("2")
         let app = App::new(
             upmd_parser::Document {
                 nodes: vec![],
-                codes: Vec::new(),
+                codes: Codes::default(),
                 headings: Vec::new(),
                 nodes_state: upmd_parser::NodesState::Full,
             },
             make_config(),
-        );
+        )
+        .unwrap();
         // Simulate a quit keypress on an empty document.
         let event = crossterm::event::Event::Key(crossterm::event::KeyEvent::new(
             crossterm::event::KeyCode::Char('q'),
@@ -1045,21 +1350,18 @@ print("2")
     }
 
     #[test]
-    fn test_empty_codes_auto_run_does_not_panic() {
+    fn test_empty_all_plan_does_not_panic() {
         let mut app = App::new(
             upmd_parser::Document {
                 nodes: vec![],
-                codes: Vec::new(),
+                codes: Codes::default(),
                 headings: Vec::new(),
                 nodes_state: upmd_parser::NodesState::Full,
             },
             make_config(),
-        );
-        let result = app.auto_run_selected();
-        assert!(
-            result.is_none(),
-            "auto_run_selected with no codes returns None"
-        );
+        )
+        .unwrap();
+        assert!(app.start_all().is_none());
     }
 
     #[test]
@@ -1069,12 +1371,13 @@ print("2")
         let mut app = App::new(
             upmd_parser::Document {
                 nodes: vec![],
-                codes: Vec::new(),
+                codes: Codes::default(),
                 headings: Vec::new(),
                 nodes_state: upmd_parser::NodesState::Full,
             },
             config,
-        );
+        )
+        .unwrap();
         let result = app.create();
         assert!(
             result.is_none(),
@@ -1089,7 +1392,7 @@ print("2")
         app.render(&mut buf1).unwrap();
         // Reset anchor so the second render doesn't emit a move-up escape
         // sequence.  This simulates two independent render sessions.
-        app.prev_lines.set(0);
+        app.batch_output.set_previous_lines(0);
         let mut buf2 = Vec::new();
         app.render(&mut buf2).unwrap();
         assert_eq!(
@@ -1109,7 +1412,7 @@ print("2")
         let card1 = String::from_utf8(buf1).unwrap();
 
         // Navigate to second block and get its card
-        app.selected = 1;
+        app.selected = Some(2);
         let mut buf2 = Vec::new();
         app.render(&mut buf2).unwrap();
         let card2 = String::from_utf8(buf2).unwrap();
@@ -1117,5 +1420,62 @@ print("2")
         assert!(card1.contains("print"), "first block contains python code");
         assert!(card2.contains("echo"), "second block contains bash code");
         assert_ne!(card1, card2, "different blocks produce different cards");
+    }
+
+    #[test]
+    fn non_terminal_parallel_output_is_plain_and_deterministic() {
+        let mut app = make_parallel_app();
+        insert_completed_output(&app, 1, "from a\n", 0);
+        insert_completed_output(&app, 2, "from b\n", 0);
+        app.batch_output.set_terminal(false);
+        app.batch_output.select(&[1, 2]);
+        app.batch_output.track(1);
+        app.batch_output.track(2);
+        app.batch_output
+            .complete(&WorkflowTransition::NextBatch(vec![3]));
+
+        let mut buf = Vec::new();
+        app.render(&mut buf).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        assert!(!output.contains('\u{1b}'));
+        assert!(output.find("==> a").unwrap() < output.find("==> b").unwrap());
+        assert!(output.contains("from a"));
+        assert!(output.contains("from b"));
+        assert!(output.contains("<== a exited with code 0"));
+        assert!(output.contains("<== b exited with code 0"));
+
+        let mut second_render = Vec::new();
+        app.render(&mut second_render).unwrap();
+        assert!(second_render.is_empty());
+    }
+
+    #[test]
+    fn terminal_parallel_output_supports_focus_and_commits_every_block() {
+        let mut app = make_parallel_app();
+        insert_completed_output(&app, 1, "from a\n", 0);
+        insert_completed_output(&app, 2, "from b\n", 0);
+        app.batch_output.select(&[1, 2]);
+        app.batch_output.track(1);
+        app.batch_output.track(2);
+
+        let mut live = Vec::new();
+        app.render(&mut live).unwrap();
+        let live = String::from_utf8(live).unwrap();
+        assert!(live.contains("Parallel:"));
+        assert!(live.contains("tab"));
+        assert_eq!(app.selected, Some(1));
+        app.focus_next_batch_block();
+        assert_eq!(app.selected, Some(2));
+
+        app.batch_output
+            .complete(&WorkflowTransition::Finished { failed: false });
+        app.batch_output.set_previous_lines(0);
+        let mut committed = Vec::new();
+        app.render(&mut committed).unwrap();
+        let committed = String::from_utf8(committed).unwrap();
+        assert!(committed.find("==> a").unwrap() < committed.find("==> b").unwrap());
+        assert!(committed.contains("from a"));
+        assert!(committed.contains("from b"));
+        assert_eq!(app.batch_output.previous_lines(), 0);
     }
 }

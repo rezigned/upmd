@@ -25,7 +25,7 @@ pub struct Parser {
     scrollback_len: usize,
     mouse_reporting: bool,
     sgr_mouse: bool,
-    /// Partial DEC private mode sequence (`ESC[?…`) carried over from a
+    /// Partial DEC private mode sequence (`ESC[?...`) carried over from a
     /// previous byte-split PTY read. Prepend to the next chunk so that
     /// `update_mouse_modes` can see the complete sequence.
     pending_csi: String,

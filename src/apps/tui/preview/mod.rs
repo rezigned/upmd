@@ -47,6 +47,7 @@ use crate::apps::theme::Theme;
 use crate::runner::CodeId;
 use keymap::{DerivedConfig, KeyMap};
 use upmd_parser::nodes::Node;
+use upmd_parser::Codes;
 
 use super::markdown::{
     apply_gutter, highlight_line, Content, LineKind, MarkdownRenderer, RenderContext, ViewLine,
@@ -70,6 +71,22 @@ mod visual_lines;
 use search::PreviewSearch;
 use selection::PreviewSelection;
 pub use visual_lines::{VisualLine, VisualLines};
+
+/// Identifies a visual line by its logical position within its parent
+/// (code block or document), allowing navigation to survive layout shifts
+/// caused by inline deps/output growing or shrinking.
+#[derive(Clone, Copy)]
+enum VisualLineIdentity {
+    Code {
+        id: CodeId,
+        line_idx: usize,
+        wrap_idx: usize,
+    },
+    Document {
+        logical_idx: usize,
+        wrap_idx: usize,
+    },
+}
 
 /// The markdown preview pane.
 ///
@@ -95,8 +112,8 @@ pub struct Preview {
     target_block: Cell<Option<CodeId>>,
     /// Transient: prefer this block's task status over active gutter.
     prefer_status_gutter: Cell<Option<CodeId>>,
-    /// Flat Vec of Code nodes indexed by (CodeId - 1).
-    code_index: Vec<upmd_parser::nodes::Code>,
+    /// Code blocks in document order with dense one-based IDs.
+    code_index: Codes,
     /// Transient result of the last clipboard copy attempt (None = no copy).
     copy_result: Cell<Option<bool>>,
     /// Prefix overhead in chars per code block (non-zero only for blockquote-nested blocks).
@@ -132,14 +149,14 @@ impl Preview {
     /// Creates a preview from parsed AST nodes and code blocks.
     pub fn new(
         nodes: Vec<Node>,
-        codes: Vec<upmd_parser::nodes::Code>,
+        codes: Codes,
         theme: Theme,
         outputs: &HashMap<CodeId, Task>,
         inline_max_lines_cap: usize,
         keymap: DerivedConfig<Action>,
     ) -> Self {
-        let preview = Self {
-            nodes: vec![],
+        let mut preview = Self {
+            nodes,
             logical_lines: vec![],
             visual_lines: VisualLines::new(),
             state: RefCell::new(ListState::default()),
@@ -157,23 +174,11 @@ impl Preview {
             code_index: codes,
             code_prefix_overhead: HashMap::new(),
         };
-        let mut preview = preview;
-        preview.set_nodes(nodes, preview.code_index.clone(), outputs);
+        preview.rebuild_view(outputs);
         if !preview.visual_lines.is_empty() {
             preview.state.borrow_mut().select(Some(0));
         }
         preview
-    }
-
-    pub fn set_nodes(
-        &mut self,
-        nodes: Vec<Node>,
-        codes: Vec<upmd_parser::nodes::Code>,
-        outputs: &HashMap<CodeId, Task>,
-    ) {
-        self.code_index = codes;
-        self.nodes = nodes;
-        self.rebuild_view(outputs);
     }
 
     pub fn prefer_status_gutter_for(&self, id: CodeId) {
@@ -342,15 +347,50 @@ impl Preview {
         self.visual_lines.get(visual_idx).map(|l| l.logical_idx)
     }
 
-    fn selected_visual_line_identity(&self) -> Option<(usize, usize)> {
+    fn selected_visual_line_identity(&self) -> Option<VisualLineIdentity> {
         let visual_idx = self.state.borrow().selected()?;
-        self.visual_lines
-            .get(visual_idx)
-            .map(|line| (line.logical_idx, line.wrap_idx))
+        let visual_lines = self.visual_lines.borrow();
+        let line = visual_lines.get(visual_idx)?;
+
+        match line.code_id {
+            Some(id) => {
+                let first_logical_idx = visual_lines
+                    .iter()
+                    .find(|line| line.code_id == Some(id))?
+                    .logical_idx;
+                Some(VisualLineIdentity::Code {
+                    id,
+                    line_idx: line.logical_idx.saturating_sub(first_logical_idx),
+                    wrap_idx: line.wrap_idx,
+                })
+            }
+            None => Some(VisualLineIdentity::Document {
+                logical_idx: line.logical_idx,
+                wrap_idx: line.wrap_idx,
+            }),
+        }
     }
 
-    fn visual_idx_for_identity(&self, (logical_idx, wrap_idx): (usize, usize)) -> Option<usize> {
+    fn visual_idx_for_identity(&self, identity: VisualLineIdentity) -> Option<usize> {
         let visual_lines = self.visual_lines.borrow();
+        let (logical_idx, wrap_idx) = match identity {
+            VisualLineIdentity::Code {
+                id,
+                line_idx,
+                wrap_idx,
+            } => {
+                let first_logical_idx = visual_lines
+                    .iter()
+                    .find(|line| line.code_id == Some(id))?
+                    .logical_idx;
+                (first_logical_idx + line_idx, wrap_idx)
+            }
+            VisualLineIdentity::Document {
+                logical_idx,
+                wrap_idx,
+            } => (logical_idx, wrap_idx),
+        };
+
         visual_lines
             .iter()
             .position(|line| line.logical_idx == logical_idx && line.wrap_idx == wrap_idx)
@@ -441,8 +481,8 @@ impl Preview {
         self.search.matches(&self.visual_lines.borrow())
     }
 
-    pub fn set_theme(&mut self, theme: Theme) {
-        self.theme = theme;
+    pub fn set_theme(&mut self, theme: &Theme) {
+        self.theme.clone_from(theme);
         self.logical_lines.iter().for_each(|l| l.clear_cache());
     }
 
@@ -492,12 +532,12 @@ impl Preview {
 
     /// Looks up the raw `Code` node by ID from the flat Vec index.
     /// Returns all code blocks in document order.
-    pub fn codes(&self) -> &[upmd_parser::nodes::Code] {
+    pub fn codes(&self) -> &Codes {
         &self.code_index
     }
 
     pub fn code_by_id(&self, id: CodeId) -> Option<&upmd_parser::nodes::Code> {
-        self.code_index.get(id as usize - 1)
+        self.code_index.by_id(id)
     }
 
     /// Converts a mouse click on the selected code block into PTY-relative

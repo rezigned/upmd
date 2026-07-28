@@ -1,0 +1,7 @@
+---
+source: src/apps/tui/dependencies.rs
+expression: "lines.join(\"\\n\")"
+---
+ · m-dep-a ────→ · m-dep-b ────→ · m-stage1 ────→ · m-stage2 ──┬─→ · m-side-x ──┬─→ · mixed-top 
+                                                               │                │               
+                                                               └─→ · m-side-y ──┘

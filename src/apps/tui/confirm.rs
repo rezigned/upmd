@@ -82,7 +82,7 @@ impl Confirm {
     pub fn rerun(id: CodeId, theme: Theme, keymap: DerivedConfig<Action>) -> Self {
         Self::new(
             "Re-run?",
-            "This will override existing output.",
+            "This will re-run the block and its dependencies, replacing their output.",
             theme,
             ConfirmAction::ReRun(id),
             keymap,

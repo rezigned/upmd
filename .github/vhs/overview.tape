@@ -2,40 +2,28 @@ Output .github/pages/demos/overview.gif
 
 Source ./.github/vhs/config.tape
 
-# Launch upmd with the DEMO file
-Type "upmd DEMO.md"
+# Launch upmd
+Type "upmd DEMO.md -b build"
+Sleep 0.2s
 Enter
-Sleep 1s
-
-# Run `ls` command
-Type "1"
-Sleep 1s
-Enter
-Sleep 1s
-
-# Run `read` command
-Type "2"
-Sleep 1s
-Enter
-Sleep 1s
-Type "upmd"
 Sleep 0.5s
-Enter
-Sleep 1s
 
-# Run TUI app (nvim)
-Type "3"
+# Navigate to `package` block
+Down
+Sleep 0.2s
+Down
+Sleep 0.3s
+Down
+Sleep 0.4s
+
+# Run `package`
+Enter
+Sleep 2.3s
+
+# Confirm
+Type "i"
+Sleep 0.3s
+Type "upmd!"
 Sleep 1s
 Enter
-Sleep 1s
-Type "ff"
-Sleep 1s
-Type "README"
-Enter
-Sleep 1s
-Down 5
-Sleep 1s
-Type ":q"
-Sleep 1s
-Enter
-Sleep 1s
+Sleep 2s

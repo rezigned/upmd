@@ -1,4 +1,4 @@
-use crate::nodes::Options;
+use crate::nodes::{Dependencies, DepsGroups, Options};
 use regex::Regex;
 use std::collections::HashMap;
 use std::sync::LazyLock;
@@ -28,48 +28,38 @@ fn attrs_regex() -> &'static Regex {
     &RE
 }
 
-fn split_language_attrs(input: &str) -> (&str, &str) {
-    let input = input.trim();
-    let lang_end = input.find('[').unwrap_or(input.len());
-    (input[..lang_end].trim(), input[lang_end..].trim())
-}
-
-pub(crate) fn parse_language(input: &str) -> String {
-    let (language, _) = split_language_attrs(input);
-    language.to_string()
-}
-
-/// Parses the language name and bracketed attributes from a code fence info string.
+/// Parses a fence info string like `"sh [name:build, bin:zsh]"`.
 ///
-/// The language is everything before the first `[`, returned as-is (trimmed).
-/// No character restrictions are imposed. Any markdown fence info string is valid.
-///
-/// Attributes are `key:value` pairs inside `[...]`, comma-separated.
-///
-/// ````markdown
-/// ```sh [name:build, bin:zsh]
-/// echo build
+/// ```text
+/// options = language '[' attrs ']'
+/// attrs   = attr (',' attr)*
+/// attr    = key ':' value
 /// ```
-/// ````
-///
-/// Returns an error when the attribute section contains unrecognized text
-/// that is not part of any key:value pair, bracket, comma, or whitespace.
-pub fn parse(input: &str) -> Result<Options, String> {
-    let (language, attrs_input) = split_language_attrs(input);
-    let attrs = parse_attrs(attrs_input)?;
-    Ok(Options {
+pub fn parse(input: &str) -> Options {
+    let (language, attrs_input) = split_language(input);
+    let (attrs, errors) = parse_attrs(attrs_input);
+    let name = attrs.get("name").cloned().unwrap_or_default();
+    let deps = Dependencies(parse_deps(attrs.get("deps").map(String::as_str)));
+
+    Options {
         language: language.to_string(),
+        name,
+        deps,
         attrs,
-    })
+        errors,
+    }
 }
 
-/// Parses `key:value` pairs from the bracketed attribute section.
+/// Parses `key: value` pairs from the bracketed attribute section.
 ///
-/// Returns the attribute map. The input is expected to be the text after
-/// the language token, typically `[name:foo, bin:/usr/bin/zsh]`.
-fn parse_attrs(input: &str) -> Result<HashMap<String, String>, String> {
+/// ```text
+/// attrs = attr (',' attr)*
+/// attr  = key ':' value
+/// ```
+fn parse_attrs(input: &str) -> (HashMap<String, String>, Vec<String>) {
     let mut map = HashMap::new();
     let regex = attrs_regex();
+    let mut errors = Vec::new();
 
     // Track which byte ranges are consumed by valid attribute pairs.
     let mut covered = vec![false; input.len()];
@@ -99,10 +89,55 @@ fn parse_attrs(input: &str) -> Result<HashMap<String, String>, String> {
         .filter(|c| !c.is_whitespace() && *c != '[' && *c != ']' && *c != ',')
         .collect();
     if !unconsumed.is_empty() {
-        return Err(format!("unrecognized attribute syntax: {unconsumed}"));
+        errors.push(format!("unrecognized attribute syntax: {unconsumed}"));
     }
 
-    Ok(map)
+    (map, errors)
+}
+
+/// Parses a `[deps]` value into groups.
+///
+/// ```text
+/// deps  = group (',' group)*
+/// group = name ('|' name)*
+/// ```
+///
+/// Example: `"B | C, A"` → `[[B, C], [A]]`.
+pub(crate) fn parse_deps(input: Option<&str>) -> Result<DepsGroups, String> {
+    let Some(input) = input else {
+        return Ok(Vec::new());
+    };
+    if input.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    input
+        .split(',')
+        .map(|group| {
+            group
+                .split('|')
+                .map(str::trim)
+                .map(|name| {
+                    if name.is_empty() {
+                        Err("empty name in deps".to_string())
+                    } else if name.chars().any(char::is_whitespace) {
+                        Err(format!("dependency name contains whitespace: {name:?}"))
+                    } else {
+                        Ok(name.to_string())
+                    }
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Splits a fence info string into (language, attrs).
+///
+/// The language is everything before the first `[`. Both halves are trimmed.
+fn split_language(input: &str) -> (&str, &str) {
+    let input = input.trim();
+    let lang_end = input.find('[').unwrap_or(input.len());
+    (input[..lang_end].trim(), input[lang_end..].trim())
 }
 
 #[cfg(test)]
@@ -111,64 +146,72 @@ mod tests {
 
     #[test]
     fn test_parse() {
-        let actual = parse(r"sh [name:build, bin:zsh, custom:x]").unwrap();
+        for (input, expected_lang, expected_attrs) in [
+            (
+                "sh [name:build, bin:zsh, custom:x]",
+                "sh",
+                vec![("name", "build"), ("bin", "zsh"), ("custom", "x")],
+            ),
+            (
+                r#"python [name:"data processing", bin:"/usr/bin/python3"]"#,
+                "python",
+                vec![("name", "data processing"), ("bin", "/usr/bin/python3")],
+            ),
+            (r#"sh [name:"abc\""]"#, "sh", vec![("name", r#"abc\""#)]),
+            (r#"sh [name:"a\\b"]"#, "sh", vec![("name", r#"a\\b"#)]),
+            ("c++", "c++", vec![]),
+            ("c#", "c#", vec![]),
+            ("f# [name:test]", "f#", vec![("name", "test")]),
+            ("", "", vec![]),
+            ("python [name:test]", "python", vec![("name", "test")]),
+            (
+                "sh [name:build, bin:zsh]",
+                "sh",
+                vec![("name", "build"), ("bin", "zsh")],
+            ),
+            (
+                "bash [bin:/usr/bin/zsh]",
+                "bash",
+                vec![("bin", "/usr/bin/zsh")],
+            ),
+            (
+                "bash [bin:~/.local/bin/zsh]",
+                "bash",
+                vec![("bin", "~/.local/bin/zsh")],
+            ),
+        ] {
+            let opts = parse(input);
+            assert_eq!(opts.language, expected_lang, "input: {input:?}");
+            let attrs: HashMap<String, String> = expected_attrs
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            assert_eq!(opts.attrs, attrs, "input: {input:?}");
+            assert!(opts.errors.is_empty(), "input: {input:?}");
+        }
 
-        assert_eq!("sh", actual.language);
-        assert_eq!("build", actual.attrs["name"]);
-        assert_eq!("zsh", actual.attrs["bin"]);
-        assert_eq!("x", actual.attrs["custom"]);
+        for (input, expected_err, expected_attrs) in [
+            ("sh [name:foo badvalue]", "badvalue", vec![("name", "foo")]),
+            ("sh [a:1 BAD b:2]", "BAD", vec![("a", "1"), ("b", "2")]),
+        ] {
+            let opts = parse(input);
+            assert!(
+                opts.errors.iter().any(|error| error.contains(expected_err)),
+                "input: {input:?}, errors: {:?}",
+                opts.errors
+            );
+            for (key, value) in expected_attrs {
+                assert_eq!(opts.attrs.get(key).map(String::as_str), Some(value));
+            }
+        }
     }
 
     #[test]
-    fn test_parse_quoted_value() {
-        let actual = parse(r#"python [name:"data processing", bin:"/usr/bin/python3"]"#).unwrap();
-
-        assert_eq!("python", actual.language);
-        assert_eq!("data processing", actual.attrs["name"]);
-        assert_eq!("/usr/bin/python3", actual.attrs["bin"]);
-    }
-
-    #[test]
-    fn test_parse_quoted_value_with_escaped_quote() {
-        // Regex consumes \" as an escaped quote, so the captured value
-        // includes the raw backslash (no unescaping is performed).
-        let actual = parse(r#"sh [name:"abc\""]"#).unwrap();
-        assert_eq!(actual.attrs["name"], r#"abc\""#);
-    }
-
-    #[test]
-    fn test_parse_quoted_value_with_backslash_escape() {
-        let actual = parse(r#"sh [name:"a\\b"]"#).unwrap();
-        assert_eq!(actual.attrs["name"], r#"a\\b"#);
-    }
-
-    #[test]
-    fn test_parse_lang_cpp() {
-        let actual = parse("c++").unwrap();
-        assert_eq!("c++", actual.language);
-        assert!(actual.attrs.is_empty());
-    }
-
-    #[test]
-    fn test_parse_lang_csharp() {
-        let actual = parse("c#").unwrap();
-        assert_eq!("c#", actual.language);
-        assert!(actual.attrs.is_empty());
-    }
-
-    #[test]
-    fn test_parse_lang_fsharp() {
-        let actual = parse("f# [name:test]").unwrap();
-        assert_eq!("f#", actual.language);
-        assert_eq!("test", actual.attrs["name"]);
-    }
-
-    #[test]
-    fn test_parse_attrs() {
+    fn test_parse_attrs_variants() {
         let expected: HashMap<String, String> =
             HashMap::from([("a".into(), "1".into()), ("b".into(), "1".into())]);
 
-        [
+        for input in [
             "[a:1,b:1]",
             "[a:1, b:1]",
             "[a:1 ,b:1]",
@@ -177,62 +220,44 @@ mod tests {
             "[a :1,b :1]",
             "[a: 1,b: 1]",
             "[a : 1,b : 1]",
-        ]
-        .iter()
-        .for_each(|input| {
-            let actual = parse_attrs(input).unwrap();
+        ] {
+            let (actual, errors) = parse_attrs(input);
             assert_eq!(expected, actual);
-        });
+            assert!(errors.is_empty(), "input: {input:?}");
+        }
     }
 
     #[test]
-    fn test_parse_empty_input() {
-        let opts = parse("").unwrap();
-        assert_eq!(opts.language, "");
-        assert!(opts.attrs.is_empty());
+    fn test_parse_retains_valid_attrs_when_dependencies_are_invalid() {
+        let opts = parse(r#"sh [name:build, deps:"setup || test", bin:zsh]"#);
+
+        assert_eq!(opts.name, "build");
+        assert_eq!(opts.attrs.get("bin").map(String::as_str), Some("zsh"));
+        assert!(opts.deps.is_err());
+        assert!(opts.errors.is_empty());
     }
 
     #[test]
-    fn test_parse_language_with_attrs() {
-        let opts = parse("python [name:test]").unwrap();
-        assert_eq!(opts.language, "python");
-        assert_eq!(opts.attrs["name"], "test");
-    }
+    fn test_parse_dependencies() {
+        for (input, expected) in [
+            (None, vec![]),
+            (Some(""), vec![]),
+            (Some("setup"), vec![vec!["setup"]]),
+            (Some("setup, build"), vec![vec!["setup"], vec!["build"]]),
+            (
+                Some("setup, build | lint, test"),
+                vec![vec!["setup"], vec!["build", "lint"], vec!["test"]],
+            ),
+            (
+                Some("  setup , build | lint  "),
+                vec![vec!["setup"], vec!["build", "lint"]],
+            ),
+        ] {
+            assert_eq!(parse_deps(input).unwrap(), expected);
+        }
 
-    #[test]
-    fn test_parse_name_bin_attrs() {
-        let opts = parse("sh [name:build, bin:zsh]").unwrap();
-        assert_eq!(opts.attrs["name"], "build");
-        assert_eq!(opts.attrs["bin"], "zsh");
-    }
-
-    #[test]
-    fn test_parse_unquoted_path_value() {
-        let opts = parse("bash [bin:/usr/bin/zsh]").unwrap();
-        assert_eq!(opts.attrs["bin"], "/usr/bin/zsh");
-    }
-
-    #[test]
-    fn test_parse_unquoted_home_path_value() {
-        let opts = parse("bash [bin:~/.local/bin/zsh]").unwrap();
-        assert_eq!(opts.attrs["bin"], "~/.local/bin/zsh");
-    }
-
-    #[test]
-    fn test_parse_trailing_garbage_rejected() {
-        let err = parse("sh [name:foo badvalue]").unwrap_err();
-        assert!(
-            err.contains("badvalue"),
-            "Expected error mentioning badvalue, got: {err}"
-        );
-    }
-
-    #[test]
-    fn test_parse_interstitial_garbage_rejected() {
-        let err = parse("sh [a:1 BAD b:2]").unwrap_err();
-        assert!(
-            err.contains("BAD"),
-            "Expected error mentioning BAD, got: {err}"
-        );
+        for input in ["setup, , build", "setup || build", "setup build"] {
+            assert!(parse_deps(Some(input)).is_err(), "{input:?}");
+        }
     }
 }

@@ -9,7 +9,20 @@ pub mod picker;
 pub mod task;
 mod theme;
 pub mod tui;
+pub mod workflow;
 
+use upmd_parser::{CodeId, Codes};
+
+fn initial_code_id(codes: &Codes, block: Option<&str>) -> Result<Option<CodeId>, String> {
+    let Some(spec) = block else {
+        return Ok(codes.first().map(|code| code.id));
+    };
+
+    match codes.resolve(spec).first() {
+        Some(&id) => Ok(Some(id)),
+        None => Err(format!("code block {spec:?} not found in document")),
+    }
+}
 /// Target directory for writing files.
 ///
 /// Initialized lazily on first access. If temp directory creation fails,

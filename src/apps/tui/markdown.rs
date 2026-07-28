@@ -18,7 +18,10 @@ use unicode_width::UnicodeWidthChar;
 use crate::apps::config::PREVIEW_FRAME_OVERHEAD;
 use crate::apps::theme::Theme;
 use crate::runner::CodeId;
-use upmd_parser::nodes::{Alignment, Code, ListKind, Table as MarkdownTable, TaskStatus};
+use upmd_parser::nodes::{
+    Alignment, Code, DepsToken, ListKind, Table as MarkdownTable, TaskStatus,
+};
+use upmd_parser::Codes;
 
 use crate::apps::task::Task;
 
@@ -715,7 +718,7 @@ pub struct RenderedMarkdown {
 pub struct MarkdownRenderer<'a> {
     theme: &'a Theme,
     outputs: &'a HashMap<u32, Task>,
-    codes: &'a [upmd_parser::nodes::Code],
+    codes: &'a Codes,
     inline_max_lines: usize,
     viewport_width: usize,
 }
@@ -724,7 +727,7 @@ impl<'a> MarkdownRenderer<'a> {
     pub fn new(
         theme: &'a Theme,
         outputs: &'a HashMap<u32, Task>,
-        codes: &'a [upmd_parser::nodes::Code],
+        codes: &'a Codes,
         inline_max_lines: usize,
         viewport_width: usize,
     ) -> Self {
@@ -824,8 +827,7 @@ impl<'a> MarkdownRenderer<'a> {
             Node::Code(code_id) => {
                 let code = self
                     .codes
-                    .iter()
-                    .find(|c| c.id == *code_id)
+                    .by_id(*code_id)
                     .expect("CodeId must resolve to a Code in Document.codes");
                 let is_start = match state.snap.take_target() {
                     Some(idx) => {
@@ -972,13 +974,25 @@ impl<'a> MarkdownRenderer<'a> {
         let language = upmd_runner::find_language(&code.language);
         let info_style = self.theme.code_info_style();
 
-        // Left: "{id}" or "{id} {name}"
+        // Left: "{id}" or "{id} {name}" with optional deps bracket.
         let left_text = if code.name.is_empty() {
             format!("{}", code.id)
         } else {
             format!("{} {}", code.id, code.name)
         };
         let mut left = vec![(left_text, info_style)];
+
+        if code.deps.is_err() {
+            left.push((" [invalid]".to_string(), info_style.fg(self.theme.error)));
+        } else {
+            for token in code.deps.segments() {
+                let style = match token {
+                    DepsToken::Punct(_) => info_style.patch(self.theme.muted_style()),
+                    DepsToken::Name(_) => info_style,
+                };
+                left.push((token.text().to_string(), style));
+            }
+        }
 
         // Status symbol with its own color, appended to left spans.
         if is_done {

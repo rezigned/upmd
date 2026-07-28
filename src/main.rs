@@ -1,5 +1,6 @@
+use std::{io::IsTerminal, process::ExitCode};
+
 use color_eyre::Result;
-use std::io::IsTerminal;
 
 use crate::apps::config::{self};
 
@@ -12,23 +13,22 @@ mod pty;
 mod reader;
 mod utils;
 
-/// Defines how `main` builds and runs a CLI or TUI app.
-trait RunApp {
-    /// Parses input text and construct from stdin or file input.
-    fn from_input(input: &str, config: crate::apps::config::Config) -> Self;
+trait RunApp: Sized {
+    fn from_input(
+        input: &str,
+        config: crate::apps::config::Config,
+    ) -> std::result::Result<Self, String>;
 
-    /// Constructs in file-picker mode (directory input with multiple files).
     fn from_picker(
         root: std::path::PathBuf,
         files: Vec<markdown_files::MarkdownFile>,
         config: crate::apps::config::Config,
     ) -> Self;
 
-    /// Runs the app to completion.
-    fn run(self) -> Result<()>;
+    fn run(self) -> Result<ExitCode>;
 }
 
-fn main() -> Result<()> {
+fn main() -> Result<ExitCode> {
     color_eyre::install()?;
     init_tracing();
     let args = args::parse()?;
@@ -38,16 +38,21 @@ fn main() -> Result<()> {
         let mut full = config::UserConfig::default_full();
         full.keymap = Some(config::KeymapConfig::dump_all());
         println!("{}", toml::to_string_pretty(&full)?);
-        return Ok(());
+        return Ok(ExitCode::SUCCESS);
     }
 
     let is_cli = args.cli;
     let user_cfg = crate::apps::config::UserConfig::load();
     let mut config = args::build_config(args, user_cfg);
 
-    // No file argument on an interactive terminal: open current directory.
+    // No file argument on an interactive terminal: check for up.md/UP.md,
+    // otherwise open current directory for the file picker.
     if config.file.is_none() && std::io::stdin().is_terminal() {
-        config.file = Some(".".to_string());
+        config.file = ["up.md", "UP.md"]
+            .into_iter()
+            .find(|f| std::path::Path::new(f).exists())
+            .map(|f| f.to_string())
+            .or_else(|| Some(".".to_string()));
     }
 
     if is_cli {
@@ -57,13 +62,13 @@ fn main() -> Result<()> {
     }
 }
 
-/// Resolves the input target, reads/discovers files, constructs the frontend,
-/// and runs it.
-fn run<App: RunApp>(config: crate::apps::config::Config) -> Result<()> {
+fn run<App: RunApp>(config: crate::apps::config::Config) -> Result<ExitCode> {
     match crate::reader::resolve_input_target(&config.file)? {
         crate::reader::InputTarget::Stdin | crate::reader::InputTarget::File(_) => {
             let input = crate::reader::read_input(&config.file)?;
-            App::from_input(&input, config).run()
+            App::from_input(&input, config)
+                .map_err(|error| color_eyre::eyre::eyre!(error))?
+                .run()
         }
         crate::reader::InputTarget::Directory(path) => {
             let files = crate::markdown_files::find_markdown_files(
