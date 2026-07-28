@@ -25,4 +25,4 @@ expression: "rows.join(\"\\n\")"
 │   │             │                                                            │
 │   │ · build   ──┘                                                            │
 └───┴──────────────────────────────────────────────────────────────────────────┘
- NORMAL  ↑↓ move  ↵ run  / search  ctrl-g goto  f files  t theme  z  upmd 0.1.1
+ NORMAL  ↑↓ move  ↵ run  / search  ctrl-g goto  f files  t theme  z  upmd 0.2.0

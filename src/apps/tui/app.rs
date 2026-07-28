@@ -1508,6 +1508,7 @@ impl App {
     /// Reads and loads a Markdown file, replacing the active document.
     /// Updates `config.file` because reload reads the active path from config.
     fn open_markdown_file(&mut self, path: PathBuf) -> Option<Cmd<Msg>> {
+        self.config.block = None;
         match crate::reader::read_from_path(&path) {
             Ok(input) => {
                 let doc = upmd_parser::new().parse(&input);

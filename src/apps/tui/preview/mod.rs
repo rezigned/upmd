@@ -72,6 +72,22 @@ use search::PreviewSearch;
 use selection::PreviewSelection;
 pub use visual_lines::{VisualLine, VisualLines};
 
+/// Identifies a visual line by its logical position within its parent
+/// (code block or document), allowing navigation to survive layout shifts
+/// caused by inline deps/output growing or shrinking.
+#[derive(Clone, Copy)]
+enum VisualLineIdentity {
+    Code {
+        id: CodeId,
+        line_idx: usize,
+        wrap_idx: usize,
+    },
+    Document {
+        logical_idx: usize,
+        wrap_idx: usize,
+    },
+}
+
 /// The markdown preview pane.
 ///
 /// Owns the two-tier line model (see module-level docs) and handles all
@@ -331,15 +347,50 @@ impl Preview {
         self.visual_lines.get(visual_idx).map(|l| l.logical_idx)
     }
 
-    fn selected_visual_line_identity(&self) -> Option<(usize, usize)> {
+    fn selected_visual_line_identity(&self) -> Option<VisualLineIdentity> {
         let visual_idx = self.state.borrow().selected()?;
-        self.visual_lines
-            .get(visual_idx)
-            .map(|line| (line.logical_idx, line.wrap_idx))
+        let visual_lines = self.visual_lines.borrow();
+        let line = visual_lines.get(visual_idx)?;
+
+        match line.code_id {
+            Some(id) => {
+                let first_logical_idx = visual_lines
+                    .iter()
+                    .find(|line| line.code_id == Some(id))?
+                    .logical_idx;
+                Some(VisualLineIdentity::Code {
+                    id,
+                    line_idx: line.logical_idx.saturating_sub(first_logical_idx),
+                    wrap_idx: line.wrap_idx,
+                })
+            }
+            None => Some(VisualLineIdentity::Document {
+                logical_idx: line.logical_idx,
+                wrap_idx: line.wrap_idx,
+            }),
+        }
     }
 
-    fn visual_idx_for_identity(&self, (logical_idx, wrap_idx): (usize, usize)) -> Option<usize> {
+    fn visual_idx_for_identity(&self, identity: VisualLineIdentity) -> Option<usize> {
         let visual_lines = self.visual_lines.borrow();
+        let (logical_idx, wrap_idx) = match identity {
+            VisualLineIdentity::Code {
+                id,
+                line_idx,
+                wrap_idx,
+            } => {
+                let first_logical_idx = visual_lines
+                    .iter()
+                    .find(|line| line.code_id == Some(id))?
+                    .logical_idx;
+                (first_logical_idx + line_idx, wrap_idx)
+            }
+            VisualLineIdentity::Document {
+                logical_idx,
+                wrap_idx,
+            } => (logical_idx, wrap_idx),
+        };
+
         visual_lines
             .iter()
             .position(|line| line.logical_idx == logical_idx && line.wrap_idx == wrap_idx)
