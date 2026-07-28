@@ -86,8 +86,10 @@ pub struct App {
     footer_right_text: Line<'static>,
     /// Transient flash notification at the bottom right.
     notification: Option<tui::notification::FlashMessage>,
-    /// Inline dependency graph shown when running a block with deps.
-    graph_inline: Option<dependencies::Dependencies>,
+    /// Dependency graph for the latest workflow.
+    workflow_graph: Option<dependencies::Dependencies>,
+    /// Whether the workflow graph is visible below the preview.
+    workflow_graph_visible: bool,
 }
 
 #[derive(Clone, KeyMap, Debug, PartialEq, Eq, Hash)]
@@ -143,6 +145,9 @@ pub enum Action {
     /// Show dependency diagram
     #[key(";", help = "deps")]
     ShowDeps,
+    /// Toggle the inline workflow dependency graph
+    #[key("'", help = "graph")]
+    ToggleWorkflowGraph,
     /// Quit
     #[key("q", "ctrl-c", help = "quit")]
     Quit,
@@ -238,7 +243,8 @@ impl App {
             notification: None,
             started: false,
             deps: None,
-            graph_inline: None,
+            workflow_graph: None,
+            workflow_graph_visible: false,
             footer_right_text: Self::build_footer_right_text(&theme),
         }
     }
@@ -379,6 +385,17 @@ impl App {
     fn start_plan(&mut self, mut workflow: Workflow) -> Option<Cmd<Msg>> {
         let auto_run = workflow.auto_run();
         let batch = workflow.start()?;
+        let graph = workflow.graph().clone();
+        self.workflow_graph_visible = graph.layers().len() > 1;
+        self.workflow_graph = Some(dependencies::Dependencies::new(
+            "Workflow",
+            self.preview.codes(),
+            Some(Ok(graph)),
+            "No active workflow",
+            self.tasks.task_statuses(),
+            self.theme.clone(),
+            self.config.keymap.dependencies(),
+        ));
         self.workflow = Some(workflow);
         self.select_batch(&batch);
         auto_run.then(|| self.launch_batch(batch)).flatten()
@@ -411,22 +428,6 @@ impl App {
                 self.notify_error(error);
                 None
             }
-        }
-    }
-
-    fn build_inline_graph(&mut self, id: CodeId) {
-        if self
-            .preview
-            .code_by_id(id)
-            .is_some_and(|code| !code.deps.is_empty())
-        {
-            self.graph_inline = Some(dependencies::Dependencies::for_target(
-                self.preview.codes(),
-                Some(id),
-                self.tasks.task_statuses(),
-                self.theme.clone(),
-                self.config.keymap.dependencies(),
-            ));
         }
     }
 
@@ -694,7 +695,6 @@ impl Component for App {
                     self.started = true;
                     if self.config.block.is_some() && self.config.yes {
                         if let Some(id) = self.menu.selected() {
-                            self.build_inline_graph(id);
                             return self.execute(id);
                         }
                     } else if self.config.all {
@@ -717,8 +717,8 @@ impl Component for App {
                 if let Some(dependencies) = &mut self.deps {
                     dependencies.tick(statuses.clone());
                 }
-                if let Some(inline) = &mut self.graph_inline {
-                    inline.tick(statuses);
+                if let Some(graph) = &mut self.workflow_graph {
+                    graph.tick(statuses);
                 }
 
                 // Clear expired flash notification.
@@ -762,17 +762,19 @@ impl App {
                         None
                     } else {
                         self.auto_input_paused = false;
-                        self.build_inline_graph(id);
                         self.execute(id)
                     }
                 } else {
                     None
                 }
             }
-            Action::Quit => {
-                if self.graph_inline.take().is_some() {
-                    return None;
+            Action::ToggleWorkflowGraph => {
+                if self.workflow_graph.is_some() {
+                    self.workflow_graph_visible = !self.workflow_graph_visible;
                 }
+                None
+            }
+            Action::Quit => {
                 self.confirm = Some(confirm::Confirm::quit(
                     self.theme.clone(),
                     self.config.keymap.confirm(),
@@ -1142,7 +1144,7 @@ impl App {
         if let Some(deps) = &mut self.deps {
             deps.set_theme(&theme);
         }
-        if let Some(graph) = &mut self.graph_inline {
+        if let Some(graph) = &mut self.workflow_graph {
             graph.set_theme(&theme);
         }
         self.envs.set_theme(&theme);
@@ -1554,7 +1556,8 @@ impl App {
         );
         self.workflow = None;
         self.deps = None;
-        self.graph_inline = None;
+        self.workflow_graph = None;
+        self.workflow_graph_visible = false;
         self.pending_states.clear();
         self.started = false;
 
@@ -1817,7 +1820,11 @@ impl Output for App {
         let mut layout = self.layout.borrow_mut();
         layout.update(area, self.menu_width(area.width));
 
-        let (preview_area, graph_area) = if let Some(ref deps) = self.graph_inline {
+        let workflow_graph = self
+            .workflow_graph
+            .as_ref()
+            .filter(|_| self.workflow_graph_visible);
+        let (preview_area, graph_area) = if let Some(deps) = workflow_graph {
             let graph_rows = deps
                 .graph_rows()
                 .min(layout.preview.height.saturating_sub(2));
@@ -1834,7 +1841,7 @@ impl Output for App {
             (layout.preview, None)
         };
         self.preview.render(frame, preview_area);
-        if let (Some(deps), Some(graph_area)) = (&self.graph_inline, graph_area) {
+        if let (Some(deps), Some(graph_area)) = (workflow_graph, graph_area) {
             let block = self
                 .theme
                 .block()
@@ -1999,6 +2006,7 @@ impl App {
     fn keymap_footer_with(&self, extra: impl Fn(&Action) -> bool) -> ratatui::text::Line<'static> {
         let shortcuts = self.theme.keymap_shortcuts(&self.keymap.items, |action| {
             extra(action)
+                || (*action == Action::ToggleWorkflowGraph && self.workflow_graph.is_some())
                 || matches!(
                     action,
                     Action::Execute
@@ -2175,18 +2183,20 @@ mod tests {
             true,
             Some("setup"),
         );
-        app.graph_inline = Some(dependencies::Dependencies::for_target(
+        app.workflow_graph = Some(dependencies::Dependencies::for_target(
             app.preview.codes(),
             Some(2),
             HashMap::new(),
             app.theme.clone(),
             app.config.keymap.dependencies(),
         ));
+        app.workflow_graph_visible = true;
 
         app.reload();
 
         assert!(app.workflow.is_none());
-        assert!(app.graph_inline.is_none());
+        assert!(app.workflow_graph.is_none());
+        assert!(!app.workflow_graph_visible);
         assert!(!app.started);
         assert_eq!(app.menu.selected(), Some(2));
     }
@@ -2263,13 +2273,14 @@ mod tests {
             },
         )
         .unwrap();
-        app.graph_inline = Some(dependencies::Dependencies::for_target(
+        app.workflow_graph = Some(dependencies::Dependencies::for_target(
             app.preview.codes(),
             Some(3),
             HashMap::new(),
             app.theme.clone(),
             app.config.keymap.dependencies(),
         ));
+        app.workflow_graph_visible = true;
 
         let backend = ratatui::backend::TestBackend::new(80, 24);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
@@ -2278,7 +2289,7 @@ mod tests {
             .unwrap();
 
         let buffer = terminal.backend().buffer();
-        let mut rows: Vec<String> = (0..buffer.area.height)
+        let rows: Vec<String> = (0..buffer.area.height)
             .map(|y| {
                 (0..buffer.area.width)
                     .map(|x| buffer[(x, y)].symbol())

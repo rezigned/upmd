@@ -94,6 +94,12 @@ help = "deps"
 keys = [";"]
 symbol = ";"
 
+[keymap.home.ToggleWorkflowGraph]
+description = "Toggle the inline workflow dependency graph"
+help = "graph"
+keys = ["'"]
+symbol = "'"
+
 [keymap.home.SwitchTheme]
 description = "Switch theme"
 help = "theme"

@@ -1,7 +1,7 @@
 # Tasks
 
-Common development commands. Run any block with `upmd tasks.md` and press Enter
-on it, or use `upmd --cli tasks.md --block <name> --yes`.
+Common development commands. Run any block with `upmd` (auto-opens this file)
+and press Enter on it, or use `upmd --cli up.md --block <name> --yes`.
 
 ## Build
 
