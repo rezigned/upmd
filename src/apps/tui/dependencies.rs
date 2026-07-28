@@ -554,8 +554,144 @@ mod tests {
 
     #[test]
     fn snapshot_mixed_top_target() {
-        let src = std::fs::read_to_string("deps-test.md").unwrap();
-        let codes = upmd_parser::new().parse(&src).codes;
+        let codes = upmd_parser::new()
+            .parse(
+                "\
+# Deps Graph Test
+
+## Simple chain
+
+```sh [name:leaf]
+sleep 0.5 && echo leaf
+```
+
+```sh [name:mid, deps:leaf]
+sleep 0.5 && echo mid
+```
+
+```sh [name:chain-top, deps:mid]
+sleep 0.5 && echo top
+```
+
+## Fan-in from chain + parallel
+
+```sh [name:x-dep]
+sleep 0.5 && echo x
+```
+
+```sh [name:y-dep, deps:x-dep]
+sleep 0.5 && echo y
+```
+
+```sh [name:a-dep]
+sleep 0.5 && echo a
+```
+
+```sh [name:b-dep]
+sleep 0.5 && echo b
+```
+
+```sh [name:z-dep, deps:\"y-dep, a-dep, b-dep\"]
+sleep 0.5 && echo z
+```
+
+## Multi-level parallel groups
+
+```sh [name:p-one]
+sleep 0.5 && echo 1
+```
+
+```sh [name:p-two]
+sleep 0.5 && echo 2
+```
+
+```sh [name:p-three]
+sleep 0.5 && echo 3
+```
+
+```sh [name:p-four]
+sleep 0.5 && echo 4
+```
+
+```sh [name:p-five]
+sleep 0.5 && echo 5
+```
+
+```sh [name:p-six, deps:\"p-one | p-two, p-three | p-four, p-five\"]
+sleep 0.5 && echo six
+```
+
+## Deep transitive chain
+
+```sh [name:d-base]
+sleep 0.5 && echo base
+```
+
+```sh [name:d-step1, deps:d-base]
+sleep 0.5 && echo step1
+```
+
+```sh [name:d-step2, deps:d-step1]
+sleep 0.5 && echo step2
+```
+
+```sh [name:d-step3, deps:d-step2]
+sleep 0.5 && echo step3
+```
+
+```sh [name:d-step4, deps:d-step3]
+sleep 0.5 && echo step4
+```
+
+## Mixed: chain + parallel
+
+```sh [name:m-dep-a]
+sleep 0.5 && echo a
+```
+
+```sh [name:m-dep-b]
+sleep 0.5 && echo b
+```
+
+```sh [name:m-stage1, deps:\"m-dep-a, m-dep-b\"]
+sleep 0.5 && echo stage1
+```
+
+```sh [name:m-stage2, deps:m-stage1]
+sleep 0.5 && echo stage2
+```
+
+```sh [name:m-side-x]
+sleep 0.5 && echo x
+```
+
+```sh [name:m-side-y]
+sleep 0.5 && echo y
+```
+
+```sh [name:mixed-top, deps:\"m-stage2, m-side-x | m-side-y\"]
+sleep 0.5 && echo top
+```
+
+## Diamond
+
+```sh [name:seed]
+sleep 0.5 && echo seed
+```
+
+```sh [name:fork-l, deps:seed]
+sleep 0.5 && echo left
+```
+
+```sh [name:fork-r, deps:seed]
+sleep 0.5 && echo right
+```
+
+```sh [name:diamond-join, deps:\"fork-l | fork-r\"]
+sleep 0.5 && echo join
+```",
+            )
+            .codes;
         let deps = Dependencies::for_target(
             &codes,
             Some(26),

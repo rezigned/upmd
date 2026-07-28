@@ -1,7 +1,7 @@
 [package]
 name = "upmd"
-description = "Run code blocks directly from Markdown in a real terminal, keeping commands, context, and output together"
-version = "0.1.1"
+description = "Run tasks and dependency-aware workflows from Markdown in a real terminal"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.82"
 repository = "https://github.com/rezigned/upmd"

@@ -15,7 +15,7 @@ cargo build --release
 
 ## Test
 
-```sh [name:test, deps:"build"]
+```sh [name:test, deps:build]
 cargo test
 ```
 

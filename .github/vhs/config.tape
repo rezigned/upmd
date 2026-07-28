@@ -4,8 +4,8 @@ Set Shell "zsh"
 
 # Fonts
 Set FontFamily "Ioskeley Mono Term"
-Set FontSize 22
-Set LineHeight 1.3
+Set FontSize 21
+Set LineHeight 1.2
 
 Set Width 1200
 Set Height 900
