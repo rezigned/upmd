@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 
-use crate::apps::tui::markdown::ViewLine;
+use crate::apps::tui::markdown::LogicalLine;
 
 use super::visual_lines::VisualLine;
 
@@ -36,7 +36,7 @@ impl PreviewSearch {
         };
     }
 
-    pub fn rebuild_texts(&self, logical_lines: &[ViewLine]) {
+    pub fn rebuild_texts(&self, logical_lines: &[LogicalLine]) {
         *self.logical_texts.borrow_mut() = logical_lines
             .iter()
             .map(|ll| ll.text_content().to_lowercase())

@@ -1,0 +1,10 @@
+---
+source: src/apps/tui/preview/mod.rs
+assertion_line: 1205
+expression: full_preview_text(&preview)
+---
+above
+
+────────────────────────────────────────────────────────
+
+below

@@ -262,8 +262,8 @@ impl SelectionState {
     /// `area` is the widget's `Rect`.  `content_offset` is the number of columns
     /// from the left edge of `area` to the start of the text (borders + padding).
     /// `line_at_row` is called with a visual row index and must return the
-    /// corresponding global line index and the `Line` at that position.
-    pub fn mouse_to_position<'a, F>(
+    /// corresponding global line index and rendered `Line`.
+    pub fn mouse_to_position<F>(
         area: Rect,
         mouse_row: u16,
         mouse_col: u16,
@@ -271,7 +271,7 @@ impl SelectionState {
         mut line_at_row: F,
     ) -> Option<(usize, usize)>
     where
-        F: FnMut(usize) -> Option<(usize, &'a Line<'static>)>,
+        F: FnMut(usize) -> Option<(usize, Line<'static>)>,
     {
         if area.width == 0 {
             return None;
@@ -294,7 +294,7 @@ impl SelectionState {
         let target_col = mouse_col.saturating_sub(content_x) as usize;
 
         let (global_line_idx, line) = line_at_row(rel_row)?;
-        let char_offset = Self::char_offset_from_col(line, target_col);
+        let char_offset = Self::char_offset_from_col(&line, target_col);
 
         Some((global_line_idx, char_offset))
     }

@@ -1,0 +1,11 @@
+---
+source: src/apps/tui/preview/mod.rs
+assertion_line: 1198
+expression: full_preview_text(&preview)
+---
+┌───────┬─────┐
+│ Name  │ Age │
+├───────┼─────┤
+│ Alice │ 30  │
+│ Bob   │ 25  │
+└───────┴─────┘

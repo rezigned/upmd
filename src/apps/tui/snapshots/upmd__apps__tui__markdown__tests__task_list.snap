@@ -1,7 +1,7 @@
 ---
 source: src/apps/tui/markdown.rs
 assertion_line: 1451
-expression: viewline_summary(&lines)
+expression: logical_line_summary(&lines)
 ---
  0: [ListItem] unchecked
  1: [ListItem] checked

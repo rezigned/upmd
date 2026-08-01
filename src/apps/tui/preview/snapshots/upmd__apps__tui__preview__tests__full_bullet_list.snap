@@ -1,0 +1,8 @@
+---
+source: src/apps/tui/preview/mod.rs
+assertion_line: 1177
+expression: full_preview_text(&preview)
+---
+• item one
+• item two
+• item three
