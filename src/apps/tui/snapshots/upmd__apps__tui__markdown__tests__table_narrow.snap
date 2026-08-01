@@ -3,9 +3,9 @@ source: src/apps/tui/markdown.rs
 assertion_line: 1631
 expression: "summary.join(\"\\n\")"
 ---
-┌───────┬─────┬─────────┐
-│ Name  │ Age │ City    │
-├───────┼─────┼─────────┤
-│ Alice │ 30  │ New Yo… │
-│ Bob   │ 25  │ London  │
-└───────┴─────┴─────────┘
+┌──────┬─────┬──────┐
+│ Name │ Age │ City │
+├──────┼─────┼──────┤
+│ Ali… │ 30  │ New… │
+│ Bob  │ 25  │ Lon… │
+└──────┴─────┴──────┘

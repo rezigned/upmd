@@ -212,7 +212,8 @@ impl Preview {
                 continue;
             };
             while let Some(old) = old_raw_iter.peek() {
-                if text.text == old.text && text.language == old.language {
+                if text.text == old.text && text.language == old.language && text.spans == old.spans
+                {
                     if let Some(old) = old_raw_iter.next() {
                         text.cached = old.cached;
                     }
@@ -1024,15 +1025,15 @@ impl Output for Preview {
             viewport_width: width,
         };
 
-        let highlight_start = original_offset.saturating_sub(viewport);
-        let highlight_end = original_offset
+        let render_start = original_offset.saturating_sub(viewport);
+        let render_end = original_offset
             .saturating_add(viewport.saturating_mul(2))
             .min(visual_lines.len());
         let mut warmed = HashSet::new();
         let mut cache_misses = 0;
-        for visual_line in &visual_lines[highlight_start..highlight_end] {
+        for visual_line in &visual_lines[render_start..render_end] {
             if warmed.insert(visual_line.logical_idx)
-                && self.logical_lines[visual_line.logical_idx].ensure_highlighted(&ctx)
+                && self.logical_lines[visual_line.logical_idx].ensure_rendered(&ctx)
             {
                 cache_misses += 1;
             }
@@ -1078,7 +1079,7 @@ impl Output for Preview {
                 visual_rows = window.len(),
                 logical_lines = warmed.len(),
                 cache_misses,
-                "populated viewport syntax cache"
+                "populated viewport content cache"
             );
         }
         drop(visual_lines);
@@ -1103,6 +1104,7 @@ impl Output for Preview {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::apps::tui::testutil::ansi_line_summary;
     use insta::assert_snapshot;
     use std::collections::HashMap;
     use upmd_parser::Parser;
@@ -1137,7 +1139,7 @@ mod tests {
             .visual_lines
             .borrow()
             .iter()
-            .map(|vl| render_visual_line(preview, &vl, &ctx).to_string())
+            .map(|vl| render_visual_line(preview, vl, &ctx).to_string())
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -1213,6 +1215,45 @@ mod tests {
         );
         preview.rebuild_visual_lines(40);
         assert_snapshot!("full_mixed_runbook", full_preview_text(&preview));
+    }
+
+    #[test]
+    fn snapshot_full_inline_styles() {
+        let preview = preview_from_markdown(
+            "**bold** *italic* ~~strike~~ `code` [link](https://example.com)\n\
+             \n\
+             ## Heading with **bold**\n\
+             \n\
+             - **bold item**\n\
+             - *italic item*",
+        );
+        preview.rebuild_visual_lines(60);
+        assert_snapshot!("full_inline_styles", full_preview_text(&preview));
+    }
+
+    #[test]
+    fn wrapped_inline_styles_preserve_nested_modifiers() {
+        let preview = preview_from_markdown(
+            "start **[abcdefghijklmnopqrstuvwxyz](https://example.com)** end",
+        );
+        preview.rebuild_visual_lines(12);
+        let ctx = RenderContext {
+            theme: &preview.theme,
+            active_code_id: None,
+            prefer_status_gutter: None,
+            spinner_char: ' ',
+            viewport_width: preview.visual_lines.last_width(),
+        };
+        let rows: Vec<_> = preview
+            .visual_lines
+            .borrow()
+            .iter()
+            .map(|visual_line| render_visual_line(&preview, visual_line, &ctx))
+            .collect();
+        assert_snapshot!(
+            "wrapped_inline_styles_nested_modifiers",
+            ansi_line_summary(&rows)
+        );
     }
 
     #[test]

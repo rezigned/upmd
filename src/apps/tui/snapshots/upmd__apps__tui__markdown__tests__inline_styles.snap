@@ -1,0 +1,11 @@
+---
+source: src/apps/tui/markdown.rs
+assertion_line: 1821
+expression: logical_line_summary(&lines)
+---
+ 0: [Text] bold italic strike `code` link alt text
+ 1: [Newline] 
+ 2: [Heading(2)] ## Heading with bold
+ 3: [ListItem] bold item
+ 4: [ListItem] italic item
+ 5: [Newline]

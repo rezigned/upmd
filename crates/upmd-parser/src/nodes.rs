@@ -3,14 +3,45 @@ use std::ops::Range;
 
 #[derive(Debug, Clone)]
 pub enum Node {
-    Heading { level: u8, text: String },
-    Paragraph(String),
+    Heading { level: u8, text: Vec<InlineSpan> },
+    Paragraph(Vec<InlineSpan>),
     BlockQuote(Vec<Node>),
     List(Vec<ListItem>),
     Code(CodeId),
     Table(Table),
-    Text(String),
+    Text(Vec<InlineSpan>),
     ThematicBreak,
+}
+
+/// A run of inline text with the formatting applied to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InlineSpan {
+    pub text: String,
+    /// Active styles for this run. Empty means plain text; styles nest in
+    /// source order (e.g. bold inside italic becomes `[Italic, Bold]`).
+    pub style: Vec<InlineStyle>,
+}
+
+/// Inline markdown formatting applied to a [`InlineSpan`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InlineStyle {
+    Bold,
+    Italic,
+    Strikethrough,
+    InlineCode,
+    Link {
+        destination: String,
+        title: Option<String>,
+    },
+    Image {
+        alt: String,
+        src: String,
+    },
+}
+
+/// Concatenates span text into a single plain string (for search, copy, menus).
+pub fn inline_text(spans: &[InlineSpan]) -> String {
+    spans.iter().map(|s| s.text.as_str()).collect()
 }
 
 /// Heading metadata collected during parsing.
@@ -42,14 +73,32 @@ pub enum ListKind {
 pub struct ListItem {
     pub depth: usize,
     pub kind: ListKind,
-    pub text: String,
+    pub text: Vec<InlineSpan>,
     pub children: Vec<Node>,
 }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableCell {
+    pub spans: Vec<InlineSpan>,
+}
+
+impl TableCell {
+    pub fn text(&self) -> String {
+        inline_text(&self.spans)
+    }
+
+    pub fn char_len(&self) -> usize {
+        self.spans
+            .iter()
+            .map(|span| span.text.chars().count())
+            .sum()
+    }
+}
+
 /// Markdown table with headers, rows, and column alignments.
 #[derive(Debug, Clone)]
 pub struct Table {
-    pub headers: Vec<String>,
-    pub rows: Vec<Vec<String>>,
+    pub headers: Vec<TableCell>,
+    pub rows: Vec<Vec<TableCell>>,
     pub alignments: Vec<Alignment>,
 }
 

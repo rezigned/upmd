@@ -1,0 +1,5 @@
+---
+source: src/apps/tui/markdown.rs
+expression: ansi_line(&rendered)
+---
+[38;2;192;197;206m• [38;2;192;197;206m[1mbold item[0m

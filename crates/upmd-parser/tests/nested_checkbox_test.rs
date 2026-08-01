@@ -1,3 +1,4 @@
+use upmd_parser::nodes::inline_text;
 use upmd_parser::Parser;
 
 #[test]
@@ -20,7 +21,10 @@ fn test_nested_checkbox_parsing() {
             for (i, item) in items.iter().enumerate() {
                 eprintln!(
                     "[{}] depth={} kind={:?} text={:?}",
-                    i, item.depth, item.kind, item.text
+                    i,
+                    item.depth,
+                    item.kind,
+                    inline_text(&item.text)
                 );
             }
 
@@ -33,20 +37,24 @@ fn test_nested_checkbox_parsing() {
                 non_task.is_empty(),
                 "Expected all items to be Task kind, got {} non-task items: {:?}",
                 non_task.len(),
-                non_task.iter().map(|i| &i.text).collect::<Vec<_>>()
+                non_task
+                    .iter()
+                    .map(|i| inline_text(&i.text))
+                    .collect::<Vec<_>>()
             );
 
             // Parent items must NOT contain nested list source in their text
             for item in items.iter().filter(|i| i.depth == 1) {
+                let text = inline_text(&item.text);
                 assert!(
-                    !item.text.contains("- [x]"),
+                    !text.contains("- [x]"),
                     "depth-1 item '{}' should not contain nested checkbox source text",
-                    item.text
+                    text
                 );
                 assert!(
-                    !item.text.contains("- [ ]"),
+                    !text.contains("- [ ]"),
                     "depth-1 item '{}' should not contain nested checkbox source text",
-                    item.text
+                    text
                 );
             }
 

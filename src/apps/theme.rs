@@ -83,6 +83,13 @@ pub fn ansi_style(style: Style) -> String {
     out
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct MarkdownStyles {
+    text: Style,
+    heading_marker: Style,
+    heading: Style,
+}
+
 /// The current theme.
 #[derive(Debug, Clone)]
 pub struct Theme {
@@ -100,6 +107,7 @@ pub struct Theme {
     pub logo: Color,
     pub muted: Color,
     pub warning: Color,
+    markdown: MarkdownStyles,
 }
 
 impl Default for Theme {
@@ -119,6 +127,7 @@ impl Default for Theme {
             logo: Color::Reset,
             muted: Color::Reset,
             warning: Color::Reset,
+            markdown: MarkdownStyles::default(),
         }
     }
 }
@@ -142,6 +151,12 @@ impl Theme {
         let info_background = calculate_info_background(Some(&code_background));
         let info_foreground = calculate_info_foreground(info_background);
         let warning = to_color(find_warning_color(theme).or_else(|| find_active_color(theme)));
+        let fallback_markdown = Style::default().fg(foreground);
+        let markdown = syntect_markdown_styles(theme).unwrap_or(MarkdownStyles {
+            text: fallback_markdown,
+            heading_marker: fallback_markdown,
+            heading: fallback_markdown,
+        });
 
         Self {
             name: name.into(),
@@ -158,6 +173,7 @@ impl Theme {
             error: to_color(find_error_color(theme)),
             muted,
             warning,
+            markdown,
         }
     }
 
@@ -167,6 +183,21 @@ impl Theme {
 
     pub fn style(&self) -> Style {
         Style::default().fg(self.foreground)
+    }
+
+    /// Style Syntect assigns to ordinary Markdown text in this theme.
+    pub fn markdown_text_style(&self) -> Style {
+        self.markdown.text
+    }
+
+    /// Style Syntect assigns to the `#` marker of a Markdown heading.
+    pub fn markdown_heading_marker_style(&self) -> Style {
+        self.markdown.heading_marker
+    }
+
+    /// Style Syntect assigns to Markdown heading text in this theme.
+    pub fn markdown_heading_style(&self) -> Style {
+        self.markdown.heading
     }
 
     /// The base style for the entire application, including the background color.
@@ -240,6 +271,25 @@ impl Theme {
 
     pub fn warning_fg_style(&self) -> Style {
         Style::default().fg(self.warning)
+    }
+
+    /// Style for inline code runs inside markdown text.
+    pub fn inline_code_style(&self) -> Style {
+        Style::default().fg(self.active).bg(self.code_background)
+    }
+
+    /// Style for inline links in markdown text.
+    pub fn link_style(&self) -> Style {
+        Style::default()
+            .fg(self.accent)
+            .add_modifier(Modifier::UNDERLINED)
+    }
+
+    /// Style for inline images (rendered as their alt text) in markdown text.
+    pub fn image_style(&self) -> Style {
+        Style::default()
+            .fg(self.muted)
+            .add_modifier(Modifier::ITALIC)
     }
 
     /// Alias for task-running color.
@@ -393,6 +443,41 @@ fn syntect_style_to_ratatui(style: syn::Style) -> Style {
         out = out.add_modifier(Modifier::UNDERLINED);
     }
     out
+}
+
+/// Resolves ordinary text, heading markers, and heading text with one Syntect
+/// highlighter so all Markdown base styles come from the same parser pass.
+fn syntect_markdown_styles(theme: &syn::Theme) -> Option<MarkdownStyles> {
+    const HEADING: &str = "upmd-heading";
+    const PARAGRAPH: &str = "upmd-paragraph";
+
+    let source = format!("# {HEADING}\n{PARAGRAPH}\n");
+    let syntax = find_syntax_or_default("markdown", &source);
+    let mut highlighter = HighlightLines::new(syntax, theme);
+
+    let mut heading_marker = None;
+    let mut heading = None;
+    let mut text = None;
+
+    for line in LinesWithEndings::from(&source) {
+        for (style, value) in highlighter.highlight_line(line, &SYNTAX).ok()? {
+            if value.contains('#') {
+                heading_marker = Some(syntect_style_to_ratatui(style));
+            }
+            if value.contains(HEADING) {
+                heading = Some(syntect_style_to_ratatui(style));
+            }
+            if value.contains(PARAGRAPH) {
+                text = Some(syntect_style_to_ratatui(style));
+            }
+        }
+    }
+
+    Some(MarkdownStyles {
+        text: text?,
+        heading_marker: heading_marker?,
+        heading: heading?,
+    })
 }
 
 /// Finds syntax by name or its content.

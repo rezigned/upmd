@@ -3,7 +3,10 @@ use pulldown_cmark::{
     Parser as CmarkParser, Tag, TagEnd,
 };
 
-use super::nodes::{Alignment, Codes, ListItem, ListKind, Node, Table, TaskStatus};
+use super::nodes::{
+    inline_text, Alignment, Codes, InlineSpan, InlineStyle, ListItem, ListKind, Node, Table,
+    TableCell, TaskStatus,
+};
 use super::options;
 
 pub struct Cmark;
@@ -24,7 +27,8 @@ impl Cmark {
 
 impl super::Parser for Cmark {
     fn parse(&self, text: &str) -> super::Document {
-        let options = Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS;
+        let options =
+            Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS | Options::ENABLE_STRIKETHROUGH;
         let parser = CmarkParser::new_ext(text, options).into_offset_iter();
         let line_starts = line_starts(text);
         let mut p = Parser {
@@ -107,8 +111,11 @@ impl<'a> Parser<'a> {
                 Event::Rule => {
                     nodes.push(Node::ThematicBreak);
                 }
-                Event::Text(t) | Event::Code(t) => {
-                    nodes.push(Node::Text(t.into_string()));
+                Event::Text(t) => {
+                    nodes.push(Node::Text(vec![text_span(t.into_string(), &[])]));
+                }
+                Event::Code(t) => {
+                    nodes.push(Node::Text(vec![code_span(&t, &[])]));
                 }
                 _ => {}
             }
@@ -119,11 +126,8 @@ impl<'a> Parser<'a> {
     // Paragraph
 
     fn parse_paragraph(&mut self) -> Node {
-        let text = self
-            .parse_inline_content(TagEnd::Paragraph)
-            .trim()
-            .to_string();
-        Node::Paragraph(text)
+        let spans = self.parse_inline_content(TagEnd::Paragraph);
+        Node::Paragraph(trim_spans(spans))
     }
 
     // Heading
@@ -137,16 +141,10 @@ impl<'a> Parser<'a> {
             HeadingLevel::H5 => 5,
             HeadingLevel::H6 => 6,
         };
-        let mut text = String::new();
-        loop {
-            match self.iter.next() {
-                Some((Event::End(TagEnd::Heading(_)), _)) => break,
-                Some((Event::Text(t) | Event::Code(t), _)) => text.push_str(&t),
-                None => break,
-                _ => {}
-            }
-        }
+        let spans = self.parse_inline_content(TagEnd::Heading(level));
+        let text = inline_text(&spans);
         let text = text.trim().to_string();
+        let spans = trim_spans(spans);
         self.headings.push(super::Heading {
             level: heading_level,
             text: text.clone(),
@@ -156,7 +154,7 @@ impl<'a> Parser<'a> {
         });
         Node::Heading {
             level: heading_level,
-            text,
+            text: spans,
         }
     }
 
@@ -198,24 +196,16 @@ impl<'a> Parser<'a> {
             match self.iter.next() {
                 Some((Event::End(TagEnd::Table), _)) => break,
                 Some((Event::Start(Tag::TableCell), _)) => {
+                    let cell = TableCell {
+                        spans: trim_spans(self.parse_inline_content(TagEnd::TableCell)),
+                    };
                     if in_header {
-                        headers.push(String::new());
+                        headers.push(cell);
                     } else {
                         while rows.len() <= row_idx {
                             rows.push(Vec::new());
                         }
-                        rows[row_idx].push(String::new());
-                    }
-                }
-                Some((Event::Text(t) | Event::Code(t), _)) => {
-                    if in_header {
-                        if let Some(cell) = headers.last_mut() {
-                            cell.push_str(&t);
-                        }
-                    } else if let Some(row) = rows.get_mut(row_idx) {
-                        if let Some(cell) = row.last_mut() {
-                            cell.push_str(&t);
-                        }
+                        rows[row_idx].push(cell);
                     }
                 }
                 Some((Event::End(TagEnd::TableHead), _)) => in_header = false,
@@ -261,53 +251,49 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_list_item(&mut self, depth: usize, index: usize, start_num: Option<u64>) -> ListItem {
-        let mut text = String::new();
+        let mut spans = Vec::new();
+        let mut stack = Vec::new();
         let mut children = Vec::new();
         let mut task_kind: Option<ListKind> = None;
 
-        loop {
-            match self.iter.next() {
-                Some((Event::End(TagEnd::Item), _)) => break,
-                Some((Event::TaskListMarker(checked), _)) => {
+        while let Some((event, range)) = self.iter.next() {
+            let Some(event) = self.consume_inline_event(event, &mut stack, &mut spans) else {
+                continue;
+            };
+
+            match event {
+                Event::End(TagEnd::Item) => break,
+                Event::TaskListMarker(checked) => {
                     task_kind = Some(ListKind::Task(if checked {
                         TaskStatus::Checked
                     } else {
                         TaskStatus::Unchecked
                     }));
                 }
-                Some((Event::Text(t), _)) => text.push_str(&t),
-                Some((Event::Code(t), _)) => {
-                    text.push('`');
-                    text.push_str(&t);
-                    text.push('`');
-                }
-                Some((Event::SoftBreak | Event::HardBreak, _)) => text.push('\n'),
-                Some((Event::Start(Tag::CodeBlock(kind)), _)) => {
+                Event::Start(Tag::CodeBlock(kind)) => {
                     if let Some(node) = self.parse_code_block(kind) {
                         children.push(node);
                     }
                 }
-                Some((Event::Start(Tag::List(start)), _)) => {
+                Event::Start(Tag::List(start)) => {
                     children.push(Node::List(self.parse_list(depth + 1, start)));
                 }
-                Some((Event::Start(Tag::BlockQuote(_)), _)) => {
+                Event::Start(Tag::BlockQuote(_)) => {
                     children.push(Node::BlockQuote(
                         self.parse_blocks(Some(TagEnd::BlockQuote(None))),
                     ));
                 }
-                Some((Event::Start(Tag::Table(alignments)), _)) => {
+                Event::Start(Tag::Table(alignments)) => {
                     children.push(self.parse_table(&alignments));
                 }
-                Some((Event::Start(Tag::Heading { level, .. }), range)) => {
+                Event::Start(Tag::Heading { level, .. }) => {
                     children.push(self.parse_heading(level, range));
                 }
-                Some((Event::Start(Tag::Paragraph), _)) => {}
-                None => break,
+                Event::Start(Tag::Paragraph) => {}
                 _ => {}
             }
         }
 
-        let raw = text.trim();
         let kind = if let Some(tk) = task_kind {
             tk
         } else if let Some(start) = start_num {
@@ -319,35 +305,177 @@ impl<'a> Parser<'a> {
         ListItem {
             depth,
             kind,
-            text: raw.to_string(),
+            text: trim_spans(spans),
             children,
         }
     }
 
     // Shared inline content parser
     //
-    // InlineContent ::= (Text | Code | Break)*
+    // InlineContent ::= (Text | Code | Break | Emphasis | Strong | Strike
+    //                    | Link | Image)*
 
-    /// Consumes events until `stop`, producing a single text string.
-    /// Inline code is wrapped in backticks; soft/hard breaks become newlines.
-    fn parse_inline_content(&mut self, stop: TagEnd) -> String {
-        let mut text = String::new();
-        loop {
-            match self.iter.next() {
-                Some((Event::End(tag), _)) if tag == stop => break,
-                Some((Event::Text(t), _)) => text.push_str(&t),
-                Some((Event::Code(t), _)) => {
-                    text.push('`');
-                    text.push_str(&t);
-                    text.push('`');
-                }
-                Some((Event::SoftBreak | Event::HardBreak, _)) => text.push('\n'),
-                None => break,
-                _ => {}
+    /// Consumes events until `stop`, producing styled inline spans.
+    fn parse_inline_content(&mut self, stop: TagEnd) -> Vec<InlineSpan> {
+        let mut spans = Vec::new();
+        let mut stack = Vec::new();
+        self.parse_inline_until(stop, &mut stack, &mut spans);
+        spans
+    }
+
+    /// Consumes one inline event, returning block/container events to the caller.
+    fn consume_inline_event(
+        &mut self,
+        event: Event<'a>,
+        stack: &mut Vec<InlineStyle>,
+        out: &mut Vec<InlineSpan>,
+    ) -> Option<Event<'a>> {
+        match event {
+            Event::Text(text) => out.push(text_span(text.into_string(), stack)),
+            Event::Code(code) => out.push(code_span(&code, stack)),
+            Event::SoftBreak | Event::HardBreak => out.push(break_span(stack)),
+            Event::Start(Tag::Emphasis) => {
+                self.parse_styled_until(InlineStyle::Italic, TagEnd::Emphasis, stack, out);
+            }
+            Event::Start(Tag::Strong) => {
+                self.parse_styled_until(InlineStyle::Bold, TagEnd::Strong, stack, out);
+            }
+            Event::Start(Tag::Strikethrough) => {
+                self.parse_styled_until(
+                    InlineStyle::Strikethrough,
+                    TagEnd::Strikethrough,
+                    stack,
+                    out,
+                );
+            }
+            Event::Start(Tag::Link {
+                dest_url, title, ..
+            }) => {
+                let title = (!title.is_empty()).then(|| title.to_string());
+                self.parse_styled_until(
+                    InlineStyle::Link {
+                        destination: dest_url.to_string(),
+                        title,
+                    },
+                    TagEnd::Link,
+                    stack,
+                    out,
+                );
+            }
+            Event::Start(Tag::Image { dest_url, .. }) => {
+                self.push_image(&dest_url, stack, out);
+            }
+            event => return Some(event),
+        }
+        None
+    }
+
+    /// Parses nested inline content while `style` is active.
+    fn parse_styled_until(
+        &mut self,
+        style: InlineStyle,
+        stop: TagEnd,
+        stack: &mut Vec<InlineStyle>,
+        out: &mut Vec<InlineSpan>,
+    ) {
+        stack.push(style);
+        self.parse_inline_until(stop, stack, out);
+        stack.pop();
+    }
+
+    /// Appends inline spans until `stop`, tracking the active style stack.
+    fn parse_inline_until(
+        &mut self,
+        stop: TagEnd,
+        stack: &mut Vec<InlineStyle>,
+        out: &mut Vec<InlineSpan>,
+    ) {
+        while let Some((event, _)) = self.iter.next() {
+            if matches!(&event, Event::End(tag) if tag == &stop) {
+                break;
+            }
+            let _ = self.consume_inline_event(event, stack, out);
+        }
+    }
+
+    /// Captures an image's alt text (its inner content) as a styled span.
+    fn push_image(
+        &mut self,
+        dest_url: &str,
+        stack: &mut Vec<InlineStyle>,
+        out: &mut Vec<InlineSpan>,
+    ) {
+        let start = out.len();
+        stack.push(InlineStyle::Image {
+            alt: String::new(),
+            src: dest_url.to_string(),
+        });
+        self.parse_inline_until(TagEnd::Image, stack, out);
+        stack.pop();
+        let alt = inline_text(&out[start..]);
+        for span in &mut out[start..] {
+            if let Some(InlineStyle::Image { alt: a, .. }) = span
+                .style
+                .iter_mut()
+                .find(|s| matches!(s, InlineStyle::Image { .. }))
+            {
+                *a = alt.clone();
             }
         }
-        text
     }
+}
+
+/// Builds a plain inline span carrying the active style stack.
+fn text_span(text: String, stack: &[InlineStyle]) -> InlineSpan {
+    InlineSpan {
+        text,
+        style: stack.to_vec(),
+    }
+}
+
+/// Builds an inline-code span, wrapping the code in backticks.
+fn code_span(code: &str, stack: &[InlineStyle]) -> InlineSpan {
+    let mut style = stack.to_vec();
+    style.push(InlineStyle::InlineCode);
+    InlineSpan {
+        text: format!("`{}`", code),
+        style,
+    }
+}
+
+/// Builds a span for a soft/hard break.
+fn break_span(stack: &[InlineStyle]) -> InlineSpan {
+    InlineSpan {
+        text: "\n".into(),
+        style: stack.to_vec(),
+    }
+}
+
+/// Characters [`trim_spans`] removes from the edges of inline content.
+const TRIM_CHARS: [char; 3] = [' ', '\t', '\n'];
+
+/// Removes leading/trailing whitespace from the first/last span and drops any
+/// spans that become empty as a result.
+fn trim_spans(mut spans: Vec<InlineSpan>) -> Vec<InlineSpan> {
+    let start = spans
+        .iter()
+        .position(|s| !s.text.trim_start_matches(TRIM_CHARS).is_empty())
+        .unwrap_or(spans.len());
+    let end = spans
+        .iter()
+        .rposition(|s| !s.text.trim_end_matches(TRIM_CHARS).is_empty())
+        .map_or(start, |i| i + 1);
+
+    spans.drain(end..);
+    spans.drain(..start);
+
+    if let Some(s) = spans.first_mut() {
+        s.text = s.text.trim_start_matches(TRIM_CHARS).to_string();
+    }
+    if let Some(s) = spans.last_mut() {
+        s.text = s.text.trim_end_matches(TRIM_CHARS).to_string();
+    }
+    spans
 }
 
 // Tests
@@ -483,7 +611,8 @@ mod tests {
                 Node::List(items) => {
                     for &(idx, expected_text, ref expected_kind) in &expected_checks {
                         assert_eq!(
-                            items[idx].text, expected_text,
+                            inline_text(&items[idx].text),
+                            expected_text,
                             "item {idx}, input: {input:?}"
                         );
                         assert_eq!(
@@ -517,7 +646,11 @@ mod tests {
             assert_eq!(nodes.len(), 1, "input: {input:?}");
             match &nodes[0] {
                 Node::Table(t) => {
-                    assert_eq!(t.headers, expected_headers, "input: {input:?}");
+                    assert_eq!(
+                        t.headers.iter().map(TableCell::text).collect::<Vec<_>>(),
+                        expected_headers,
+                        "input: {input:?}"
+                    );
                     assert_eq!(t.rows.len(), expected_rows, "input: {input:?}");
                     assert_eq!(t.alignments, expected_alignments, "input: {input:?}");
                 }
@@ -537,7 +670,7 @@ mod tests {
             match node {
                 Node::Heading { level, text } => {
                     assert_eq!(*level, expected_level);
-                    assert_eq!(text, expected_text);
+                    assert_eq!(inline_text(text), expected_text);
                 }
                 _ => panic!("Expected Heading"),
             }
@@ -550,7 +683,7 @@ mod tests {
         assert_eq!(doc.headings[0].text, "Title");
         assert_eq!(doc.headings[0].start_line, 1);
         assert_eq!(doc.headings[1].level, 2);
-        assert_eq!(doc.headings[1].text, "Run make");
+        assert_eq!(doc.headings[1].text, "Run `make`");
         assert_eq!(doc.nodes_state, crate::NodesState::Full);
     }
 
@@ -563,7 +696,7 @@ mod tests {
             Node::BlockQuote(children) => {
                 assert_eq!(children.len(), 1);
                 match &children[0] {
-                    Node::Paragraph(s) => assert!(s.contains("blockquote")),
+                    Node::Paragraph(s) => assert!(inline_text(s).contains("blockquote")),
                     _ => panic!("Expected Paragraph in BlockQuote"),
                 }
             }
@@ -588,10 +721,149 @@ mod tests {
             _ => panic!("expected list"),
         };
         assert_eq!(items.len(), 2);
-        assert_eq!(items[0].text, "item 1");
-        assert_eq!(items[1].text, "item 2");
+        assert_eq!(inline_text(&items[0].text), "item 1");
+        assert_eq!(inline_text(&items[1].text), "item 2");
         assert_eq!(items[0].children.len(), 1);
         assert!(matches!(&items[0].children[0], Node::Code(code_id)
             if doc.codes.iter().any(|c| c.id == *code_id && c.content.trim() == "echo hi")));
+    }
+
+    #[test]
+    fn test_parse_inline_styles() {
+        let cases = [
+            ("plain", "plain", vec![]),
+            ("**bold**", "bold", vec![InlineStyle::Bold]),
+            ("*italic*", "italic", vec![InlineStyle::Italic]),
+            ("~~strike~~", "strike", vec![InlineStyle::Strikethrough]),
+            ("`code`", "`code`", vec![InlineStyle::InlineCode]),
+            (
+                "[link](https://x.dev)",
+                "link",
+                vec![InlineStyle::Link {
+                    destination: "https://x.dev".into(),
+                    title: None,
+                }],
+            ),
+            (
+                "[link](https://x.dev \"API\")",
+                "link",
+                vec![InlineStyle::Link {
+                    destination: "https://x.dev".into(),
+                    title: Some("API".into()),
+                }],
+            ),
+            (
+                "![alt](image.png)",
+                "alt",
+                vec![InlineStyle::Image {
+                    alt: "alt".into(),
+                    src: "image.png".into(),
+                }],
+            ),
+            (
+                "***both***",
+                "both",
+                vec![InlineStyle::Italic, InlineStyle::Bold],
+            ),
+            (
+                "**`code`**",
+                "`code`",
+                vec![InlineStyle::Bold, InlineStyle::InlineCode],
+            ),
+            (
+                "~~*struck italic*~~",
+                "struck italic",
+                vec![InlineStyle::Strikethrough, InlineStyle::Italic],
+            ),
+        ];
+
+        for (markdown, expected_text, expected_styles) in cases {
+            let nodes = Cmark::new().parse(markdown).nodes;
+            let spans = match &nodes[0] {
+                Node::Paragraph(spans) => spans,
+                other => panic!("Expected Paragraph for {markdown:?}, got {other:?}"),
+            };
+
+            assert_eq!(inline_text(spans), expected_text, "input: {markdown:?}");
+            assert_eq!(spans.len(), 1, "input: {markdown:?}");
+            assert_eq!(spans[0].style, expected_styles, "input: {markdown:?}");
+        }
+    }
+
+    #[test]
+    fn test_parse_inline_styles_in_table_cells() {
+        let cases = [
+            ("**bold**", "bold", vec![InlineStyle::Bold]),
+            (
+                "[docs](https://x.dev \"API\")",
+                "docs",
+                vec![InlineStyle::Link {
+                    destination: "https://x.dev".into(),
+                    title: Some("API".into()),
+                }],
+            ),
+            ("`code`", "`code`", vec![InlineStyle::InlineCode]),
+        ];
+
+        for (markdown, expected_text, expected_styles) in cases {
+            let input = format!("| Value |\n|---|\n| {markdown} |");
+            let nodes = Cmark::new().parse(&input).nodes;
+            let table = match &nodes[0] {
+                Node::Table(table) => table,
+                other => panic!("Expected Table for {markdown:?}, got {other:?}"),
+            };
+            let cell = &table.rows[0][0];
+
+            assert_eq!(cell.text(), expected_text, "input: {markdown:?}");
+            assert_eq!(cell.spans.len(), 1, "input: {markdown:?}");
+            assert_eq!(cell.spans[0].style, expected_styles, "input: {markdown:?}");
+        }
+    }
+
+    #[test]
+    fn test_parse_inline_styles_in_list_items() {
+        let cases = [
+            ("**bold item**", "bold item", vec![InlineStyle::Bold]),
+            ("*italic item*", "italic item", vec![InlineStyle::Italic]),
+            ("`code`", "`code`", vec![InlineStyle::InlineCode]),
+            ("~~strike~~", "strike", vec![InlineStyle::Strikethrough]),
+            (
+                "[link](https://x.dev)",
+                "link",
+                vec![InlineStyle::Link {
+                    destination: "https://x.dev".into(),
+                    title: None,
+                }],
+            ),
+            (
+                "![alt](image.png)",
+                "alt",
+                vec![InlineStyle::Image {
+                    alt: "alt".into(),
+                    src: "image.png".into(),
+                }],
+            ),
+            (
+                "***both***",
+                "both",
+                vec![InlineStyle::Italic, InlineStyle::Bold],
+            ),
+        ];
+
+        for (markdown, expected_text, expected_styles) in cases {
+            let input = format!("- {markdown}");
+            let nodes = Cmark::new().parse(&input).nodes;
+            let items = match &nodes[0] {
+                Node::List(items) => items,
+                other => panic!("Expected List for {markdown:?}, got {other:?}"),
+            };
+
+            assert_eq!(inline_text(&items[0].text), expected_text);
+            assert_eq!(items[0].text.len(), 1, "input: {markdown:?}");
+            assert_eq!(
+                items[0].text[0].style, expected_styles,
+                "input: {markdown:?}"
+            );
+        }
     }
 }
