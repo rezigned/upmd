@@ -1,18 +1,19 @@
-//! Produces styled [`ViewLine`]s from parsed markdown [`Node`]s.
+//! Produces styled [`LogicalLine`]s from parsed markdown [`Node`]s.
 //!
-//! [`MarkdownRenderer::render`] walks the AST and builds a vector of `ViewLine`s,
+//! [`MarkdownRenderer::render`] walks the AST and builds a vector of `LogicalLine`s,
 //! one per semantic markdown element (headings, paragraphs, code body lines,
-//! table rows, etc.).  Tables expand into multiple `ViewLine`s (one per row).
+//! table rows, etc.). Tables expand into multiple `LogicalLine`s (one per row).
 //!
-//! [`ViewLine::render`] lazily renders a `ViewLine` into a ratatui
+//! [`LogicalLine::render`] lazily renders a `LogicalLine` into a ratatui
 //! [`Line`] at draw time.  It applies syntax highlighting (with a per-line cache
-//! in [`Content::Raw::cached`]), theme colours, active-code gutters, spinners,
+//! in [`LazyText::cached`]), theme colours, active-code gutters, spinners,
 //! and search highlights.  The resulting `Line` is then consumed by the preview
 //! pane which may soft-wrap it across multiple terminal rows.
 
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
 use std::collections::HashMap;
+use std::sync::Arc;
 use unicode_width::UnicodeWidthChar;
 
 use crate::apps::config::PREVIEW_FRAME_OVERHEAD;
@@ -25,7 +26,7 @@ use upmd_parser::Codes;
 
 use crate::apps::task::Task;
 
-/// Render-time context passed to [`ViewLine::render`].
+/// Render-time context passed to [`LogicalLine::render`].
 pub struct RenderContext<'a> {
     pub theme: &'a Theme,
     pub active_code_id: Option<CodeId>,
@@ -34,58 +35,105 @@ pub struct RenderContext<'a> {
     pub spinner_char: char,
     pub viewport_width: usize,
 }
-/// The type of visual line in the preview.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum LineKind {
-    Text,
-    ListItem,
-    Heading(u8),
-    CodeInfo,
-    CodeBody,
-    Output,
-    Table,
+
+/// Source text highlighted lazily and cached independently of viewport paint.
+#[derive(Debug, Clone)]
+pub struct LazyText {
+    pub(crate) text: String,
+    pub(crate) language: String,
+    /// Lazily-populated cache: `None` until first highlight, then reused.
+    pub(crate) cached: std::cell::RefCell<Option<Text<'static>>>,
+}
+
+impl LazyText {
+    fn new(text: impl Into<String>, language: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            language: language.into(),
+            cached: std::cell::RefCell::new(None),
+        }
+    }
+}
+
+impl Default for LazyText {
+    fn default() -> Self {
+        Self {
+            text: String::new(),
+            language: String::new(),
+            cached: std::cell::RefCell::new(None),
+        }
+    }
+}
+
+/// Code info bar: left spans + right text, right-aligned at render time.
+#[derive(Debug, Clone)]
+pub struct CodeInfoLine {
+    left: Vec<(String, Style)>,
+    right: String,
+    style: Style,
+}
+
+/// Element-specific content for one logical preview line.
+///
+/// Cross-cutting navigation and display metadata remains on [`LogicalLine`].
+#[derive(Debug, Clone, Default)]
+pub enum LogicalLineSource {
+    Text(LazyText),
+    ListItem(LazyText),
+    Heading {
+        level: u8,
+        text: LazyText,
+    },
+    CodeInfo(CodeInfoLine),
+    CodeBody(LazyText),
+    Output(Text<'static>),
+    TableRow {
+        /// Stores the raw table data so it can be re-rendered when the viewport
+        /// width changes.
+        table: Arc<MarkdownTable>,
+        /// Which row of the table this `LogicalLine` represents.
+        row_idx: usize,
+        initial: Line<'static>,
+    },
     ThematicBreak,
     #[default]
     Newline,
 }
 
-/// Content storage - either raw text (needs highlighting) or already styled.
-#[derive(Debug, Clone)]
-pub enum Content {
-    Raw {
-        text: String,
-        language: String,
-        /// Lazily-populated cache: `None` until first highlight, then reused.
-        cached: std::cell::RefCell<Option<Text<'static>>>,
-    },
-    Ready(Text<'static>),
-    /// Code info bar: left spans + right text, right-aligned at render time.
-    CodeInfo {
-        left: Vec<(String, ratatui::style::Style)>,
-        right: String,
-        style: ratatui::style::Style,
-    },
-}
+impl LogicalLineSource {
+    fn lazy_text_mut(&mut self) -> Option<&mut LazyText> {
+        match self {
+            LogicalLineSource::Text(text)
+            | LogicalLineSource::ListItem(text)
+            | LogicalLineSource::CodeBody(text)
+            | LogicalLineSource::Heading { text, .. } => Some(text),
+            _ => None,
+        }
+    }
 
-impl Default for Content {
-    fn default() -> Self {
-        Self::Ready(Text::raw(""))
+    fn lazy_text(&self) -> Option<&LazyText> {
+        match self {
+            LogicalLineSource::Text(text)
+            | LogicalLineSource::ListItem(text)
+            | LogicalLineSource::CodeBody(text)
+            | LogicalLineSource::Heading { text, .. } => Some(text),
+            _ => None,
+        }
     }
 }
 
 /// A single *logical* line in the preview: one semantic markdown element.
 ///
-/// `ViewLine`s are produced once by [`MarkdownRenderer::render`] and cached in
+/// `LogicalLine`s are produced once by [`MarkdownRenderer::render`] and cached in
 /// [`Preview::logical_lines`](crate::apps::tui::preview::Preview::logical_lines).
-/// They are **not** directly drawn; instead [`ViewLine::render`]
+/// They are **not** directly drawn; instead [`LogicalLine::render`]
 /// lazily renders them into a [`Line`] each frame, and
 /// [`Preview::rebuild_visual_lines`](crate::apps::tui::preview::Preview::rebuild_visual_lines)
 /// optionally soft-wraps that `Line` into one or more
 /// [`VisualLine`](crate::apps::tui::preview::VisualLine)s.
 #[derive(Debug, Clone, Default)]
-pub struct ViewLine {
-    pub kind: LineKind,
-    pub content: Content,
+pub struct LogicalLine {
+    pub source: LogicalLineSource,
     pub code_id: Option<CodeId>,
     pub is_block_start: bool,
     pub is_code_start: bool,
@@ -96,22 +144,16 @@ pub struct ViewLine {
     /// Multiple prefixes can stack (for example, a blockquote marker followed by
     /// a list marker). Keeping them separate preserves each prefix's style.
     pub prefixes: Vec<Span<'static>>,
-    /// Stores the raw table data so it can be re-rendered when the viewport
-    /// width changes.
-    pub table: Option<MarkdownTable>,
-    /// Which row of the table this `ViewLine` represents (only for [`LineKind::Table`]).
-    pub table_row_idx: Option<usize>,
     /// Optional foreground color override for the gutter indicator (used by
     /// output lines to reflect task status).
     pub gutter_fg: Option<Color>,
 }
 
-impl ViewLine {
+impl LogicalLine {
     /// Creates an empty newline.
     pub fn newline(code_id: Option<CodeId>, is_block_start: bool) -> Self {
         Self {
-            kind: LineKind::Newline,
-            content: Content::Ready(Text::raw("")),
+            source: LogicalLineSource::Newline,
             code_id,
             is_block_start,
             ..Self::default()
@@ -121,12 +163,7 @@ impl ViewLine {
     /// Creates a text line with raw content that needs lazy highlighting.
     pub fn text_lazy(raw: impl Into<String>, is_block_start: bool) -> Self {
         Self {
-            kind: LineKind::Text,
-            content: Content::Raw {
-                text: raw.into(),
-                language: "markdown".to_string(),
-                cached: std::cell::RefCell::new(None),
-            },
+            source: LogicalLineSource::Text(LazyText::new(raw, "markdown")),
             is_block_start,
             ..Self::default()
         }
@@ -135,12 +172,7 @@ impl ViewLine {
     /// Creates a list item with raw content and styled prefix.
     pub fn list_item(raw: impl Into<String>, prefix: Span<'static>, is_block_start: bool) -> Self {
         Self {
-            kind: LineKind::ListItem,
-            content: Content::Raw {
-                text: raw.into(),
-                language: "markdown".to_string(),
-                cached: std::cell::RefCell::new(None),
-            },
+            source: LogicalLineSource::ListItem(LazyText::new(raw, "markdown")),
             is_block_start,
             prefixes: vec![prefix],
             ..Self::default()
@@ -150,11 +182,9 @@ impl ViewLine {
     /// Creates a heading line with raw content that needs lazy highlighting.
     pub fn heading_lazy(raw: impl Into<String>, level: u8) -> Self {
         Self {
-            kind: LineKind::Heading(level),
-            content: Content::Raw {
-                text: raw.into(),
-                language: "markdown".to_string(),
-                cached: std::cell::RefCell::new(None),
+            source: LogicalLineSource::Heading {
+                level,
+                text: LazyText::new(raw, "markdown"),
             },
             is_block_start: true,
             ..Self::default()
@@ -163,34 +193,27 @@ impl ViewLine {
 
     /// Creates a code info line (header showing code ID, language, status).
     pub fn code_info(
-        content: impl Into<Text<'static>>,
+        left: Vec<(String, Style)>,
+        right: String,
+        style: Style,
         code_id: CodeId,
         is_start: bool,
         is_running: bool,
     ) -> Self {
         Self {
-            kind: LineKind::CodeInfo,
-            content: Content::Ready(content.into()),
+            source: LogicalLineSource::CodeInfo(CodeInfoLine { left, right, style }),
             code_id: Some(code_id),
             is_block_start: is_start,
             is_code_start: is_start,
             is_running,
-            prefixes: Vec::new(),
-            table: None,
-            table_row_idx: None,
-            gutter_fg: None,
+            ..Self::default()
         }
     }
 
     /// Creates a code body line with raw content that needs lazy highlighting.
     pub fn code_body(raw: impl Into<String>, language: impl Into<String>, code_id: CodeId) -> Self {
         Self {
-            kind: LineKind::CodeBody,
-            content: Content::Raw {
-                text: raw.into(),
-                language: language.into(),
-                cached: std::cell::RefCell::new(None),
-            },
+            source: LogicalLineSource::CodeBody(LazyText::new(raw, language)),
             code_id: Some(code_id),
             ..Self::default()
         }
@@ -199,20 +222,20 @@ impl ViewLine {
     /// Creates an output line.
     pub fn output(content: impl Into<Text<'static>>, code_id: CodeId) -> Self {
         Self {
-            kind: LineKind::Output,
-            content: Content::Ready(content.into()),
+            source: LogicalLineSource::Output(content.into()),
             code_id: Some(code_id),
             ..Self::default()
         }
     }
 
     /// Creates a table row or border line.
-    pub fn table(table: MarkdownTable, row_idx: usize, line: Line<'static>) -> Self {
+    pub fn table(table: Arc<MarkdownTable>, row_idx: usize, initial: Line<'static>) -> Self {
         Self {
-            kind: LineKind::Table,
-            content: Content::Ready(Text::from(line)),
-            table: Some(table),
-            table_row_idx: Some(row_idx),
+            source: LogicalLineSource::TableRow {
+                table,
+                row_idx,
+                initial,
+            },
             ..Self::default()
         }
     }
@@ -220,17 +243,28 @@ impl ViewLine {
     /// Creates a thematic break (horizontal rule).
     pub fn thematic_break() -> Self {
         Self {
-            kind: LineKind::ThematicBreak,
-            content: Content::Ready(Text::raw("")),
+            source: LogicalLineSource::ThematicBreak,
             is_block_start: true,
             ..Self::default()
         }
     }
 
+    pub fn into_lazy_text(mut self) -> Option<LazyText> {
+        self.source.lazy_text_mut().map(std::mem::take)
+    }
+
+    pub fn lazy_text_mut(&mut self) -> Option<&mut LazyText> {
+        self.source.lazy_text_mut()
+    }
+
+    fn lazy_text(&self) -> Option<&LazyText> {
+        self.source.lazy_text()
+    }
+
     /// Clears the lazy-highlight cache so the next render recomputes with the current theme.
     pub fn clear_cache(&self) {
-        if let Content::Raw { cached, .. } = &self.content {
-            *cached.borrow_mut() = None;
+        if let Some(text) = self.lazy_text() {
+            *text.cached.borrow_mut() = None;
         }
     }
 
@@ -242,40 +276,63 @@ impl ViewLine {
     }
 
     #[inline]
+    pub fn heading_level(&self) -> Option<u8> {
+        match self.source {
+            LogicalLineSource::Heading { level, .. } => Some(level),
+            _ => None,
+        }
+    }
+
+    #[inline]
     pub fn is_code_info(&self) -> bool {
-        matches!(self.kind, LineKind::CodeInfo)
+        matches!(self.source, LogicalLineSource::CodeInfo(_))
     }
 
     #[inline]
     pub fn is_code_body(&self) -> bool {
-        matches!(self.kind, LineKind::CodeBody)
+        matches!(self.source, LogicalLineSource::CodeBody(_))
     }
 
     #[inline]
     pub fn is_output(&self) -> bool {
-        matches!(self.kind, LineKind::Output)
+        matches!(self.source, LogicalLineSource::Output(_))
+    }
+
+    #[inline]
+    pub fn has_code_gutter(&self) -> bool {
+        matches!(
+            self.source,
+            LogicalLineSource::CodeInfo(_)
+                | LogicalLineSource::CodeBody(_)
+                | LogicalLineSource::Output(_)
+        )
     }
 
     #[inline]
     pub fn is_table(&self) -> bool {
-        matches!(self.kind, LineKind::Table)
+        matches!(self.source, LogicalLineSource::TableRow { .. })
     }
 
-    #[inline]
     /// Returns `true` for lines that must not be wrapped (already sized/formatted).
+    #[inline]
     pub fn is_unwrappable(&self) -> bool {
         self.is_table() || self.is_output() || self.is_code_info()
     }
 
     /// Returns text content, preferring raw text if available.
     pub fn text_content(&self) -> String {
-        match &self.content {
-            Content::Raw { text, .. } => text.clone(),
-            Content::Ready(text) => text.to_string(),
-            Content::CodeInfo { left, right, .. } => {
-                let l: String = left.iter().map(|(s, _)| s.as_str()).collect();
-                format!("{l} {}", right.trim_end())
+        match &self.source {
+            LogicalLineSource::Text(text)
+            | LogicalLineSource::ListItem(text)
+            | LogicalLineSource::CodeBody(text)
+            | LogicalLineSource::Heading { text, .. } => text.text.clone(),
+            LogicalLineSource::CodeInfo(info) => {
+                let left: String = info.left.iter().map(|(text, _)| text.as_str()).collect();
+                format!("{left} {}", info.right.trim_end())
             }
+            LogicalLineSource::Output(text) => text.to_string(),
+            LogicalLineSource::TableRow { initial, .. } => initial.to_string(),
+            LogicalLineSource::ThematicBreak | LogicalLineSource::Newline => String::new(),
         }
     }
 
@@ -304,14 +361,15 @@ impl ViewLine {
 
     /// Populates the syntax cache without applying viewport-dependent paint.
     pub fn ensure_highlighted(&self, ctx: &RenderContext<'_>) -> bool {
-        if let Content::Raw { cached, .. } = &self.content {
-            if cached.borrow().is_none() {
+        if let Some(text) = self.lazy_text() {
+            if text.cached.borrow().is_none() {
                 drop(self.render_content(ctx));
                 return true;
             }
         }
         false
     }
+
     fn render_with(&self, ctx: &RenderContext<'_>, highlight: bool) -> Line<'static> {
         if let Some(mut line) = self.render_synthetic(ctx) {
             self.apply_prefixes(&mut line);
@@ -345,21 +403,15 @@ impl ViewLine {
             }
         }
 
-        if is_active {
-            // Code info IDs track the active block even when the preview is not focused.
-            if self.is_code_info() {
-                if let Some(first_span) = line.spans.first_mut() {
-                    first_span.style = first_span.style.patch(ctx.theme.active_fg_style());
-                }
+        if is_active && self.is_code_info() {
+            if let Some(first_span) = line.spans.first_mut() {
+                first_span.style = first_span.style.patch(ctx.theme.active_fg_style());
             }
         }
     }
 
     /// Display-only second pass: applies prefixes and the code gutter.
     fn apply_prefixes(&self, line: &mut Line<'static>) {
-        // Prefixes are stored outer-to-inner (e.g. [quote, list]). Prepend them
-        // to the content spans in that order so the rendered line reads left
-        // to right as expected ("> • item").
         let mut spans = self.prefixes.to_vec();
         spans.append(&mut line.spans);
         line.spans = spans;
@@ -373,115 +425,105 @@ impl ViewLine {
     /// Handles synthetic line types (thematic break, table) that bypass content
     /// rendering; `render` adds display prefixes afterward.
     fn render_synthetic(&self, ctx: &RenderContext<'_>) -> Option<Line<'static>> {
-        if matches!(self.kind, LineKind::ThematicBreak) {
-            let width = ctx.viewport_width.saturating_sub(PREVIEW_FRAME_OVERHEAD);
-            return Some(Line::from(Span::styled(
-                "─".repeat(width),
-                ctx.theme.rule_style(),
-            )));
-        }
-
-        if matches!(self.kind, LineKind::Table) {
-            if let (Some(ref table), Some(row_idx)) = (&self.table, self.table_row_idx) {
-                let lines = render_table(table, ctx.theme, ctx.viewport_width);
-                return Some(
-                    lines
-                        .into_iter()
-                        .nth(row_idx)
-                        .unwrap_or_else(|| Line::raw("")),
-                );
+        match &self.source {
+            LogicalLineSource::ThematicBreak => {
+                let width = ctx.viewport_width.saturating_sub(PREVIEW_FRAME_OVERHEAD);
+                Some(Line::from(Span::styled(
+                    "─".repeat(width),
+                    ctx.theme.rule_style(),
+                )))
             }
+            LogicalLineSource::TableRow { table, row_idx, .. } => Some(
+                render_table(table, ctx.theme, ctx.viewport_width)
+                    .into_iter()
+                    .nth(*row_idx)
+                    .unwrap_or_else(|| Line::raw("")),
+            ),
+            _ => None,
         }
-
-        None
     }
 
     /// Renders text-identical content without syntax highlighting.
     fn render_plain_content(&self, ctx: &RenderContext<'_>) -> Line<'static> {
-        match &self.content {
-            Content::Raw { text, .. } => expand_tabs_in_line(Line::raw(text.clone())),
-            _ => self.render_content(ctx),
+        if let Some(text) = self.lazy_text() {
+            expand_tabs_in_line(Line::raw(text.text.clone()))
+        } else {
+            self.render_content(ctx)
         }
     }
 
     /// Renders the main line content with lazy syntax highlighting.
     fn render_content(&self, ctx: &RenderContext<'_>) -> Line<'static> {
-        match &self.content {
-            Content::Raw {
-                text,
-                language,
-                cached,
-            } => {
-                let mut cache = cached.borrow_mut();
+        match &self.source {
+            LogicalLineSource::Text(text)
+            | LogicalLineSource::ListItem(text)
+            | LogicalLineSource::CodeBody(text)
+            | LogicalLineSource::Heading { text, .. } => {
+                let mut cache = text.cached.borrow_mut();
                 if let Some(ref hit) = *cache {
-                    hit.lines
-                        .first()
-                        .cloned()
-                        .unwrap_or_else(|| expand_tabs_in_line(Line::raw(text.clone())))
-                } else {
-                    let mut highlighted = ctx.theme.highlight(text, language);
-                    for line in &mut highlighted.lines {
-                        *line = expand_tabs_in_line(std::mem::take(line));
-                    }
-                    let l = highlighted
+                    return hit
                         .lines
                         .first()
                         .cloned()
-                        .unwrap_or_else(|| expand_tabs_in_line(Line::raw(text.clone())));
-                    *cache = Some(highlighted);
-                    l
+                        .unwrap_or_else(|| expand_tabs_in_line(Line::raw(text.text.clone())));
                 }
+
+                let mut highlighted = ctx.theme.highlight(&text.text, &text.language);
+                for line in &mut highlighted.lines {
+                    *line = expand_tabs_in_line(std::mem::take(line));
+                }
+                let line = highlighted
+                    .lines
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| expand_tabs_in_line(Line::raw(text.text.clone())));
+                *cache = Some(highlighted);
+                line
             }
-            Content::Ready(text) => text.lines.first().cloned().unwrap_or_else(|| Line::raw("")),
-            Content::CodeInfo { left, right, style } => {
-                // Compute right-aligned padding using the live viewport width.
-                // Subtract prefix width (e.g. "> " from blockquote) so the
-                // right-aligned label doesn't get clipped.
+            LogicalLineSource::CodeInfo(info) => {
                 let prefix_width = self.prefix_width();
                 let wrap_width = ctx
                     .viewport_width
                     .saturating_sub(crate::apps::config::PREVIEW_CODE_WRAP_OVERHEAD + prefix_width)
                     .max(1);
-                let mut spans: Vec<Span<'static>> = left
+                let mut spans: Vec<Span<'static>> = info
+                    .left
                     .iter()
-                    .map(|(s, st)| Span::styled(s.clone(), *st))
+                    .map(|(text, style)| Span::styled(text.clone(), *style))
                     .collect();
-                // Spinner goes inline right after left content, before the gap.
                 if self.is_running {
                     spans.push(Span::styled(
                         format!(" {}", ctx.spinner_char),
                         ctx.theme.active_fg_style(),
                     ));
                 }
-                let left_chars: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-                let right_chars = right.chars().count();
+                let left_chars: usize = spans.iter().map(|span| span.content.chars().count()).sum();
+                let right_chars = info.right.chars().count();
                 let gap = wrap_width.saturating_sub(left_chars + right_chars).max(1);
-                spans.push(Span::styled(" ".repeat(gap), *style));
-                spans.push(Span::styled(right.clone(), *style));
-                let mut line = Line::from(spans);
-                line.style = *style;
-                line
+                spans.push(Span::styled(" ".repeat(gap), info.style));
+                spans.push(Span::styled(info.right.clone(), info.style));
+                Line::from(spans).style(info.style)
             }
+            LogicalLineSource::Output(text) => {
+                text.lines.first().cloned().unwrap_or_else(|| Line::raw(""))
+            }
+            LogicalLineSource::TableRow { initial, .. } => initial.clone(),
+            LogicalLineSource::ThematicBreak | LogicalLineSource::Newline => Line::raw(""),
         }
     }
 
     /// Adds a gutter indicator for highlightable lines.
     fn add_gutter(&self, line: &mut Line<'static>, is_active: bool, ctx: &RenderContext<'_>) {
-        if !matches!(
-            self.kind,
-            LineKind::CodeInfo | LineKind::CodeBody | LineKind::Output
-        ) {
+        if !self.has_code_gutter() {
             return;
         }
-        let is_unwrappable = self.is_output();
-        let prefer_status_gutter = ctx.prefer_status_gutter == self.code_id;
         apply_gutter(
             line,
-            is_unwrappable,
+            self.is_output(),
             is_active,
             ctx.theme,
             self.gutter_fg,
-            prefer_status_gutter,
+            ctx.prefer_status_gutter == self.code_id,
             self.is_running,
         );
     }
@@ -682,9 +724,9 @@ fn align_cell(text: &str, width: usize, align: Alignment) -> String {
 /// Render-time context for code-block snap-to-heading/paragraph.
 #[derive(Default)]
 struct SnapContext {
-    /// Index of the heading ViewLine that precedes the next code block.
+    /// Index of the heading LogicalLine that precedes the next code block.
     title_line: Option<usize>,
-    /// Index of the first paragraph ViewLine that precedes the next code block.
+    /// Index of the first paragraph LogicalLine that precedes the next code block.
     description_line: Option<usize>,
 }
 
@@ -710,7 +752,7 @@ struct RenderState {
 }
 
 pub struct RenderedMarkdown {
-    pub lines: Vec<ViewLine>,
+    pub lines: Vec<LogicalLine>,
     pub code_prefix_overhead: HashMap<CodeId, usize>,
 }
 
@@ -755,7 +797,7 @@ impl<'a> MarkdownRenderer<'a> {
     fn quote_prefix_span(&self) -> Span<'static> {
         // Quote markers sit outside code backgrounds. Pinning the background
         // avoids inheriting the highlighted/code block background that is added
-        // later during ViewLine::render.
+        // later during LogicalLine::render.
         Span::styled(
             "> ",
             Style::default()
@@ -768,7 +810,7 @@ impl<'a> MarkdownRenderer<'a> {
         depth * 2
     }
 
-    fn push_line(&self, lines: &mut Vec<ViewLine>, mut line: ViewLine, quote_depth: usize) {
+    fn push_line(&self, lines: &mut Vec<LogicalLine>, mut line: LogicalLine, quote_depth: usize) {
         // Quote prefixes are outer chrome. Insert before any existing list/task
         // prefix so rendering preserves markdown order: "> • item", not
         // "• > item".
@@ -781,7 +823,7 @@ impl<'a> MarkdownRenderer<'a> {
     fn push_node(
         &self,
         node: &upmd_parser::nodes::Node,
-        lines: &mut Vec<ViewLine>,
+        lines: &mut Vec<LogicalLine>,
         state: &mut RenderState,
     ) {
         use upmd_parser::nodes::Node;
@@ -818,7 +860,7 @@ impl<'a> MarkdownRenderer<'a> {
                 };
                 self.push_line(
                     lines,
-                    ViewLine::heading_lazy(content, *level),
+                    LogicalLine::heading_lazy(content, *level),
                     state.quote_depth,
                 );
                 state.snap.title_line = Some(line_idx);
@@ -872,24 +914,25 @@ impl<'a> MarkdownRenderer<'a> {
                 }
                 self.push_line(
                     lines,
-                    ViewLine::newline(Some(code.id), false),
+                    LogicalLine::newline(Some(code.id), false),
                     state.quote_depth,
                 );
             }
             Node::Table(table) => {
-                let rendered = render_table(table, self.theme, self.viewport_width);
-                for (i, line) in rendered.into_iter().enumerate() {
+                let table = Arc::new(table.clone());
+                let rendered = render_table(&table, self.theme, self.viewport_width);
+                for (row_idx, line) in rendered.into_iter().enumerate() {
                     self.push_line(
                         lines,
-                        ViewLine::table(table.clone(), i, line),
+                        LogicalLine::table(Arc::clone(&table), row_idx, line),
                         state.quote_depth,
                     );
                 }
-                self.push_line(lines, ViewLine::newline(None, false), state.quote_depth);
+                self.push_line(lines, LogicalLine::newline(None, false), state.quote_depth);
             }
             Node::ThematicBreak => {
-                self.push_line(lines, ViewLine::thematic_break(), state.quote_depth);
-                self.push_line(lines, ViewLine::newline(None, false), state.quote_depth);
+                self.push_line(lines, LogicalLine::thematic_break(), state.quote_depth);
+                self.push_line(lines, LogicalLine::newline(None, false), state.quote_depth);
             }
         }
     }
@@ -897,7 +940,7 @@ impl<'a> MarkdownRenderer<'a> {
     fn push_highlighted_lines(
         &self,
         text: &str,
-        lines: &mut Vec<ViewLine>,
+        lines: &mut Vec<LogicalLine>,
         block_start: bool,
         quote_depth: usize,
     ) -> Option<usize> {
@@ -907,13 +950,13 @@ impl<'a> MarkdownRenderer<'a> {
         for line in text.lines() {
             self.push_line(
                 lines,
-                ViewLine::text_lazy(line.to_string(), first),
+                LogicalLine::text_lazy(line.to_string(), first),
                 quote_depth,
             );
             first = false;
             emitted = true;
         }
-        self.push_line(lines, ViewLine::newline(None, false), quote_depth);
+        self.push_line(lines, LogicalLine::newline(None, false), quote_depth);
         if emitted {
             Some(start_idx)
         } else {
@@ -924,7 +967,7 @@ impl<'a> MarkdownRenderer<'a> {
     fn push_list(
         &self,
         items: &[upmd_parser::nodes::ListItem],
-        lines: &mut Vec<ViewLine>,
+        lines: &mut Vec<LogicalLine>,
         state: &mut RenderState,
     ) {
         for (i, item) in items.iter().enumerate() {
@@ -950,7 +993,7 @@ impl<'a> MarkdownRenderer<'a> {
                 };
                 self.push_line(
                     lines,
-                    ViewLine::list_item(line.to_string(), prefix, i == 0 && line_idx == 0),
+                    LogicalLine::list_item(line.to_string(), prefix, i == 0 && line_idx == 0),
                     state.quote_depth,
                 );
             }
@@ -962,10 +1005,10 @@ impl<'a> MarkdownRenderer<'a> {
         }
         // Skip trailing newline for nested lists to avoid blank lines between siblings.
         if items.first().is_some_and(|i| i.depth == 1) {
-            self.push_line(lines, ViewLine::newline(None, false), state.quote_depth);
+            self.push_line(lines, LogicalLine::newline(None, false), state.quote_depth);
         }
     }
-    fn push_code_info(&self, code: &Code, is_start: bool) -> ViewLine {
+    fn push_code_info(&self, code: &Code, is_start: bool) -> LogicalLine {
         let buffer = self.outputs.get(&code.id);
         let is_executed =
             |done: bool| buffer.is_some_and(|b| b.execution.is_some() && b.done == done);
@@ -1006,26 +1049,19 @@ impl<'a> MarkdownRenderer<'a> {
             left.push((format!(" {sym}"), info_style.patch(style)));
         }
 
-        // Right: "{language} " is right-aligned at render time via Content::CodeInfo.
+        // The language label is right-aligned at render time.
         let right = format!("{} ", language.name);
-
-        let mut view_line = ViewLine::code_info(Line::raw(""), code.id, is_start, is_running);
-        view_line.content = Content::CodeInfo {
-            left,
-            right,
-            style: info_style,
-        };
-        view_line
+        LogicalLine::code_info(left, right, info_style, code.id, is_start, is_running)
     }
 
-    fn push_code_body(&self, code: &Code) -> Vec<ViewLine> {
+    fn push_code_body(&self, code: &Code) -> Vec<LogicalLine> {
         code.content
             .lines()
-            .map(|line| ViewLine::code_body(line.to_string(), &code.language, code.id))
+            .map(|line| LogicalLine::code_body(line.to_string(), &code.language, code.id))
             .collect()
     }
 
-    fn push_code_output(&self, code: &Code) -> Vec<ViewLine> {
+    fn push_code_output(&self, code: &Code) -> Vec<LogicalLine> {
         let Some(buffer) = self.outputs.get(&code.id) else {
             return Vec::new();
         };
@@ -1071,7 +1107,7 @@ impl<'a> MarkdownRenderer<'a> {
                     span.style.bg = Some(bg);
                 }
             }
-            out.push(ViewLine::output(line, code.id));
+            out.push(LogicalLine::output(line, code.id));
         }
         out
     }
@@ -1160,8 +1196,8 @@ fn highlight_ranges(text: &str, term: &str) -> Vec<std::ops::Range<usize>> {
         .collect()
 }
 
-/// Expands raw tab characters for display while preserving the source text stored
-/// in [`Content::Raw`].
+/// Expands raw tab characters for display while preserving the source text in
+/// [`LazyText`].
 ///
 /// Ratatui renders text as terminal cells; raw `\t` is a control character that
 /// terminals interpret as cursor movement. Expanding tabs after syntax
@@ -1225,11 +1261,25 @@ mod tests {
         (theme, rendered)
     }
 
-    fn render_nodes(markdown: &str) -> Vec<ViewLine> {
+    fn render_nodes(markdown: &str) -> Vec<LogicalLine> {
         render_markdown(markdown).lines
     }
 
-    fn viewline_summary(lines: &[ViewLine]) -> String {
+    fn source_label(line: &LogicalLine) -> String {
+        match &line.source {
+            LogicalLineSource::Text(_) => "Text".to_string(),
+            LogicalLineSource::ListItem(_) => "ListItem".to_string(),
+            LogicalLineSource::Heading { level, .. } => format!("Heading({level})"),
+            LogicalLineSource::CodeInfo(_) => "CodeInfo".to_string(),
+            LogicalLineSource::CodeBody(_) => "CodeBody".to_string(),
+            LogicalLineSource::Output(_) => "Output".to_string(),
+            LogicalLineSource::TableRow { .. } => "Table".to_string(),
+            LogicalLineSource::ThematicBreak => "ThematicBreak".to_string(),
+            LogicalLineSource::Newline => "Newline".to_string(),
+        }
+    }
+
+    fn logical_line_summary(lines: &[LogicalLine]) -> String {
         lines
             .iter()
             .enumerate()
@@ -1242,18 +1292,18 @@ mod tests {
                 } else {
                     text
                 };
-                format!("{:2}: [{:?}] {}", i, l.kind, preview)
+                format!("{:2}: [{}] {}", i, source_label(l), preview)
             })
             .collect::<Vec<_>>()
             .join("\n")
     }
 
-    fn code_start_lines(lines: &[ViewLine]) -> Vec<(usize, LineKind, Option<CodeId>, String)> {
+    fn code_start_lines(lines: &[LogicalLine]) -> Vec<(usize, String, Option<CodeId>, String)> {
         lines
             .iter()
             .enumerate()
             .filter(|(_, line)| line.is_code_start)
-            .map(|(idx, line)| (idx, line.kind, line.code_id, line.text_content()))
+            .map(|(idx, line)| (idx, source_label(line), line.code_id, line.text_content()))
             .collect()
     }
 
@@ -1264,7 +1314,7 @@ mod tests {
 
         assert_eq!(starts.len(), 1);
         assert_eq!(starts[0].0, 0);
-        assert_eq!(starts[0].1, LineKind::Heading(1));
+        assert_eq!(starts[0].1, "Heading(1)");
         assert_eq!(starts[0].3, "# Title");
     }
 
@@ -1275,7 +1325,7 @@ mod tests {
 
         assert_eq!(starts.len(), 1);
         assert_eq!(starts[0].0, 0);
-        assert_eq!(starts[0].1, LineKind::Text);
+        assert_eq!(starts[0].1, "Text");
         assert_eq!(starts[0].3, "Intro paragraph.");
     }
 
@@ -1285,9 +1335,9 @@ mod tests {
         let starts = code_start_lines(&lines);
 
         assert_eq!(starts.len(), 2);
-        assert_eq!(starts[0].1, LineKind::Heading(1));
+        assert_eq!(starts[0].1, "Heading(1)");
         assert_eq!(starts[0].3, "# Title");
-        assert_eq!(starts[1].1, LineKind::CodeInfo);
+        assert_eq!(starts[1].1, "CodeInfo");
         assert_ne!(starts[0].2, starts[1].2);
     }
 
@@ -1297,7 +1347,7 @@ mod tests {
         let starts = code_start_lines(&lines);
 
         assert_eq!(starts.len(), 1);
-        assert_eq!(starts[0].1, LineKind::CodeInfo);
+        assert_eq!(starts[0].1, "CodeInfo");
         assert_eq!(lines[0].text_content(), "quoted note");
         assert!(lines[0].code_id.is_none());
     }
@@ -1308,7 +1358,7 @@ mod tests {
         let starts = code_start_lines(&lines);
 
         assert_eq!(starts.len(), 1);
-        assert_eq!(starts[0].1, LineKind::CodeInfo);
+        assert_eq!(starts[0].1, "CodeInfo");
         assert_eq!(lines[0].text_content(), "Intro paragraph.");
         assert!(lines[0].code_id.is_none());
     }
@@ -1353,7 +1403,7 @@ mod tests {
         let lines = render_nodes("> - quoted item");
         let list_item = lines
             .iter()
-            .find(|line| matches!(line.kind, LineKind::ListItem))
+            .find(|line| matches!(line.source, LogicalLineSource::ListItem(_)))
             .expect("expected a list item inside the blockquote");
 
         assert_eq!(list_item.prefix_width(), 4);
@@ -1426,56 +1476,72 @@ mod tests {
     #[test]
     fn test_render_headings() {
         let lines = render_nodes("# Hello\n\n## World\n\n### Rust");
-        assert_snapshot!("headings", viewline_summary(&lines));
+        assert_snapshot!("headings", logical_line_summary(&lines));
     }
 
     #[test]
     fn test_render_paragraph() {
         let lines = render_nodes("This is a paragraph.\n\nWith a blank line.");
-        assert_snapshot!("paragraph", viewline_summary(&lines));
+        assert_snapshot!("paragraph", logical_line_summary(&lines));
     }
 
     #[test]
     fn test_render_fenced_code_block() {
         let lines = render_nodes("```bash\necho hello\n```");
-        assert_snapshot!("fenced_code", viewline_summary(&lines));
+        assert_snapshot!("fenced_code", logical_line_summary(&lines));
     }
 
     #[test]
     fn test_render_code_with_language_attr() {
         let lines = render_nodes("```python [os:linux]\nprint('hi')\n```");
-        assert_snapshot!("code_with_attr", viewline_summary(&lines));
+        assert_snapshot!("code_with_attr", logical_line_summary(&lines));
     }
 
     #[test]
     fn test_render_bullet_list() {
         let lines = render_nodes("- item one\n- item two\n- item three");
-        assert_snapshot!("bullet_list", viewline_summary(&lines));
+        assert_snapshot!("bullet_list", logical_line_summary(&lines));
     }
 
     #[test]
     fn test_render_ordered_list() {
         let lines = render_nodes("1. first\n2. second\n3. third");
-        assert_snapshot!("ordered_list", viewline_summary(&lines));
+        assert_snapshot!("ordered_list", logical_line_summary(&lines));
     }
 
     #[test]
     fn test_render_task_list() {
         let lines = render_nodes("- [ ] unchecked\n- [x] checked\n- [-] in progress");
-        assert_snapshot!("task_list", viewline_summary(&lines));
+        assert_snapshot!("task_list", logical_line_summary(&lines));
     }
 
     #[test]
     fn test_render_thematic_break() {
         let lines = render_nodes("above\n\n-----\n\nbelow");
-        assert_snapshot!("thematic_break", viewline_summary(&lines));
+        assert_snapshot!("thematic_break", logical_line_summary(&lines));
+    }
+
+    #[test]
+    fn test_render_blockquote() {
+        let lines = render_nodes(
+            "> quoted paragraph\n\
+             > \n\
+             > ```bash\n\
+             > echo hi\n\
+             > ```\n\
+             \n\
+             > - quoted item\n\
+             > - nested quote\n\
+             >   - deeper",
+        );
+        assert_snapshot!("blockquote", logical_line_summary(&lines));
     }
 
     #[test]
     fn test_render_table() {
         let lines =
             render_nodes("| Name  | Age |\n|-------|-----|\n| Alice | 30  |\n| Bob   | 25  |");
-        assert_snapshot!("table", viewline_summary(&lines));
+        assert_snapshot!("table", logical_line_summary(&lines));
     }
 
     #[test]
@@ -1497,7 +1563,7 @@ pytest tests/
 ```
 "#;
         let lines = render_nodes(input);
-        assert_snapshot!("mixed_runbook", viewline_summary(&lines));
+        assert_snapshot!("mixed_runbook", logical_line_summary(&lines));
     }
 
     #[test]
@@ -1510,10 +1576,7 @@ pytest tests/
     fn test_render_code_ids_sequence() {
         let lines = render_nodes("```bash\necho a\n```\n\n```python\nprint(1)\n```");
         // Both code blocks should have distinct IDs
-        let code_lines: Vec<_> = lines
-            .iter()
-            .filter(|l| l.kind == LineKind::CodeInfo)
-            .collect();
+        let code_lines: Vec<_> = lines.iter().filter(|line| line.is_code_info()).collect();
         assert_eq!(code_lines.len(), 2);
         let id0 = code_lines[0].code_id;
         let id1 = code_lines[1].code_id;
@@ -1525,7 +1588,7 @@ pytest tests/
     #[test]
     fn test_render_code_info_line_has_code_id() {
         let lines = render_nodes("```bash\necho test\n```");
-        let code_info = lines.iter().find(|l| l.kind == LineKind::CodeInfo);
+        let code_info = lines.iter().find(|line| line.is_code_info());
         assert!(code_info.is_some());
         assert!(code_info.unwrap().code_id.is_some());
     }
@@ -1533,10 +1596,7 @@ pytest tests/
     #[test]
     fn test_render_code_body_associated_with_code_id() {
         let lines = render_nodes("```bash\necho test\n```");
-        let code_bodies: Vec<_> = lines
-            .iter()
-            .filter(|l| l.kind == LineKind::CodeBody)
-            .collect();
+        let code_bodies: Vec<_> = lines.iter().filter(|line| line.is_code_body()).collect();
         assert!(!code_bodies.is_empty());
         for body in code_bodies {
             assert!(body.code_id.is_some(), "code body missing code_id");
@@ -1548,10 +1608,7 @@ pytest tests/
         let lines = render_nodes(
             "```go\npackage main\n\t\"fmt\"\n\tos.Setenv(\"FROM_GO\", \"set by go\")\n```",
         );
-        let code_bodies: Vec<_> = lines
-            .iter()
-            .filter(|line| line.kind == LineKind::CodeBody)
-            .collect();
+        let code_bodies: Vec<_> = lines.iter().filter(|line| line.is_code_body()).collect();
         assert_eq!(code_bodies.len(), 3);
         assert_eq!(code_bodies[0].text_content(), "package main");
         assert_eq!(code_bodies[1].text_content(), "\t\"fmt\"");
@@ -1579,15 +1636,15 @@ pytest tests/
     }
 
     #[test]
-    fn test_render_heading_line_kind() {
+    fn test_render_heading_source() {
         let lines = render_nodes("# Title\n\n## Subtitle");
         let headings: Vec<_> = lines
             .iter()
-            .filter(|l| matches!(l.kind, LineKind::Heading(_)))
+            .filter(|line| line.heading_level().is_some())
             .collect();
         assert_eq!(headings.len(), 2);
-        assert_eq!(headings[0].kind, LineKind::Heading(1));
-        assert_eq!(headings[1].kind, LineKind::Heading(2));
+        assert_eq!(headings[0].heading_level(), Some(1));
+        assert_eq!(headings[1].heading_level(), Some(2));
     }
 
     #[test]
@@ -1595,10 +1652,7 @@ pytest tests/
         let lines = render_nodes("# H1\n## H2\n### H3\n#### H4");
         let levels: Vec<u8> = lines
             .iter()
-            .filter_map(|l| match l.kind {
-                LineKind::Heading(n) => Some(n),
-                _ => None,
-            })
+            .filter_map(LogicalLine::heading_level)
             .collect();
         assert_eq!(levels, [1, 2, 3, 4]);
     }
@@ -1679,7 +1733,7 @@ pytest tests/
     }
 
     /// Renders a markdown document with the given outputs, returning the text of
-    /// all rendered ViewLines.
+    /// all rendered logical lines.
     fn render_with_outputs(
         outputs: &HashMap<u32, Task>,
         markdown: &str,
@@ -1689,7 +1743,7 @@ pytest tests/
         let theme = Theme::new("base16-ocean.dark", false);
         let renderer = MarkdownRenderer::new(&theme, outputs, &doc.codes, inline_max_lines, 80);
         let lines = renderer.render(&doc.nodes).lines;
-        viewline_summary(&lines)
+        logical_line_summary(&lines)
     }
 
     #[test]
@@ -1769,14 +1823,12 @@ pytest tests/
             spinner_char: ' ',
             viewport_width: 80,
         };
-        let line = ViewLine::text_lazy("let value = 1;", false);
+        let line = LogicalLine::text_lazy("let value = 1;", false);
 
         let rendered = line.render_plain(&ctx);
 
         assert_eq!(rendered.to_string(), "let value = 1;");
-        let Content::Raw { cached, .. } = &line.content else {
-            panic!("expected raw content");
-        };
+        let cached = &line.lazy_text().expect("expected lazy text").cached;
         assert!(cached.borrow().is_none());
 
         assert!(line.ensure_highlighted(&ctx));
@@ -1794,9 +1846,7 @@ pytest tests/
             spinner_char: '⠲',
             viewport_width: 80,
         };
-        let mut line = ViewLine::text_lazy("read -p \"Your name: \" ME", false);
-        line.kind = LineKind::CodeBody;
-        line.code_id = Some(1);
+        let mut line = LogicalLine::code_body("read -p \"Your name: \" ME", "bash", 1);
         line.is_running = true;
 
         let rendered = line.render(&ctx);

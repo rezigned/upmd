@@ -1,0 +1,10 @@
+---
+source: src/apps/tui/preview/mod.rs
+assertion_line: 1170
+expression: full_preview_text(&preview)
+---
+▎ 1                  Rust 
+▎ fn very_long_function_
+▎ name_that_exceeds_narrow
+▎ _width() -> VeryLongRetu
+▎ rnType {}

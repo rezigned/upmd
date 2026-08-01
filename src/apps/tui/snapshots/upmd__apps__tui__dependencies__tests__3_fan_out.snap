@@ -5,5 +5,5 @@ expression: "lines.join(\"\\n\")"
  · a ──┬─→ · b 
        │       
        ├─→ · c 
-               
+       │       
        └─→ · d

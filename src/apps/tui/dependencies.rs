@@ -263,7 +263,9 @@ impl Dependencies {
                     let above_has_item = row_index > 0 && ((row_index - 1) / 2) < layer.len();
                     let below_has_item =
                         row_index + 1 < canvas_rows && (row_index / 2 + 1) < layer.len();
-                    if above_has_item || below_has_item {
+                    let between_next_items =
+                        row_index % 2 == 1 && (row_index / 2 + 1) < next_layer.len();
+                    if above_has_item || below_has_item || between_next_items {
                         let mut connector = String::new();
                         for position in 0..conn_w {
                             connector.push(if position == merge_col { '│' } else { ' ' });

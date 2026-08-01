@@ -4,25 +4,23 @@
 //!
 //! The preview separates *content* from *viewport layout* using two line types:
 //!
-//! 1. **Logical lines**: [`ViewLine`](crate::apps::tui::markdown::ViewLine)s stored in
+//! 1. **Logical lines**: [`LogicalLine`](crate::apps::tui::markdown::LogicalLine)s stored in
 //!    [`Preview::logical_lines`].  Each represents one semantic markdown element
 //!    (heading, paragraph, code body line, table row, etc.).  They are produced once
 //!    by [`MarkdownRenderer`](crate::apps::tui::markdown::MarkdownRenderer) and only
 //!    rebuilt when the markdown source changes.
 //!
 //! 2. **Viewport lines**: [`VisualLine`]s stored in [`VisualLines`].
-//!    Each represents **one terminal row** with plain layout text and the
-//!    corresponding source character range.  A single `ViewLine` may expand into
-//!    multiple `VisualLine`s when the text is wider than the pane and needs
-//!    soft-wrapping (handled by [`wrap_line`](crate::apps::tui::wrap::wrap_line)).
-//!    PTY output, tables, and dividers are never wrapped.
+//!    Each represents **one terminal row** using a logical-line index and source
+//!    character range. A single `LogicalLine` may expand into multiple
+//!    `VisualLine`s when it needs soft-wrapping. PTY output, tables, and dividers
+//!    are never wrapped.
 //!
 //! # Render pipeline
 //!
 //! ```text
-//! Markdown Nodes  →  MarkdownRenderer  →  [ViewLine]  →  VisualLines  →  [VisualLine]  →  Preview::render  →  [ListItem]
-//!                       (parse)          (plain text)      rebuild       (plain layout    (syntax + slice)    (display)
-//!                                                        (on resize)      every frame)
+//! Markdown Nodes  →  MarkdownRenderer  →  [LogicalLine]  →  VisualLines  →  [VisualLine]  →  Preview::render
+//!                       (parse)             (content)         rebuild       (row ranges)     (slice + paint)
 //! ```
 //!
 //! `render()` only paints the visible window plus a small overdraw margin.
@@ -49,9 +47,7 @@ use keymap::{DerivedConfig, KeyMap};
 use upmd_parser::nodes::Node;
 use upmd_parser::Codes;
 
-use super::markdown::{
-    apply_gutter, highlight_line, Content, LineKind, MarkdownRenderer, RenderContext, ViewLine,
-};
+use super::markdown::{apply_gutter, highlight_line, LogicalLine, MarkdownRenderer, RenderContext};
 use super::selection::SelectionState;
 use super::wrap::{slice_line, CopyLine};
 use crate::apps::task::Task;
@@ -96,7 +92,7 @@ enum VisualLineIdentity {
 pub struct Preview {
     nodes: Vec<Node>,
     /// Logical lines produced by [`MarkdownRenderer`].
-    logical_lines: Vec<ViewLine>,
+    logical_lines: Vec<LogicalLine>,
     /// Viewport lines produced by [`VisualLines::rebuild`].
     visual_lines: VisualLines,
     state: RefCell<ListState>,
@@ -204,38 +200,25 @@ impl Preview {
         tracing::Span::current().record("lines", rendered.lines.len());
         self.logical_lines = rendered.lines;
         self.code_prefix_overhead = rendered.code_prefix_overhead;
-        // Preserve lazy syntax highlighting cache for unchanged raw lines.
+        // Preserve lazy syntax highlighting caches for unchanged source lines.
         let mut old_raw_iter = old_lines
             .into_iter()
-            .filter_map(|line| match line.content {
-                Content::Raw {
-                    text,
-                    language,
-                    cached,
-                } => Some((text, language, cached)),
-                _ => None,
-            })
+            .filter_map(LogicalLine::into_lazy_text)
             .peekable();
 
-        // Match new raw lines against old ones sequentially to migrate their cached
-        // syntax highlighting if the text and language remain unchanged.
+        // Match new source lines sequentially so unchanged text keeps its cache.
         for line in &mut self.logical_lines {
-            if let Content::Raw {
-                text,
-                language,
-                cached,
-            } = &mut line.content
-            {
-                while let Some((old_text, old_lang, _)) = old_raw_iter.peek() {
-                    if text == old_text && language == old_lang {
-                        if let Some((_, _, old_cached)) = old_raw_iter.next() {
-                            *cached = old_cached;
-                        }
-                        break;
-                    } else {
-                        old_raw_iter.next();
+            let Some(text) = line.lazy_text_mut() else {
+                continue;
+            };
+            while let Some(old) = old_raw_iter.peek() {
+                if text.text == old.text && text.language == old.language {
+                    if let Some(old) = old_raw_iter.next() {
+                        text.cached = old.cached;
                     }
+                    break;
                 }
+                old_raw_iter.next();
             }
         }
 
@@ -334,10 +317,9 @@ impl Preview {
 
     /// Counts the number of heading lines at or before the given logical line index.
     pub fn heading_count_at_line(&self, logical_idx: usize) -> usize {
-        use crate::apps::tui::markdown::LineKind;
         self.logical_lines[..=logical_idx]
             .iter()
-            .filter(|l| matches!(l.kind, LineKind::Heading(_)))
+            .filter(|line| line.heading_level().is_some())
             .count()
             .saturating_sub(1)
     }
@@ -436,9 +418,10 @@ impl Preview {
     pub fn source_visual_extent(&self, id: CodeId) -> Option<(usize, usize)> {
         let visual_lines = self.visual_lines.borrow();
         let mut indices = visual_lines.iter().enumerate().filter_map(|(idx, line)| {
-            let kind = self.logical_lines.get(line.logical_idx)?.kind;
-            (line.code_id == Some(id) && matches!(kind, LineKind::CodeInfo | LineKind::CodeBody))
-                .then_some(idx)
+            let logical_line = self.logical_lines.get(line.logical_idx)?;
+            (line.code_id == Some(id)
+                && (logical_line.is_code_info() || logical_line.is_code_body()))
+            .then_some(idx)
         });
         let first = indices.next()?;
         let end = indices.next_back().unwrap_or(first);
@@ -495,7 +478,7 @@ impl Preview {
         self.select_and_scroll_smooth(idx.min(max));
     }
 
-    pub fn selected_code(&self) -> Option<&ViewLine> {
+    pub fn selected_code(&self) -> Option<&LogicalLine> {
         let sel = self.state.borrow().selected()?;
         let logical_idx = self.visual_lines.get(sel)?.logical_idx;
         self.logical_lines.get(logical_idx)
@@ -601,11 +584,31 @@ impl Preview {
             .is_some_and(|ll| ll.is_code_start)
     }
 
+    /// Builds the syntax-free layout row represented by `visual_line`.
+    fn plain_visual_line(&self, visual_line: &VisualLine) -> Line<'static> {
+        let ctx = RenderContext {
+            theme: &self.theme,
+            active_code_id: None,
+            prefer_status_gutter: None,
+            spinner_char: ' ',
+            viewport_width: self.visual_lines.last_width(),
+        };
+        let logical_line = &self.logical_lines[visual_line.logical_idx];
+        let source_line = logical_line.render_plain(&ctx);
+        if logical_line.is_unwrappable() {
+            source_line
+        } else {
+            slice_line(&source_line, visual_line.char_range.clone())
+        }
+    }
+
     /// Builds a [`CopyLine`] from the visual line at `line_idx`.
     fn copy_line_at(&self, line_idx: usize) -> Option<CopyLine> {
         let vl = self.visual_lines.get(line_idx)?;
-        let mut text: String = vl.line.spans.iter().map(|s| s.content.as_ref()).collect();
-        let display_prefix_len = match (vl.code_id.is_some(), text.strip_prefix("▎ ")) {
+        let line = self.plain_visual_line(&vl);
+        let mut text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        let has_code_gutter = self.logical_lines[vl.logical_idx].has_code_gutter();
+        let display_prefix_len = match (has_code_gutter, text.strip_prefix("▎ ")) {
             (true, Some(stripped)) => {
                 text = stripped.to_string();
                 CODE_GUTTER_WIDTH
@@ -633,16 +636,16 @@ impl Preview {
             slice_line(source_line, visual_line.char_range.clone())
         };
 
-        if visual_line.code_id.is_some() && visual_line.wrap_idx > 0 {
+        if logical_line.has_code_gutter() && visual_line.wrap_idx > 0 {
             let is_active = ctx.active_code_id == visual_line.code_id;
             apply_gutter(
                 &mut line,
                 logical_line.is_unwrappable(),
                 is_active,
                 ctx.theme,
-                visual_line.gutter_fg,
+                logical_line.gutter_fg,
                 ctx.prefer_status_gutter == visual_line.code_id,
-                visual_line.gutter_fg == Some(ctx.theme.warning),
+                logical_line.gutter_fg == Some(ctx.theme.warning),
             );
         }
         line
@@ -721,10 +724,9 @@ impl Preview {
 
     /// Selects the Nth heading, snapping to it only when off-screen.
     pub fn select_heading(&mut self, heading_idx: usize) {
-        use crate::apps::tui::markdown::LineKind;
         let mut count = 0;
         for (logical_idx, line) in self.logical_lines.iter().enumerate() {
-            if matches!(line.kind, LineKind::Heading(_)) {
+            if line.heading_level().is_some() {
                 if count == heading_idx {
                     if let Some(visual_idx) = self.visual_idx_of_logical(logical_idx) {
                         let (offset, height) = {
@@ -804,7 +806,17 @@ impl Preview {
                     PREVIEW_CONTENT_X_OFFSET,
                     |rel_row| {
                         let vidx = state_offset + rel_row;
-                        visual_lines.get(vidx).map(|vl| (vidx, &vl.line))
+                        visual_lines.get(vidx).map(|vl| {
+                            let ctx = RenderContext {
+                                theme: &self.theme,
+                                active_code_id: None,
+                                prefer_status_gutter: None,
+                                spinner_char: ' ',
+                                viewport_width: self.visual_lines.last_width(),
+                            };
+                            let source_line = self.logical_lines[vl.logical_idx].render_plain(&ctx);
+                            (vidx, self.render_visual_line_from(vl, &source_line, &ctx))
+                        })
                     },
                 );
                 drop(visual_lines);
@@ -846,7 +858,17 @@ impl Preview {
                     PREVIEW_CONTENT_X_OFFSET,
                     |rel_row| {
                         let vidx = state_offset + rel_row;
-                        visual_lines.get(vidx).map(|vl| (vidx, &vl.line))
+                        visual_lines.get(vidx).map(|vl| {
+                            let ctx = RenderContext {
+                                theme: &self.theme,
+                                active_code_id: None,
+                                prefer_status_gutter: None,
+                                spinner_char: ' ',
+                                viewport_width: self.visual_lines.last_width(),
+                            };
+                            let source_line = self.logical_lines[vl.logical_idx].render_plain(&ctx);
+                            (vidx, self.render_visual_line_from(vl, &source_line, &ctx))
+                        })
                     },
                 );
                 drop(visual_lines);
@@ -954,7 +976,7 @@ impl Output for Preview {
     /// Only draws the visible viewport window (plus a small overdraw margin) so
     /// large documents remain cheap to render.  Code blocks are re-evaluated each
     /// frame to pick up spinner changes and active-code styling, but unchanged
-    /// text benefits from the [`ViewLine`](crate::apps::tui::markdown::ViewLine) cache.
+    /// text benefits from the [`LogicalLine`](crate::apps::tui::markdown::LogicalLine) cache.
     fn render(&self, frame: &mut Frame, area: Rect) {
         let height = area.height as usize;
         let width = area.width as usize;
@@ -1102,49 +1124,95 @@ mod tests {
         preview.render_visual_line_from(visual_line, &source_line, ctx)
     }
 
-    fn visual_summary(preview: &Preview) -> String {
+    /// Renders every visual row to its final text, joined with newlines.
+    fn full_preview_text(preview: &Preview) -> String {
+        let ctx = RenderContext {
+            theme: &preview.theme,
+            active_code_id: None,
+            prefer_status_gutter: None,
+            spinner_char: ' ',
+            viewport_width: preview.visual_lines.last_width(),
+        };
         preview
             .visual_lines
             .borrow()
             .iter()
-            .enumerate()
-            .map(|(i, vl)| {
-                let text = vl.line.to_string();
-                let char_count = text.chars().count();
-                let preview_text = if char_count > 70 {
-                    let t: String = text.chars().take(67).collect();
-                    format!("{}...", t)
-                } else {
-                    text
-                };
-                format!("{:2}: [{}] {}", i, vl.wrap_idx, preview_text)
-            })
+            .map(|vl| render_visual_line(preview, &vl, &ctx).to_string())
             .collect::<Vec<_>>()
             .join("\n")
     }
 
     #[test]
-    fn test_wrap_long_paragraph() {
-        let preview = preview_from_markdown("This is a very long paragraph that should definitely wrap into multiple visual lines when the pane width is narrow.");
-        preview.rebuild_visual_lines(30);
-        let summary = visual_summary(&preview);
-        assert_snapshot!("wrap_long_paragraph", summary);
+    fn snapshot_full_heading() {
+        let preview = preview_from_markdown("# Title\n\n## Subtitle");
+        preview.rebuild_visual_lines(60);
+        assert_snapshot!("full_heading", full_preview_text(&preview));
     }
 
     #[test]
-    fn test_no_wrap_code_output() {
+    fn snapshot_full_paragraph_wrap() {
+        let preview = preview_from_markdown("A short paragraph.\n\nA much longer paragraph that will wrap when the available width is narrower than its content.");
+        preview.rebuild_visual_lines(30);
+        assert_snapshot!("full_paragraph_wrap", full_preview_text(&preview));
+    }
+
+    #[test]
+    fn snapshot_full_fenced_code() {
         let preview = preview_from_markdown("```bash\necho hello\n```");
-        preview.rebuild_visual_lines(20);
-        let summary = visual_summary(&preview);
-        assert_snapshot!("no_wrap_code_output", summary);
+        preview.rebuild_visual_lines(60);
+        assert_snapshot!("full_fenced_code", full_preview_text(&preview));
     }
 
     #[test]
-    fn test_code_body_wraps() {
-        let preview = preview_from_markdown("```rust\nfn very_long_function_name_that_exceeds_narrow_width() -> VeryLongReturnType {\n}\n```");
+    fn snapshot_full_code_wrap() {
+        let preview = preview_from_markdown("```rust\nfn very_long_function_name_that_exceeds_narrow_width() -> VeryLongReturnType {}\n```");
         preview.rebuild_visual_lines(30);
-        let summary = visual_summary(&preview);
-        assert_snapshot!("code_body_wraps", summary);
+        assert_snapshot!("full_code_wrap", full_preview_text(&preview));
+    }
+
+    #[test]
+    fn snapshot_full_bullet_list() {
+        let preview = preview_from_markdown("- item one\n- item two\n- item three");
+        preview.rebuild_visual_lines(60);
+        assert_snapshot!("full_bullet_list", full_preview_text(&preview));
+    }
+
+    #[test]
+    fn snapshot_full_task_list() {
+        let preview = preview_from_markdown("- [ ] unchecked\n- [x] checked\n- [ ] pending");
+        preview.rebuild_visual_lines(60);
+        assert_snapshot!("full_task_list", full_preview_text(&preview));
+    }
+
+    #[test]
+    fn snapshot_full_blockquote() {
+        let preview = preview_from_markdown("> quoted paragraph\n> ```bash\n> echo hi\n> ```");
+        preview.rebuild_visual_lines(60);
+        assert_snapshot!("full_blockquote", full_preview_text(&preview));
+    }
+
+    #[test]
+    fn snapshot_full_table() {
+        let preview =
+            preview_from_markdown("| Name | Age |\n|------|-----|\n| Alice | 30 |\n| Bob | 25 |");
+        preview.rebuild_visual_lines(60);
+        assert_snapshot!("full_table", full_preview_text(&preview));
+    }
+
+    #[test]
+    fn snapshot_full_thematic_break() {
+        let preview = preview_from_markdown("above\n\n-----\n\nbelow");
+        preview.rebuild_visual_lines(60);
+        assert_snapshot!("full_thematic_break", full_preview_text(&preview));
+    }
+
+    #[test]
+    fn snapshot_full_mixed_runbook() {
+        let preview = preview_from_markdown(
+            "# Setup\n\nInstall deps.\n\n```bash\nnpm install\n```\n\n> note\n\n- a\n- b",
+        );
+        preview.rebuild_visual_lines(40);
+        assert_snapshot!("full_mixed_runbook", full_preview_text(&preview));
     }
 
     #[test]
@@ -1357,8 +1425,8 @@ mod tests {
                 line.code_id == Some(1) && preview.logical_lines[line.logical_idx].is_code_body()
             })
             .expect("expected a code body visual line");
-        let display_len = preview.visual_lines.borrow()[code_body_idx]
-            .line
+        let display_len = preview
+            .plain_visual_line(&preview.visual_lines.borrow()[code_body_idx])
             .to_string()
             .chars()
             .count();

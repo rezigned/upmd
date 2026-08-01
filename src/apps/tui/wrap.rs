@@ -1,9 +1,6 @@
 use std::ops::Range;
 
-use ratatui::{
-    style::Style,
-    text::{Line, Span},
-};
+use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthChar;
 
 /// Describes a line of text for selection copying.
@@ -20,87 +17,32 @@ pub struct CopyLine {
     pub display_prefix_len: usize,
 }
 
-/// Wraps a single `Line` into multiple `Line`s so that each fits within
+/// Returns the character ranges produced by hard-wrapping `line` to
 /// `max_width` display columns.
 ///
-/// Returns a vector of `(wrapped_line, char_offset, source_len)` where
-/// `char_offset` is the starting character position of this wrapped segment
-/// within the original line, and `source_len` is the total character count of
-/// the original unwrapped line.
-pub fn wrap_line(line: Line<'static>, max_width: usize) -> Vec<(Line<'static>, usize, usize)> {
-    let line_style = line.style;
-    let line_alignment = line.alignment;
-
-    let chars: Vec<(char, Style)> = line
-        .spans
-        .into_iter()
-        .flat_map(|span| {
-            let style = span.style;
-            span.content
-                .chars()
-                .map(move |c| (c, style))
-                .collect::<Vec<_>>()
-        })
-        .collect();
-
-    let total_len = chars.len();
-    if total_len == 0 {
-        let mut empty = Line::default().style(line_style);
-        if let Some(a) = line_alignment {
-            empty = empty.alignment(a);
-        }
-        return vec![(empty, 0, 0)];
-    }
-
-    let mut segments = Vec::new();
-    let mut segment_spans: Vec<Span<'static>> = Vec::new();
-    let mut segment_width = 0;
+/// This stores no copied text or style data. Consumers that only need a
+/// viewport index can slice the source line when a row becomes visible.
+pub fn wrap_ranges(line: &Line<'_>, max_width: usize) -> Vec<Range<usize>> {
+    let mut ranges = Vec::new();
     let mut segment_start = 0;
-    let mut current_text = String::new();
-    let mut current_style = chars.first().map(|(_, s)| *s).unwrap_or_default();
+    let mut segment_width = 0;
+    let mut char_idx = 0;
 
-    for (i, (ch, style)) in chars.into_iter().enumerate() {
-        let w = ch.width().unwrap_or(1);
-
-        if segment_width + w > max_width && !current_text.is_empty() {
-            segment_spans.push(Span::styled(
-                std::mem::take(&mut current_text),
-                current_style,
-            ));
-            let mut seg = Line::from(std::mem::take(&mut segment_spans)).style(line_style);
-            if let Some(a) = line_alignment {
-                seg = seg.alignment(a);
-            }
-            segments.push((seg, segment_start, total_len));
-            segment_start = i;
+    for ch in line.spans.iter().flat_map(|span| span.content.chars()) {
+        let width = ch.width().unwrap_or(1);
+        if segment_width + width > max_width && char_idx > segment_start {
+            ranges.push(segment_start..char_idx);
+            segment_start = char_idx;
             segment_width = 0;
-            current_style = style;
         }
-
-        if !current_text.is_empty() && current_style != style {
-            segment_spans.push(Span::styled(
-                std::mem::take(&mut current_text),
-                current_style,
-            ));
-            current_style = style;
-        }
-
-        current_text.push(ch);
-        segment_width += w;
+        segment_width += width;
+        char_idx += 1;
     }
 
-    if !current_text.is_empty() {
-        segment_spans.push(Span::styled(current_text, current_style));
+    if char_idx == 0 || segment_start < char_idx {
+        ranges.push(segment_start..char_idx);
     }
-    if !segment_spans.is_empty() {
-        let mut seg = Line::from(segment_spans).style(line_style);
-        if let Some(a) = line_alignment {
-            seg = seg.alignment(a);
-        }
-        segments.push((seg, segment_start, total_len));
-    }
-
-    segments
+    ranges
 }
 
 /// Extracts a character range while preserving span, line, and alignment styles.
@@ -142,6 +84,18 @@ pub fn slice_line(line: &Line<'static>, range: Range<usize>) -> Line<'static> {
 mod tests {
     use super::*;
     use insta::assert_snapshot;
+    use ratatui::style::Style;
+
+    fn wrap_line(line: Line<'static>, max_width: usize) -> Vec<(Line<'static>, usize, usize)> {
+        let total_len = line.to_string().chars().count();
+        wrap_ranges(&line, max_width)
+            .into_iter()
+            .map(|range| {
+                let offset = range.start;
+                (slice_line(&line, range), offset, total_len)
+            })
+            .collect()
+    }
 
     #[test]
     fn test_wrap_line_plain() {

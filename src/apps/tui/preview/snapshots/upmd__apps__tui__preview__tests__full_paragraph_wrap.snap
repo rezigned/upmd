@@ -1,0 +1,11 @@
+---
+source: src/apps/tui/preview/mod.rs
+assertion_line: 1156
+expression: full_preview_text(&preview)
+---
+A short paragraph.
+
+A much longer paragraph th
+at will wrap when the avai
+lable width is narrower th
+an its content.

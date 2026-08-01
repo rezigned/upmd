@@ -1,30 +1,22 @@
 use std::cell::{Cell, RefCell};
 use std::ops::Range;
 
-use ratatui::style::Color;
-use ratatui::text::Line;
-
 use crate::apps::config::{PREVIEW_CODE_WRAP_OVERHEAD, PREVIEW_FRAME_OVERHEAD};
 use crate::apps::theme::Theme;
 use crate::runner::CodeId;
 
-use crate::apps::tui::markdown::{RenderContext, ViewLine};
-use crate::apps::tui::wrap::wrap_line;
+use crate::apps::tui::markdown::{LogicalLine, RenderContext};
+use crate::apps::tui::wrap::wrap_ranges;
 
-/// A single viewport line with plain layout text and paint source metadata.
+/// A single viewport row mapped back to its logical source line.
 ///
-/// `VisualLine`s are produced by [`VisualLines::rebuild`] and stored in
-/// [`VisualLines`]. Each corresponds to exactly one row in the terminal, even
-/// when the original [`ViewLine`](crate::apps::tui::markdown::ViewLine) was
-/// wrapped across multiple rows. The `wrap_idx` and `char_range` fields identify
-/// the segment so paint can slice highlighted spans while selection and copying
-/// use the syntax-free text.
+/// `VisualLine`s contain layout metadata only. Text and styles remain on the
+/// corresponding [`LogicalLine`](crate::apps::tui::markdown::LogicalLine) and are
+/// sliced when the row is rendered, selected, or copied.
 #[derive(Debug, Clone)]
 pub struct VisualLine {
-    pub line: Line<'static>,
     pub code_id: Option<CodeId>,
     pub logical_idx: usize,
-    pub gutter_fg: Option<Color>,
     /// Which wrapped segment of the original line this visual line represents.
     pub wrap_idx: usize,
     /// Character range within the original unwrapped display line.
@@ -32,19 +24,10 @@ pub struct VisualLine {
 }
 
 impl VisualLine {
-    /// A line that is never soft-wrapped (tables, PTY output, dividers).
-    fn unwrapped(
-        line: Line<'static>,
-        code_id: Option<CodeId>,
-        logical_idx: usize,
-        gutter_fg: Option<Color>,
-    ) -> Self {
-        let char_len = line.to_string().chars().count();
+    fn unwrapped(code_id: Option<CodeId>, logical_idx: usize, char_len: usize) -> Self {
         Self {
-            line,
             code_id,
             logical_idx,
-            gutter_fg,
             wrap_idx: 0,
             char_range: 0..char_len,
         }
@@ -52,28 +35,23 @@ impl VisualLine {
 
     /// A segment produced by soft-wrapping a logical line.
     fn wrapped(
-        line: Line<'static>,
         code_id: Option<CodeId>,
         logical_idx: usize,
         wrap_idx: usize,
-        char_offset: usize,
-        gutter_fg: Option<Color>,
+        char_range: Range<usize>,
     ) -> Self {
-        let char_len = line.to_string().chars().count();
         Self {
-            line,
             code_id,
             logical_idx,
-            gutter_fg,
             wrap_idx,
-            char_range: char_offset..char_offset + char_len,
+            char_range,
         }
     }
 }
 
 /// The viewport line cache.
 ///
-/// Owns the [`VisualLine`]s produced from the logical [`ViewLine`]s and tracks
+/// Owns the [`VisualLine`]s produced from the logical [`LogicalLine`]s and tracks
 /// the last known terminal dimensions so the cache can be invalidated on resize.
 pub struct VisualLines {
     lines: RefCell<Vec<VisualLine>>,
@@ -96,18 +74,16 @@ impl VisualLines {
         }
     }
 
-    /// Converts logical [`ViewLine`]s into viewport [`VisualLine`]s.
-    ///
-    /// Each `ViewLine` is rendered without syntax highlighting, then optionally
-    /// soft-wrapped by [`wrap_line`](crate::apps::tui::wrap::wrap_line). PTY
-    /// output, tables, and dividers are passed through unchanged.
+    /// Each `LogicalLine` is rendered without syntax highlighting, then optionally
+    /// measured by [`wrap_ranges`](crate::apps::tui::wrap::wrap_ranges). PTY
+    /// output, tables, and dividers are indexed as one row.
     ///
     /// If `target_block` is set, it is consumed and the visual index of the
     /// requested code-start line is returned so the caller can update its
     /// selection state.
     pub fn rebuild(
         &self,
-        logical_lines: &[ViewLine],
+        logical_lines: &[LogicalLine],
         width: usize,
         theme: &Theme,
         target_block: &Cell<Option<CodeId>>,
@@ -129,7 +105,7 @@ impl VisualLines {
         for (idx, logical_line) in logical_lines.iter().enumerate() {
             let line = logical_line.render_plain(&ctx);
             let prefix_width = logical_line.prefix_width();
-            let wrap_width = if logical_line.code_id.is_some() {
+            let wrap_width = if logical_line.has_code_gutter() {
                 width
                     .saturating_sub(PREVIEW_CODE_WRAP_OVERHEAD + prefix_width)
                     .max(1)
@@ -139,23 +115,16 @@ impl VisualLines {
                     .max(1)
             };
             if logical_line.is_unwrappable() {
-                new_visual_lines.push(VisualLine::unwrapped(
-                    line,
-                    logical_line.code_id,
-                    idx,
-                    logical_line.gutter_fg,
-                ));
+                let char_len = line.to_string().chars().count();
+                new_visual_lines.push(VisualLine::unwrapped(logical_line.code_id, idx, char_len));
             } else {
-                for (wrap_idx, (wrapped_line, char_offset, _source_len)) in
-                    wrap_line(line, wrap_width).into_iter().enumerate()
+                for (wrap_idx, char_range) in wrap_ranges(&line, wrap_width).into_iter().enumerate()
                 {
                     new_visual_lines.push(VisualLine::wrapped(
-                        wrapped_line,
                         logical_line.code_id,
                         idx,
                         wrap_idx,
-                        char_offset,
-                        logical_line.gutter_fg,
+                        char_range,
                     ));
                 }
             }
