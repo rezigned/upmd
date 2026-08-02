@@ -23,6 +23,11 @@ cargo test
 cargo test -- "$TEST_NAME"
 ```
 
+```sh [name:test-snapshots]
+INSTA_UPDATE=always cargo test -- --nocapture
+```
+
+
 ## Lint and format
 
 ```sh [name:clippy]
@@ -73,6 +78,20 @@ cargo clean
 
 ```sh [name:outdated]
 cargo outdated -R
+```
+
+## Release
+
+```sh [name:changelog]
+# Regenerate CHANGELOG.md from conventional commits since the last tag
+git cliff -o CHANGELOG.md
+```
+
+```sh [name:release, deps:verify-all]
+# Creates release commit + tag locally only (no crates.io publish, no push).
+# Push manually when ready with:
+#   git push origin main --follow-tags
+cargo release --package upmd patch --no-publish --no-push
 ```
 
 ## Demo recordings

@@ -26,27 +26,6 @@ members = [
 [patch.crates-io]
 vt100 = { git = "https://github.com/rezigned/vt100-rust", rev = "8a35571e9066436691ff52054f2f5425e22bd902" }
 
-# Config for 'dist'
-[workspace.metadata.dist]
-# Ignore release.yml mismatch (manual GitHub App token edit)
-allow-dirty = ["ci"]
-cargo-dist-version = "0.32.0"
-# CI backends to support
-ci = "github"
-# The installers to generate for each app
-installers = ["shell", "homebrew"]
-# Target platforms to build apps for (Rust target-triple syntax)
-targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
-msi = []
-# Path that installers should place binaries in
-install-path = "CARGO_HOME"
-# Homebrew tap repository for formula publishing
-tap = "rezigned/homebrew-tap"
-# CI jobs to run for publishing artifacts (homebrew formula, etc.)
-publish-jobs = ["homebrew"]
-# Whether to install an updater program
-install-updater = false
-
 [dependencies]
 
 # Workspace crates
@@ -91,6 +70,29 @@ lto = "fat"
 codegen-units = 1
 strip = "symbols"
 panic = "abort"
+
+# Config for 'cargo-release'
+[workspace.metadata.release]
+consolidate-commits = false
+tag-name = "v{{version}}"
+tag-message = "{{version}}"
+pre-release-commit-message = "chore(release): bump version to {{version}}"
+pre-release-hook = ["git", "cliff", "-o", "CHANGELOG.md", "--tag", "{{version}}"]
+publish = false
+
+# Config for 'cargo-dist'
+[workspace.metadata.dist]
+allow-dirty = ["ci"] # Ignore release.yml mismatch due to custom github token
+cargo-dist-version = "0.32.0"
+changelog = "CHANGELOG.md"
+ci = "github"
+installers = ["shell", "homebrew"]
+targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+msi = []
+install-path = "CARGO_HOME"
+tap = "rezigned/homebrew-tap"
+publish-jobs = ["homebrew"]
+install-updater = false
 
 # [profile.release]
 # debug = true

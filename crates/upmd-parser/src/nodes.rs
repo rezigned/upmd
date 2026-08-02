@@ -76,6 +76,7 @@ pub struct ListItem {
     pub text: Vec<InlineSpan>,
     pub children: Vec<Node>,
 }
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableCell {
     pub spans: Vec<InlineSpan>,
