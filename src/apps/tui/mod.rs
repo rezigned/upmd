@@ -18,6 +18,9 @@ pub mod themes;
 pub mod widgets;
 pub mod wrap;
 
+#[cfg(test)]
+pub mod testutil;
+
 use ratatui::text::Line;
 
 /// Component-defined footer shortcuts.

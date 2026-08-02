@@ -1,0 +1,9 @@
+---
+source: src/apps/tui/preview/mod.rs
+expression: ansi_line_summary(&rows)
+---
+[38;2;192;197;206mstart [38;2;79;91;102m[1m[4mab[0m
+[38;2;79;91;102m[1m[4mcdefghij[0m
+[38;2;79;91;102m[1m[4mklmnopqr[0m
+[38;2;79;91;102m[1m[4mstuvwxyz[0m
+[38;2;192;197;206m end[0m

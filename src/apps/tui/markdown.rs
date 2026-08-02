@@ -13,18 +13,20 @@
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::rc::Rc;
 use unicode_width::UnicodeWidthChar;
 
 use crate::apps::config::PREVIEW_FRAME_OVERHEAD;
 use crate::apps::theme::Theme;
 use crate::runner::CodeId;
 use upmd_parser::nodes::{
-    Alignment, Code, DepsToken, ListKind, Table as MarkdownTable, TaskStatus,
+    inline_text, Alignment, Code, DepsToken, InlineSpan, InlineStyle, ListKind, Table, TableCell,
+    TaskStatus,
 };
 use upmd_parser::Codes;
 
 use crate::apps::task::Task;
+use crate::apps::tui::wrap::slice_line;
 
 /// Render-time context passed to [`LogicalLine::render`].
 pub struct RenderContext<'a> {
@@ -36,12 +38,14 @@ pub struct RenderContext<'a> {
     pub viewport_width: usize,
 }
 
-/// Source text highlighted lazily and cached independently of viewport paint.
+/// Source text rendered lazily and cached independently of viewport paint.
 #[derive(Debug, Clone)]
 pub struct LazyText {
     pub(crate) text: String,
     pub(crate) language: String,
-    /// Lazily-populated cache: `None` until first highlight, then reused.
+    /// Parsed inline Markdown formatting for this line.
+    pub(crate) spans: Vec<InlineSpan>,
+    /// Lazily populated render cache.
     pub(crate) cached: std::cell::RefCell<Option<Text<'static>>>,
 }
 
@@ -50,6 +54,17 @@ impl LazyText {
         Self {
             text: text.into(),
             language: language.into(),
+            spans: Vec::new(),
+            cached: std::cell::RefCell::new(None),
+        }
+    }
+
+    fn from_spans(spans: Vec<InlineSpan>) -> Self {
+        let text = inline_text(&spans);
+        Self {
+            text,
+            language: "markdown".into(),
+            spans,
             cached: std::cell::RefCell::new(None),
         }
     }
@@ -60,6 +75,7 @@ impl Default for LazyText {
         Self {
             text: String::new(),
             language: String::new(),
+            spans: Vec::new(),
             cached: std::cell::RefCell::new(None),
         }
     }
@@ -71,6 +87,53 @@ pub struct CodeInfoLine {
     left: Vec<(String, Style)>,
     right: String,
     style: Style,
+}
+
+#[derive(Debug)]
+struct TableRenderCache {
+    viewport_width: usize,
+    lines: Vec<Line<'static>>,
+}
+
+/// Raw table data with rendered rows shared by every logical table line.
+#[derive(Debug)]
+pub struct MarkdownTable {
+    source: Table,
+    cache: std::cell::RefCell<Option<TableRenderCache>>,
+}
+
+impl MarkdownTable {
+    fn new(source: Table, viewport_width: usize, lines: Vec<Line<'static>>) -> Self {
+        Self {
+            source,
+            cache: std::cell::RefCell::new(Some(TableRenderCache {
+                viewport_width,
+                lines,
+            })),
+        }
+    }
+
+    fn line(&self, row_idx: usize, theme: &Theme, viewport_width: usize) -> Line<'static> {
+        let mut cache = self.cache.borrow_mut();
+        if cache
+            .as_ref()
+            .is_none_or(|cached| cached.viewport_width != viewport_width)
+        {
+            *cache = Some(TableRenderCache {
+                viewport_width,
+                lines: render_table(&self.source, theme, viewport_width),
+            });
+        }
+        cache
+            .as_ref()
+            .and_then(|cached| cached.lines.get(row_idx))
+            .cloned()
+            .unwrap_or_else(|| Line::raw(""))
+    }
+
+    fn clear_cache(&self) {
+        *self.cache.borrow_mut() = None;
+    }
 }
 
 /// Element-specific content for one logical preview line.
@@ -88,11 +151,11 @@ pub enum LogicalLineSource {
     CodeBody(LazyText),
     Output(Text<'static>),
     TableRow {
-        /// Stores the raw table data so it can be re-rendered when the viewport
-        /// width changes.
-        table: Arc<MarkdownTable>,
-        /// Which row of the table this `LogicalLine` represents.
+        /// Raw table data and responsive render cache shared by every row.
+        table: Rc<MarkdownTable>,
+        /// Which rendered row this `LogicalLine` represents.
         row_idx: usize,
+        /// Initial content retained for search and copy before viewport painting.
         initial: Line<'static>,
     },
     ThematicBreak,
@@ -160,31 +223,35 @@ impl LogicalLine {
         }
     }
 
-    /// Creates a text line with raw content that needs lazy highlighting.
-    pub fn text_lazy(raw: impl Into<String>, is_block_start: bool) -> Self {
+    /// Creates a text line from inline markdown spans.
+    pub fn text_lazy_spans(spans: Vec<InlineSpan>, is_block_start: bool) -> Self {
         Self {
-            source: LogicalLineSource::Text(LazyText::new(raw, "markdown")),
+            source: LogicalLineSource::Text(LazyText::from_spans(spans)),
             is_block_start,
             ..Self::default()
         }
     }
 
-    /// Creates a list item with raw content and styled prefix.
-    pub fn list_item(raw: impl Into<String>, prefix: Span<'static>, is_block_start: bool) -> Self {
+    /// Creates a list item from inline markdown spans with a styled prefix.
+    pub fn list_item_spans(
+        spans: Vec<InlineSpan>,
+        prefix: Span<'static>,
+        is_block_start: bool,
+    ) -> Self {
         Self {
-            source: LogicalLineSource::ListItem(LazyText::new(raw, "markdown")),
+            source: LogicalLineSource::ListItem(LazyText::from_spans(spans)),
             is_block_start,
             prefixes: vec![prefix],
             ..Self::default()
         }
     }
 
-    /// Creates a heading line with raw content that needs lazy highlighting.
-    pub fn heading_lazy(raw: impl Into<String>, level: u8) -> Self {
+    /// Creates a heading line from inline markdown spans.
+    pub fn heading_lazy_spans(spans: Vec<InlineSpan>, level: u8) -> Self {
         Self {
             source: LogicalLineSource::Heading {
                 level,
-                text: LazyText::new(raw, "markdown"),
+                text: LazyText::from_spans(spans),
             },
             is_block_start: true,
             ..Self::default()
@@ -229,7 +296,7 @@ impl LogicalLine {
     }
 
     /// Creates a table row or border line.
-    pub fn table(table: Arc<MarkdownTable>, row_idx: usize, initial: Line<'static>) -> Self {
+    pub fn table(table: Rc<MarkdownTable>, row_idx: usize, initial: Line<'static>) -> Self {
         Self {
             source: LogicalLineSource::TableRow {
                 table,
@@ -261,10 +328,15 @@ impl LogicalLine {
         self.source.lazy_text()
     }
 
-    /// Clears the lazy-highlight cache so the next render recomputes with the current theme.
+    /// Clears cached content so the next render uses the current theme.
     pub fn clear_cache(&self) {
-        if let Some(text) = self.lazy_text() {
-            *text.cached.borrow_mut() = None;
+        match &self.source {
+            LogicalLineSource::TableRow { table, .. } => table.clear_cache(),
+            _ => {
+                if let Some(text) = self.lazy_text() {
+                    *text.cached.borrow_mut() = None;
+                }
+            }
         }
     }
 
@@ -359,8 +431,8 @@ impl LogicalLine {
         self.render_with(ctx, false)
     }
 
-    /// Populates the syntax cache without applying viewport-dependent paint.
-    pub fn ensure_highlighted(&self, ctx: &RenderContext<'_>) -> bool {
+    /// Populates the content cache without applying viewport-dependent paint.
+    pub fn ensure_rendered(&self, ctx: &RenderContext<'_>) -> bool {
         if let Some(text) = self.lazy_text() {
             if text.cached.borrow().is_none() {
                 drop(self.render_content(ctx));
@@ -433,12 +505,14 @@ impl LogicalLine {
                     ctx.theme.rule_style(),
                 )))
             }
-            LogicalLineSource::TableRow { table, row_idx, .. } => Some(
-                render_table(table, ctx.theme, ctx.viewport_width)
-                    .into_iter()
-                    .nth(*row_idx)
-                    .unwrap_or_else(|| Line::raw("")),
-            ),
+            LogicalLineSource::TableRow { table, row_idx, .. } => {
+                let width = ctx
+                    .viewport_width
+                    .saturating_sub(PREVIEW_FRAME_OVERHEAD)
+                    .saturating_sub(self.prefix_width())
+                    .max(1);
+                Some(table.line(*row_idx, ctx.theme, width))
+            }
             _ => None,
         }
     }
@@ -452,7 +526,7 @@ impl LogicalLine {
         }
     }
 
-    /// Renders the main line content with lazy syntax highlighting.
+    /// Renders the main line content, caching semantic Markdown or syntax-highlighted code.
     fn render_content(&self, ctx: &RenderContext<'_>) -> Line<'static> {
         match &self.source {
             LogicalLineSource::Text(text)
@@ -468,16 +542,30 @@ impl LogicalLine {
                         .unwrap_or_else(|| expand_tabs_in_line(Line::raw(text.text.clone())));
                 }
 
-                let mut highlighted = ctx.theme.highlight(&text.text, &text.language);
-                for line in &mut highlighted.lines {
+                let mut rendered = if text.spans.is_empty() {
+                    ctx.theme.highlight(&text.text, &text.language)
+                } else {
+                    let line = match self.source {
+                        LogicalLineSource::Heading { .. } => {
+                            render_heading_spans(&text.spans, ctx.theme)
+                        }
+                        _ => render_inline_spans(
+                            &text.spans,
+                            ctx.theme.markdown_text_style(),
+                            ctx.theme,
+                        ),
+                    };
+                    Text::from(line)
+                };
+                for line in &mut rendered.lines {
                     *line = expand_tabs_in_line(std::mem::take(line));
                 }
-                let line = highlighted
+                let line = rendered
                     .lines
                     .first()
                     .cloned()
                     .unwrap_or_else(|| expand_tabs_in_line(Line::raw(text.text.clone())));
-                *cache = Some(highlighted);
+                *cache = Some(rendered);
                 line
             }
             LogicalLineSource::CodeInfo(info) => {
@@ -590,7 +678,7 @@ pub fn gutter_style(
 ///
 /// Column widths are capped so the total table width does not exceed
 /// `viewport_width`.  Content is truncated with "…" when necessary.
-fn render_table(table: &MarkdownTable, theme: &Theme, viewport_width: usize) -> Vec<Line<'static>> {
+fn render_table(table: &Table, theme: &Theme, viewport_width: usize) -> Vec<Line<'static>> {
     let content_fg = theme.foreground;
     let line_fg = theme.info_background;
     if table.headers.is_empty() {
@@ -604,12 +692,12 @@ fn render_table(table: &MarkdownTable, theme: &Theme, viewport_width: usize) -> 
 
     let natural_widths: Vec<usize> = (0..n)
         .map(|i| {
-            let header_w = table.headers[i].chars().count();
+            let header_w = table.headers[i].char_len();
             let cell_w = table
                 .rows
                 .iter()
                 .filter_map(|r| r.get(i))
-                .map(|c| c.chars().count())
+                .map(TableCell::char_len)
                 .max()
                 .unwrap_or(0);
             header_w.max(cell_w)
@@ -664,14 +752,19 @@ fn render_table(table: &MarkdownTable, theme: &Theme, viewport_width: usize) -> 
         )
     };
 
-    let make_row = |cells: &[String], style_fn: &dyn Fn(usize) -> Style| {
+    let make_row = |cells: &[TableCell], base_style: Style| {
         let mut spans = vec![Span::raw("│").fg(line_fg)];
         for (i, cell) in cells.iter().enumerate() {
             let align = table.alignments.get(i).copied().unwrap_or(Alignment::Left);
-            spans.push(Span::styled(
-                format!(" {} ", align_cell(cell, col_widths[i], align)),
-                style_fn(i),
+            spans.push(Span::styled(" ", base_style));
+            spans.extend(render_table_cell(
+                cell,
+                col_widths[i],
+                align,
+                base_style,
+                theme,
             ));
+            spans.push(Span::styled(" ", base_style));
             spans.push(Span::raw("│").fg(line_fg));
         }
         Line::from(spans)
@@ -683,42 +776,55 @@ fn render_table(table: &MarkdownTable, theme: &Theme, viewport_width: usize) -> 
 
     let mut lines = vec![
         Line::raw(h_border("┌", "┬", "┐")).style(line),
-        make_row(&table.headers, &|_| bold),
+        make_row(&table.headers, bold),
         Line::raw(h_border("├", "┼", "┤")).style(line),
     ];
     for row in &table.rows {
-        lines.push(make_row(row, &|_| normal));
+        lines.push(make_row(row, normal));
     }
     lines.push(Line::raw(h_border("└", "┴", "┘")).style(line));
     lines
 }
 
-fn align_cell(text: &str, width: usize, align: Alignment) -> String {
-    let visible = text.chars().count();
-    let text = if visible > width {
-        if width <= 1 {
-            "…".to_string()
+fn render_table_cell(
+    cell: &TableCell,
+    width: usize,
+    alignment: Alignment,
+    base_style: Style,
+    theme: &Theme,
+) -> Vec<Span<'static>> {
+    if width == 0 {
+        return Vec::new();
+    }
+
+    let visible = cell.char_len();
+    let mut line = render_inline_spans(&cell.spans, base_style, theme);
+    let content_width = visible.min(width);
+    if visible > width {
+        if width == 1 {
+            line = Line::from(Span::styled("…", base_style));
         } else {
-            let prefix: String = text.chars().take(width.saturating_sub(1)).collect();
-            format!("{}…", prefix)
+            line = slice_line(&line, 0..width - 1);
+            line.spans.push(Span::styled("…", base_style));
         }
-    } else {
-        text.to_string()
+    }
+
+    let padding = width.saturating_sub(content_width);
+    let (left, right) = match alignment {
+        Alignment::Right => (padding, 0),
+        Alignment::Center => (padding / 2, padding - padding / 2),
+        Alignment::Left | Alignment::None => (0, padding),
     };
 
-    match align {
-        Alignment::Right => format!("{:>width$}", text),
-        Alignment::Center => {
-            let pad = width.saturating_sub(text.chars().count());
-            format!(
-                "{}{}{}",
-                " ".repeat(pad / 2),
-                text,
-                " ".repeat(pad - pad / 2)
-            )
-        }
-        Alignment::Left | Alignment::None => format!("{text:width$}"),
+    let mut spans = Vec::with_capacity(line.spans.len() + 2);
+    if left > 0 {
+        spans.push(Span::styled(" ".repeat(left), base_style));
     }
+    spans.extend(line.spans);
+    if right > 0 {
+        spans.push(Span::styled(" ".repeat(right), base_style));
+    }
+    spans
 }
 
 /// Render-time context for code-block snap-to-heading/paragraph.
@@ -852,15 +958,20 @@ impl<'a> MarkdownRenderer<'a> {
             Node::Heading { text: t, level } => {
                 let line_idx = lines.len();
                 let prefix = "#".repeat(*level as usize);
-                let text = t.trim_start_matches('#').trim();
-                let content = if prefix.is_empty() {
-                    text.to_string()
-                } else {
-                    format!("{} {}", prefix, text)
-                };
+                let mut content = t.clone();
+                if let Some(first) = content.first_mut() {
+                    first.text = first.text.trim_start_matches('#').trim_start().to_string();
+                }
+                content.insert(
+                    0,
+                    InlineSpan {
+                        text: format!("{prefix} "),
+                        style: Vec::new(),
+                    },
+                );
                 self.push_line(
                     lines,
-                    LogicalLine::heading_lazy(content, *level),
+                    LogicalLine::heading_lazy_spans(content, *level),
                     state.quote_depth,
                 );
                 state.snap.title_line = Some(line_idx);
@@ -919,12 +1030,19 @@ impl<'a> MarkdownRenderer<'a> {
                 );
             }
             Node::Table(table) => {
-                let table = Arc::new(table.clone());
-                let rendered = render_table(&table, self.theme, self.viewport_width);
-                for (row_idx, line) in rendered.into_iter().enumerate() {
+                let table_width = self
+                    .viewport_width
+                    .saturating_sub(PREVIEW_FRAME_OVERHEAD)
+                    .saturating_sub(Self::quote_prefix_width(state.quote_depth))
+                    .max(1);
+                let rendered = render_table(table, self.theme, table_width);
+                let row_count = rendered.len();
+                let table = Rc::new(MarkdownTable::new(table.clone(), table_width, rendered));
+                for row_idx in 0..row_count {
+                    let initial = table.line(row_idx, self.theme, table_width);
                     self.push_line(
                         lines,
-                        LogicalLine::table(Arc::clone(&table), row_idx, line),
+                        LogicalLine::table(Rc::clone(&table), row_idx, initial),
                         state.quote_depth,
                     );
                 }
@@ -939,7 +1057,7 @@ impl<'a> MarkdownRenderer<'a> {
 
     fn push_highlighted_lines(
         &self,
-        text: &str,
+        spans: &[InlineSpan],
         lines: &mut Vec<LogicalLine>,
         block_start: bool,
         quote_depth: usize,
@@ -947,10 +1065,10 @@ impl<'a> MarkdownRenderer<'a> {
         let start_idx = lines.len();
         let mut first = block_start;
         let mut emitted = false;
-        for line in text.lines() {
+        for line in split_span_lines(spans) {
             self.push_line(
                 lines,
-                LogicalLine::text_lazy(line.to_string(), first),
+                LogicalLine::text_lazy_spans(line, first),
                 quote_depth,
             );
             first = false;
@@ -985,7 +1103,7 @@ impl<'a> MarkdownRenderer<'a> {
 
             let continuation = format!("{}{}", indent, " ".repeat(marker.chars().count()));
 
-            for (line_idx, line) in item.text.lines().enumerate() {
+            for (line_idx, line) in split_span_lines(&item.text).into_iter().enumerate() {
                 let prefix = if line_idx == 0 {
                     Span::styled(format!("{}{}", indent, marker), Style::default().fg(color))
                 } else {
@@ -993,7 +1111,7 @@ impl<'a> MarkdownRenderer<'a> {
                 };
                 self.push_line(
                     lines,
-                    LogicalLine::list_item(line.to_string(), prefix, i == 0 && line_idx == 0),
+                    LogicalLine::list_item_spans(line, prefix, i == 0 && line_idx == 0),
                     state.quote_depth,
                 );
             }
@@ -1227,10 +1345,96 @@ fn expand_tabs_in_line(mut line: Line<'static>) -> Line<'static> {
     line
 }
 
+/// Splits inline spans on `\n` into one group of spans per line, mirroring
+/// `str::lines()` (trailing empty segments are dropped).
+fn split_span_lines(spans: &[InlineSpan]) -> Vec<Vec<InlineSpan>> {
+    let mut lines = Vec::new();
+    let mut current = Vec::new();
+    for span in spans {
+        let mut text = span.text.as_str();
+        loop {
+            match text.find('\n') {
+                Some(idx) => {
+                    let (head, tail) = text.split_at(idx);
+                    if !head.is_empty() {
+                        current.push(InlineSpan {
+                            text: head.to_string(),
+                            style: span.style.clone(),
+                        });
+                    }
+                    lines.push(std::mem::take(&mut current));
+                    text = &tail[1..];
+                }
+                None => {
+                    if !text.is_empty() {
+                        current.push(InlineSpan {
+                            text: text.to_string(),
+                            style: span.style.clone(),
+                        });
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+/// Renders parsed inline Markdown spans directly from their semantic styles.
+fn render_inline_spans(spans: &[InlineSpan], base_style: Style, theme: &Theme) -> Line<'static> {
+    let rendered = spans
+        .iter()
+        .map(|span| render_inline_span(span, base_style, theme))
+        .collect::<Vec<_>>();
+    Line::from(rendered).style(base_style)
+}
+
+/// Preserves Syntect's distinct styles for the heading marker and heading text.
+fn render_heading_spans(spans: &[InlineSpan], theme: &Theme) -> Line<'static> {
+    let heading_style = theme.markdown_heading_style();
+    let rendered = spans
+        .iter()
+        .enumerate()
+        .map(|(index, span)| {
+            let base_style = if index == 0 && span.text.starts_with('#') {
+                theme.markdown_heading_marker_style()
+            } else {
+                heading_style
+            };
+            render_inline_span(span, base_style, theme)
+        })
+        .collect::<Vec<_>>();
+    Line::from(rendered).style(heading_style)
+}
+
+fn render_inline_span(span: &InlineSpan, base_style: Style, theme: &Theme) -> Span<'static> {
+    let style = span.style.iter().fold(base_style, |style, inline| {
+        style.patch(inline_style(theme, inline))
+    });
+    Span::styled(span.text.clone(), style)
+}
+
+/// Maps an [`InlineStyle`] to the ratatui [`Style`] patched onto a semantic
+/// Markdown span. Nested modifiers combine; semantic colors override the base.
+fn inline_style(theme: &Theme, style: &InlineStyle) -> Style {
+    match style {
+        InlineStyle::Bold => Style::default().add_modifier(Modifier::BOLD),
+        InlineStyle::Italic => Style::default().add_modifier(Modifier::ITALIC),
+        InlineStyle::Strikethrough => Style::default().add_modifier(Modifier::CROSSED_OUT),
+        InlineStyle::InlineCode => theme.inline_code_style(),
+        InlineStyle::Link { .. } => theme.link_style(),
+        InlineStyle::Image { .. } => theme.image_style(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::apps::task::Task;
+    use crate::apps::tui::testutil::ansi_line;
     use insta::assert_snapshot;
     use ratatui::style::Color;
     use std::collections::HashMap;
@@ -1538,10 +1742,119 @@ mod tests {
     }
 
     #[test]
+    fn test_render_inline_heading_styles() {
+        let theme = Theme::new("base16-ocean.dark", false);
+        let ctx = RenderContext {
+            theme: &theme,
+            active_code_id: None,
+            prefer_status_gutter: None,
+            spinner_char: ' ',
+            viewport_width: 80,
+        };
+        let lines = render_nodes("# **Bold** title");
+        let heading = lines
+            .iter()
+            .find(|l| l.heading_level().is_some())
+            .expect("expected a heading");
+        let rendered = heading.render(&ctx);
+
+        assert_snapshot!("inline_heading_styles", ansi_line(&rendered));
+    }
+
+    #[test]
+    fn test_render_inline_list_item_styles() {
+        let theme = Theme::new("base16-ocean.dark", false);
+        let ctx = RenderContext {
+            theme: &theme,
+            active_code_id: None,
+            prefer_status_gutter: None,
+            spinner_char: ' ',
+            viewport_width: 80,
+        };
+        let lines = render_nodes("- **bold item**");
+        let item = lines
+            .iter()
+            .find(|l| matches!(l.source, LogicalLineSource::ListItem(_)))
+            .expect("expected a list item");
+        let rendered = item.render(&ctx);
+
+        assert_snapshot!("inline_list_item_styles", ansi_line(&rendered));
+    }
+
+    #[test]
+    fn test_split_span_lines() {
+        let spans = vec![
+            InlineSpan {
+                text: "line one\n".into(),
+                style: vec![InlineStyle::Bold],
+            },
+            InlineSpan {
+                text: "line two".into(),
+                style: vec![],
+            },
+        ];
+        let lines = split_span_lines(&spans);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(inline_text(&lines[0]), "line one");
+        assert_eq!(lines[0][0].style, vec![InlineStyle::Bold]);
+        assert_eq!(inline_text(&lines[1]), "line two");
+
+        // Empty input yields no lines.
+        assert!(split_span_lines(&[]).is_empty());
+        // Trailing newline drops the empty tail.
+        assert_eq!(
+            split_span_lines(&[InlineSpan {
+                text: "a\n".into(),
+                style: vec![]
+            }])
+            .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_render_inline_styles_snapshot() {
+        let lines = render_nodes(
+            "**bold** *italic* ~~strike~~ `code` [link](https://x.dev) ![alt text](img.png)\n\
+             \n\
+             ## Heading with **bold**\n\
+             \n\
+             - **bold item**\n\
+             - *italic item*",
+        );
+        assert_snapshot!("inline_styles", logical_line_summary(&lines));
+    }
+
+    #[test]
     fn test_render_table() {
         let lines =
             render_nodes("| Name  | Age |\n|-------|-----|\n| Alice | 30  |\n| Bob   | 25  |");
         assert_snapshot!("table", logical_line_summary(&lines));
+    }
+
+    #[test]
+    fn test_render_table_inline_styles() {
+        let theme = Theme::new("base16-ocean.dark", false);
+        let ctx = RenderContext {
+            theme: &theme,
+            active_code_id: None,
+            prefer_status_gutter: None,
+            spinner_char: ' ',
+            viewport_width: 80,
+        };
+        let lines = render_nodes(
+            "| Name | Reference |\n\
+             |------|-----------|\n\
+             | **bold** | [docs](https://x.dev) |",
+        );
+        let row = lines
+            .iter()
+            .filter(|line| matches!(line.source, LogicalLineSource::TableRow { .. }))
+            .map(|line| line.render(&ctx))
+            .find(|line| line.to_string().contains("bold"))
+            .expect("expected styled table body row");
+
+        assert_snapshot!("table_inline_styles", ansi_line(&row));
     }
 
     #[test]
@@ -1814,7 +2127,7 @@ pytest tests/
         assert_snapshot!("inline_scroll_short", result);
     }
     #[test]
-    fn render_plain_does_not_populate_syntax_cache() {
+    fn render_plain_does_not_populate_content_cache() {
         let theme = Theme::new("base16-ocean.dark", false);
         let ctx = RenderContext {
             theme: &theme,
@@ -1823,7 +2136,13 @@ pytest tests/
             spinner_char: ' ',
             viewport_width: 80,
         };
-        let line = LogicalLine::text_lazy("let value = 1;", false);
+        let line = LogicalLine::text_lazy_spans(
+            vec![InlineSpan {
+                text: "let value = 1;".into(),
+                style: Vec::new(),
+            }],
+            false,
+        );
 
         let rendered = line.render_plain(&ctx);
 
@@ -1831,9 +2150,9 @@ pytest tests/
         let cached = &line.lazy_text().expect("expected lazy text").cached;
         assert!(cached.borrow().is_none());
 
-        assert!(line.ensure_highlighted(&ctx));
+        assert!(line.ensure_rendered(&ctx));
         assert!(cached.borrow().is_some());
-        assert!(!line.ensure_highlighted(&ctx));
+        assert!(!line.ensure_rendered(&ctx));
     }
 
     #[test]
