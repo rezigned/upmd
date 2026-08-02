@@ -1,6 +1,6 @@
 ---
 source: src/apps/tui/app.rs
-expression: "rows.join(\"\\n\")"
+expression: output
 ---
 ┌───┬──────────────────────────────────────────────────────────────────────────┐
 │ 1 │ ▎ 3 target [prepare | build]                                      Shell  │
@@ -25,4 +25,4 @@ expression: "rows.join(\"\\n\")"
 │   │             │                                                            │
 │   │ · build   ──┘                                                            │
 └───┴──────────────────────────────────────────────────────────────────────────┘
- NORMAL  ↑↓ move  ↵ run  / search  ctrl-g goto  f files  t theme  z  upmd 0.2.0
+ NORMAL  ↑↓ move  ↵ run  / search  ctrl-g goto  f files  t theme  z  upmd VERSION

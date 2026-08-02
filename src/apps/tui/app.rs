@@ -2297,6 +2297,9 @@ mod tests {
                     .collect::<String>()
             })
             .collect();
-        insta::assert_snapshot!(rows.join("\n"));
+        let output = rows
+            .join("\n")
+            .replace(&format!("upmd {}", config::APP_VERSION), "upmd VERSION");
+        insta::assert_snapshot!(output);
     }
 }
