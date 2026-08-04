@@ -256,6 +256,10 @@ impl DependencyGraph {
         &self.layers
     }
 
+    pub fn has_deps(&self) -> bool {
+        !self.dependents.is_empty()
+    }
+
     pub fn target(&self) -> Option<CodeId> {
         self.target
     }

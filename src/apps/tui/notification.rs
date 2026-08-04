@@ -68,6 +68,7 @@ impl FlashMessage {
     pub fn is_expired(&self, now: Instant) -> bool {
         now >= self.expires_at
     }
+
     /// Renders the notification into `frame` at the bottom-right of `area`.
     pub fn render(&self, frame: &mut Frame, area: Rect, theme: &crate::apps::theme::Theme) {
         use ratatui::{layout::Alignment, text::Line, widgets::Paragraph};

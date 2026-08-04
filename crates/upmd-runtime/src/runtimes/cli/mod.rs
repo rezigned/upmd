@@ -58,6 +58,7 @@ impl Config {
             poll_timeout_ms: 16,
         }
     }
+
     /// Sets the poll timeout duration in milliseconds.
     ///
     /// This controls how long `crossterm::event::poll()` waits for input.

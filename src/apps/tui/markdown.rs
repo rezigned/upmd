@@ -616,6 +616,7 @@ impl LogicalLine {
         );
     }
 }
+
 /// Prepends gutter "▎". Priority: running > active > status > inactive.
 pub fn apply_gutter(
     line: &mut Line<'static>,
@@ -1126,6 +1127,7 @@ impl<'a> MarkdownRenderer<'a> {
             self.push_line(lines, LogicalLine::newline(None, false), state.quote_depth);
         }
     }
+
     fn push_code_info(&self, code: &Code, is_start: bool) -> LogicalLine {
         let buffer = self.outputs.get(&code.id);
         let is_executed =
@@ -2126,6 +2128,7 @@ pytest tests/
         let result = render_with_outputs(&outputs, "```bash\necho test\n```", 10);
         assert_snapshot!("inline_scroll_short", result);
     }
+
     #[test]
     fn render_plain_does_not_populate_content_cache() {
         let theme = Theme::new("base16-ocean.dark", false);

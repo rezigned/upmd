@@ -139,6 +139,7 @@ impl Help {
             _ => "?",
         }
     }
+
     fn build_matches(&self) -> Vec<usize> {
         if self.query.is_empty() {
             return (0..self.all_items.len()).collect();

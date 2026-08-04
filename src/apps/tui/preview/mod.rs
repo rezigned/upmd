@@ -115,6 +115,7 @@ pub struct Preview {
     /// Prefix overhead in chars per code block (non-zero only for blockquote-nested blocks).
     code_prefix_overhead: HashMap<CodeId, usize>,
 }
+
 #[derive(KeyMap, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Action {
     /// Scrolls the preview content up by one line (mouse-triggered).
@@ -141,6 +142,7 @@ pub enum Action {
     #[key("pagedown", "ctrl-f")]
     PageDown,
 }
+
 impl Preview {
     /// Creates a preview from parsed AST nodes and code blocks.
     pub fn new(
@@ -1482,6 +1484,7 @@ mod tests {
             Some("echo hello".to_string())
         );
     }
+
     #[test]
     fn test_mouse_to_pty_coords_handles_scroll_above_block_start() {
         let preview = preview_from_markdown("# Intro\n\n```bash\necho first\necho second\n```\n");
@@ -1677,6 +1680,7 @@ mod tests {
             );
         }
     }
+
     #[test]
     fn inline_pty_uses_all_rows_below_visible_source() {
         assert_eq!(inline_pty_rows(40, 4, 5, 0), (35, 0));
