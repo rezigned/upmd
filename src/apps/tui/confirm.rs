@@ -41,6 +41,7 @@ pub enum Action {
     Confirmed(ConfirmAction),
     Cancelled,
 }
+
 impl Confirm {
     pub fn new(
         title: &str,

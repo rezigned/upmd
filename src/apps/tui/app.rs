@@ -5,7 +5,8 @@ use crate::apps::exec;
 use crate::apps::navigation::Navigation;
 use crate::apps::tui;
 use crate::apps::tui::{
-    confirm, dependencies, file_picker, layout, menu, preview, tasks::Tasks, themes, Shortcut,
+    confirm, dependencies, file_picker, layout, menu, preview, tasks::Tasks, themes,
+    workflow::State as WorkflowState, Shortcut,
 };
 use crate::apps::workflow::{Workflow, WorkflowTransition};
 use crate::utils::key_to_bytes;
@@ -20,12 +21,7 @@ use ratatui::{
     Frame,
 };
 use std::{
-    cell::RefCell,
-    collections::{BTreeMap, HashMap},
-    path::PathBuf,
-    process::ExitCode,
-    thread,
-    time::Duration,
+    cell::RefCell, collections::HashMap, path::PathBuf, process::ExitCode, thread, time::Duration,
 };
 use upmd_parser::{CodeId, Parser};
 use upmd_runtime::{
@@ -104,18 +100,13 @@ pub struct App {
     /// Selecting a/b/c.md does not re-root the next picker to a/b/.
     file_picker_root: Option<PathBuf>,
     output: tui::output::Output,
-    workflow: Option<Workflow>,
-    pending_states: BTreeMap<CodeId, (Option<config::Envs>, Option<PathBuf>)>,
+    workflow: WorkflowState,
     last_cwd: Option<PathBuf>,
     started: bool,
     /// Cached default footer right text (rebuilt when the theme changes).
     footer_right_text: Line<'static>,
     /// Transient flash notification at the bottom right.
     notification: Option<tui::notification::FlashMessage>,
-    /// Dependency graph for the latest workflow.
-    workflow_graph: Option<dependencies::Dependencies>,
-    /// Whether the workflow graph is visible below the preview.
-    workflow_graph_visible: bool,
 }
 
 #[derive(Clone, KeyMap, Debug, PartialEq, Eq, Hash)]
@@ -254,13 +245,10 @@ impl App {
             file_picker_root: None,
             menu,
             output: tui::output::Output::new(config.keymap.output()),
-            workflow: None,
-            pending_states: BTreeMap::new(),
+            workflow: WorkflowState::default(),
             last_cwd: None,
             notification: None,
             started: false,
-            workflow_graph: None,
-            workflow_graph_visible: false,
             footer_right_text: Self::build_footer_right_text(&theme),
         }
     }
@@ -372,16 +360,13 @@ impl App {
                 .tasks
                 .get(id)
                 .is_some_and(|task| task.exit_code == Some(0));
-            let should_execute = self
-                .workflow
-                .as_ref()
-                .is_none_or(|workflow| workflow.should_execute(id, succeeded));
+            let should_execute = self.workflow.should_execute(id, succeeded);
             if !should_execute {
-                completed = self.advance_workflow(id, Some(0));
+                completed = self.workflow.advance(id, Some(0));
             } else if let Some(command) = self.execute_block(id) {
                 commands.push(command);
             } else {
-                completed = self.advance_workflow(id, Some(1));
+                completed = self.workflow.advance(id, Some(1));
             }
         }
 
@@ -398,12 +383,9 @@ impl App {
         }
     }
 
-    fn start_plan(&mut self, mut workflow: Workflow) -> Option<Cmd<Msg>> {
-        let auto_run = workflow.auto_run();
-        let batch = workflow.start()?;
+    fn start_plan(&mut self, workflow: Workflow) -> Option<Cmd<Msg>> {
         let graph = workflow.graph().clone();
-        self.workflow_graph_visible = graph.layers().len() > 1;
-        self.workflow_graph = Some(dependencies::Dependencies::new(
+        let dependencies = dependencies::Dependencies::new(
             "Workflow",
             self.preview.codes(),
             Some(Ok(graph)),
@@ -411,8 +393,8 @@ impl App {
             self.tasks.task_statuses(),
             self.theme.clone(),
             self.config.keymap.dependencies(),
-        ));
-        self.workflow = Some(workflow);
+        );
+        let (batch, auto_run) = self.workflow.start(workflow, dependencies)?;
         self.select_batch(&batch);
         auto_run.then(|| self.launch_batch(batch)).flatten()
     }
@@ -448,26 +430,17 @@ impl App {
     }
 
     fn execute(&mut self, id: CodeId) -> Option<Cmd<Msg>> {
-        if let Some(workflow) = &self.workflow {
-            if !workflow.is_running(id) {
+        if self.workflow.is_active() {
+            if !self.workflow.is_running(id) {
                 return None;
             }
             return self.execute_block(id).or_else(|| {
-                self.advance_workflow(id, Some(1))
-                    .and_then(|r| self.handle_advance(r))
+                self.workflow
+                    .advance(id, Some(1))
+                    .and_then(|result| self.handle_advance(result))
             });
         }
         self.start_target(id)
-    }
-
-    fn advance_workflow(
-        &mut self,
-        id: CodeId,
-        exit_code: Option<i32>,
-    ) -> Option<WorkflowTransition> {
-        self.workflow
-            .as_mut()
-            .map(|workflow| workflow.advance(id, exit_code))
     }
 
     fn handle_advance(&mut self, result: WorkflowTransition) -> Option<Cmd<Msg>> {
@@ -476,15 +449,14 @@ impl App {
                 self.flush_pending_states();
                 self.select_batch(&batch);
                 self.workflow
-                    .as_ref()
-                    .is_some_and(Workflow::auto_run)
+                    .auto_run()
                     .then(|| self.launch_batch(batch))
                     .flatten()
             }
             WorkflowTransition::Pending | WorkflowTransition::Untracked => None,
             WorkflowTransition::Stopped(failure) => {
                 self.flush_pending_states();
-                self.workflow = None;
+                self.workflow.finish();
                 self.notify_error(format!(
                     "Block {} failed - stopping dependency chain",
                     failure.block
@@ -493,8 +465,42 @@ impl App {
             }
             WorkflowTransition::Finished { .. } => {
                 self.flush_pending_states();
-                self.workflow = None;
+                self.workflow.finish();
                 None
+            }
+        }
+    }
+
+    fn capture_state(&mut self, id: CodeId, capture_env: bool, capture_cwd: bool) {
+        if !capture_env && !capture_cwd {
+            return;
+        }
+        let task = self.tasks.get(id);
+        let env = capture_env.then(|| task?.captured_envs.clone()).flatten();
+        let cwd = capture_cwd
+            .then(|| task?.captured_cwd.as_deref().map(PathBuf::from))
+            .flatten();
+
+        if !self.workflow.is_active() {
+            if let Some(env) = env {
+                self.envs.merge_envs(env);
+            }
+            if let Some(cwd) = cwd {
+                self.last_cwd = Some(cwd);
+            }
+            return;
+        }
+
+        self.workflow.capture(id, env, cwd);
+    }
+
+    fn flush_pending_states(&mut self) {
+        for (_, state) in self.workflow.take_captures() {
+            if let Some(envs) = state.envs {
+                self.envs.merge_envs(envs);
+            }
+            if let Some(cwd) = state.cwd {
+                self.last_cwd = Some(cwd);
             }
         }
     }
@@ -503,7 +509,7 @@ impl App {
         // Don't auto-navigate when running a specific target (stay on the
         // block the user originally selected.  In for_all mode (no target)
         // navigation follows the execution order.
-        let has_target = self.workflow.as_ref().and_then(Workflow::target).is_some();
+        let has_target = self.workflow.has_target();
         if has_target {
             return;
         }
@@ -515,6 +521,7 @@ impl App {
     fn sync_menu_running_state(&mut self) {
         self.menu.set_code_statuses(self.tasks.task_statuses());
     }
+
     /// Sends raw text to the currently selected PTY as if the user typed it.
     fn send_text_to_pty(&mut self, text: &str) {
         if let Some(id) = self.menu.selected() {
@@ -733,9 +740,7 @@ impl Component for App {
                 if let Some(Overlay::Dependencies(dependencies)) = &mut self.overlay {
                     dependencies.tick(statuses.clone());
                 }
-                if let Some(graph) = &mut self.workflow_graph {
-                    graph.tick(statuses);
-                }
+                self.workflow.tick(statuses);
 
                 // Clear expired flash notification.
                 if self
@@ -760,7 +765,49 @@ impl App {
         }
     }
 
+    fn is_action_enabled(&self, action: &Action) -> bool {
+        let selected_task = self.menu.selected().and_then(|id| self.tasks.get(id));
+
+        match action {
+            Action::ViewOutput => selected_task.is_some(),
+            Action::Input => selected_task.is_some_and(|task| task.running()),
+            Action::ExitInput => self.view == View::Input,
+            Action::Paste => {
+                self.view == View::Input && selected_task.is_some_and(|task| task.running())
+            }
+            Action::ToggleWorkflowGraph => self.workflow.has_graph(),
+            _ => true,
+        }
+    }
+
+    fn is_action_visible_in_footer(&self, action: &Action) -> bool {
+        if !self.is_action_enabled(action) {
+            return false;
+        }
+
+        match self.view {
+            View::Input => matches!(action, Action::ExitInput | Action::Paste),
+            View::Home | View::Output => matches!(
+                action,
+                Action::Execute
+                    | Action::Input
+                    | Action::ViewOutput
+                    | Action::OpenFilePicker
+                    | Action::Search
+                    | Action::Goto
+                    | Action::SwitchTheme
+                    | Action::ToggleWorkflowGraph
+                    | Action::ToggleZen
+                    | Action::Help
+            ),
+        }
+    }
+
     fn handle_action(&mut self, action: Action) -> Option<Cmd<Msg>> {
+        if !self.is_action_enabled(&action) {
+            return None;
+        }
+
         match action {
             Action::Execute => {
                 if let Some(id) = self
@@ -784,9 +831,7 @@ impl App {
                 }
             }
             Action::ToggleWorkflowGraph => {
-                if self.workflow_graph.is_some() {
-                    self.workflow_graph_visible = !self.workflow_graph_visible;
-                }
+                self.workflow.toggle_graph();
                 None
             }
             Action::Quit => {
@@ -1140,9 +1185,7 @@ impl App {
         if let Some(Overlay::Dependencies(dependencies)) = &mut self.overlay {
             dependencies.set_theme(&theme);
         }
-        if let Some(graph) = &mut self.workflow_graph {
-            graph.set_theme(&theme);
-        }
+        self.workflow.set_theme(&theme);
         self.envs.set_theme(&theme);
         self.theme = theme;
         self.preview.rebuild_view(self.tasks.buffers());
@@ -1224,6 +1267,7 @@ impl App {
         self.sync_input_mode();
         cmd.map(|c| c.map(Msg::Menu))
     }
+
     fn handle_preview_msg(&mut self, action: preview::Action) -> Option<Cmd<Msg>> {
         match action {
             preview::Action::ToggleToc => {
@@ -1296,6 +1340,7 @@ impl App {
         self.sync_input_mode();
         None
     }
+
     fn handle_confirm_msg(&mut self, action: confirm::Action) -> Option<Cmd<Msg>> {
         let cmd = match &mut self.overlay {
             Some(Overlay::Confirm(confirm)) => confirm.update(action),
@@ -1361,6 +1406,7 @@ impl App {
 
         None
     }
+
     /// Handles picker actions that change application-level state.
     /// The picker owns navigation; the app owns file loading and cancellation.
     fn handle_file_picker_msg(&mut self, action: file_picker::Action) -> Option<Cmd<Msg>> {
@@ -1391,6 +1437,7 @@ impl App {
             _ => cmd.map(|c| c.map(Msg::FilePicker)),
         }
     }
+
     fn help_keymap_items(&self) -> Vec<tui::help::KeymapEntry> {
         let mut items = Vec::new();
         Self::append_help_entries(&mut items, "home", self.config.keymap.home::<Action>());
@@ -1535,6 +1582,7 @@ impl App {
         }
         None
     }
+
     /// Replaces the document and resets document-derived execution and UI state.
     fn load_document(&mut self, doc: upmd_parser::Document) -> Result<(), String> {
         let selected = crate::apps::initial_code_id(&doc.codes, self.config.block.as_deref())?;
@@ -1562,11 +1610,8 @@ impl App {
             self.config.tui.inline_max_lines(),
             self.config.keymap.preview::<preview::Action>(),
         );
-        self.workflow = None;
+        self.workflow.clear();
         self.overlay = None;
-        self.workflow_graph = None;
-        self.workflow_graph_visible = false;
-        self.pending_states.clear();
         self.started = false;
 
         if let Some(id) = selected {
@@ -1662,46 +1707,6 @@ impl App {
         }
     }
 
-    fn capture_state(&mut self, id: CodeId, capture_env: bool, capture_cwd: bool) {
-        if !capture_env && !capture_cwd {
-            return;
-        }
-        let task = self.tasks.get(id);
-        let env = capture_env.then(|| task?.captured_envs.clone()).flatten();
-        let cwd = capture_cwd
-            .then(|| task?.captured_cwd.as_deref().map(PathBuf::from))
-            .flatten();
-
-        if self.workflow.is_none() {
-            if let Some(env) = env {
-                self.envs.merge_envs(env);
-            }
-            if let Some(cwd) = cwd {
-                self.last_cwd = Some(cwd);
-            }
-            return;
-        }
-
-        let entry = self.pending_states.entry(id).or_default();
-        if let Some(env) = env {
-            entry.0 = Some(env);
-        }
-        if let Some(cwd) = cwd {
-            entry.1 = Some(cwd);
-        }
-    }
-
-    fn flush_pending_states(&mut self) {
-        for (_, (env, cwd)) in std::mem::take(&mut self.pending_states) {
-            if let Some(env) = env {
-                self.envs.merge_envs(env);
-            }
-            if let Some(cwd) = cwd {
-                self.last_cwd = Some(cwd);
-            }
-        }
-    }
-
     fn handle_stream_update(
         &mut self,
         id: CodeId,
@@ -1754,9 +1759,9 @@ impl App {
         if matches!(&stream, crate::pty::stream::Stream::End) {
             let exit_code = self.tasks.get(id).and_then(|task| task.exit_code);
             if exit_code != Some(0) {
-                self.pending_states.remove(&id);
+                self.workflow.discard_capture(id);
             }
-            let result = self.advance_workflow(id, exit_code)?;
+            let result = self.workflow.advance(id, exit_code)?;
             return self.handle_advance(result);
         }
         None
@@ -1809,10 +1814,7 @@ impl Output for App {
         let mut layout = self.layout.borrow_mut();
         layout.update(area, self.menu_width(area.width));
 
-        let workflow_graph = self
-            .workflow_graph
-            .as_ref()
-            .filter(|_| self.workflow_graph_visible);
+        let workflow_graph = self.workflow.visible_graph();
         let (preview_area, graph_area) = if let Some(deps) = workflow_graph {
             let graph_rows = deps
                 .graph_rows()
@@ -1921,14 +1923,7 @@ impl App {
                 } else {
                     self.theme.mode_badge("NORMAL", self.theme.accent)
                 };
-                let left = self
-                    .theme
-                    .keymap_shortcuts(&self.keymap.items, |action| match action {
-                        Action::ExitInput => is_running,
-                        Action::Paste => is_running,
-                        _ => false,
-                    });
-                (badge, left, None)
+                (badge, self.footer_shortcuts(), None)
             }
             _ if self.zen => {
                 let badge = self.theme.mode_badge("ZEN", self.theme.logo);
@@ -1940,50 +1935,9 @@ impl App {
             }
             _ => {
                 let badge = self.theme.mode_badge("NORMAL", self.theme.accent);
-                let left = match self.menu.selected().and_then(|id| self.tasks.get(id)) {
-                    Some(buf) => self.keymap_footer_with(|action| match action {
-                        Action::ViewOutput => true,
-                        Action::Input => buf.running(),
-                        _ => false,
-                    }),
-                    None => self.keymap_footer(),
-                };
-                (badge, left, None)
+                (badge, self.footer_shortcuts(), None)
             }
         }
-    }
-
-    fn keymap_footer(&self) -> ratatui::text::Line<'static> {
-        self.keymap_footer_with(|_| false)
-    }
-
-    fn keymap_footer_with(&self, extra: impl Fn(&Action) -> bool) -> ratatui::text::Line<'static> {
-        let shortcuts = self.theme.keymap_shortcuts(&self.keymap.items, |action| {
-            extra(action)
-                || (*action == Action::ToggleWorkflowGraph && self.workflow_graph.is_some())
-                || matches!(
-                    action,
-                    Action::Execute
-                        | Action::OpenFilePicker
-                        | Action::Search
-                        | Action::Goto
-                        | Action::SwitchTheme
-                        | Action::ToggleZen
-                        | Action::Help
-                )
-        });
-
-        let nav_spans = vec![
-            Span::styled("↑↓", self.theme.active_fg_style()),
-            Span::styled(" ", self.theme.inactive_style()),
-            Span::raw("move").style(self.theme.muted_style()),
-        ];
-
-        let mut all_spans = nav_spans;
-        all_spans.push(Span::styled("  ", self.theme.inactive_style()));
-        all_spans.extend(shortcuts.spans);
-
-        ratatui::text::Line::from(all_spans)
     }
 
     /// Shows an info flash notification at the bottom right.
@@ -1999,6 +1953,27 @@ impl App {
     /// Shows an error flash notification at the bottom right.
     pub fn notify_error(&mut self, text: impl Into<String>) {
         self.notification = Some(tui::notification::error(text));
+    }
+}
+
+impl Shortcut for App {
+    fn footer_shortcuts(&self) -> Line<'static> {
+        let shortcuts = self.theme.keymap_shortcuts(&self.keymap.items, |action| {
+            self.is_action_visible_in_footer(action)
+        });
+
+        if self.view == View::Input {
+            return shortcuts;
+        }
+
+        let mut spans = vec![
+            Span::styled("↑↓", self.theme.active_fg_style()),
+            Span::styled(" ", self.theme.inactive_style()),
+            Span::raw("move").style(self.theme.muted_style()),
+            Span::styled("  ", self.theme.inactive_style()),
+        ];
+        spans.extend(shortcuts.spans);
+        Line::from(spans)
     }
 }
 
@@ -2027,6 +2002,7 @@ mod tests {
             AppConfig::default(),
         )
     }
+
     fn selected_picker_path(app: &App) -> Option<&Path> {
         match &app.overlay {
             Some(Overlay::FilePicker { picker, .. }) => picker.selected_path(),
@@ -2119,6 +2095,7 @@ mod tests {
         assert!(app.overlay.is_none());
         assert_eq!(app.file_picker_root.as_deref(), Some(root.as_path()));
     }
+
     #[test]
     fn reload_success_replaces_document_state_and_reapplies_run_configuration() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2134,20 +2111,19 @@ mod tests {
             true,
             Some("setup"),
         );
-        app.workflow_graph = Some(dependencies::Dependencies::for_target(
-            app.preview.codes(),
-            Some(2),
-            HashMap::new(),
-            app.theme.clone(),
-            app.config.keymap.dependencies(),
-        ));
-        app.workflow_graph_visible = true;
+        app.workflow
+            .set_graph(dependencies::Dependencies::for_target(
+                app.preview.codes(),
+                Some(2),
+                HashMap::new(),
+                app.theme.clone(),
+                app.config.keymap.dependencies(),
+            ));
 
         app.reload();
 
-        assert!(app.workflow.is_none());
-        assert!(app.workflow_graph.is_none());
-        assert!(!app.workflow_graph_visible);
+        assert!(!app.workflow.is_active());
+        assert!(!app.workflow.has_graph());
         assert!(!app.started);
         assert_eq!(app.menu.selected(), Some(2));
     }
@@ -2158,16 +2134,17 @@ mod tests {
         let mut app = app_for_reload(Path::new("unused.md"), markdown, true, Some("2"));
         app.config.file = None;
         let selected_before = app.menu.selected();
-        let had_plan = app.workflow.is_some();
+        let had_plan = app.workflow.is_active();
 
         app.reload();
 
         assert_eq!(app.menu.selected(), selected_before);
-        assert_eq!(app.workflow.is_some(), had_plan);
+        assert_eq!(app.workflow.is_active(), had_plan);
         let notification = app.notification.as_ref().unwrap();
         assert_eq!(notification.kind, tui::notification::FlashKind::Error);
         assert_eq!(notification.text, "No file path in config, cannot reload");
     }
+
     #[cfg(unix)]
     #[test]
     fn alternate_screen_is_resized_to_rows_below_source_block() {
@@ -2210,6 +2187,7 @@ mod tests {
         assert_eq!(app.tasks.get(1).unwrap().parser.screen().size().0, 35);
         app.tasks.send_input(1, b"\x03");
     }
+
     #[test]
     fn inline_dependency_graph_preserves_collapsed_pane_borders() {
         let markdown = "\
@@ -2224,14 +2202,14 @@ mod tests {
             },
         )
         .unwrap();
-        app.workflow_graph = Some(dependencies::Dependencies::for_target(
-            app.preview.codes(),
-            Some(3),
-            HashMap::new(),
-            app.theme.clone(),
-            app.config.keymap.dependencies(),
-        ));
-        app.workflow_graph_visible = true;
+        app.workflow
+            .set_graph(dependencies::Dependencies::for_target(
+                app.preview.codes(),
+                Some(3),
+                HashMap::new(),
+                app.theme.clone(),
+                app.config.keymap.dependencies(),
+            ));
 
         let backend = ratatui::backend::TestBackend::new(80, 24);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();

@@ -123,8 +123,13 @@ impl Dependencies {
         self.statuses = statuses;
         self.spinner.tick();
     }
+
     pub fn set_theme(&mut self, theme: &Theme) {
         self.theme.clone_from(theme);
+    }
+
+    pub fn has_deps(&self) -> bool {
+        self.graph.as_ref().is_some_and(DependencyGraph::has_deps)
     }
 
     fn name_of(&self, id: CodeId) -> String {

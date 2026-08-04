@@ -54,6 +54,14 @@ impl Output {
         self.done = buf.done();
     }
 
+    fn is_action_enabled(action: &Action, done: bool) -> bool {
+        match action {
+            Action::Back => true,
+            Action::BackIfDone | Action::Copy => done,
+            Action::Paste => !done,
+        }
+    }
+
     pub fn handle_mouse_event(
         &mut self,
         mouse: crossterm::event::MouseEvent,
@@ -211,11 +219,8 @@ impl Output {
         use ratatui::text::Span;
 
         let done = buf.done();
-        let left = theme.keymap_shortcuts(&self.keymap.items, move |action| match action {
-            Action::Back => true,
-            Action::BackIfDone => done,
-            Action::Copy => done,
-            Action::Paste => !done,
+        let left = theme.keymap_shortcuts(&self.keymap.items, |action| {
+            Self::is_action_enabled(action, done)
         });
         let right = if buf.running() {
             let ch = self.spinner.render();
@@ -316,10 +321,7 @@ impl Input for Output {
     fn action(&self, event: crossterm::event::Event) -> Option<Self::Msg> {
         if let crossterm::event::Event::Key(key) = event {
             if let Some(action) = self.keymap.get(&key) {
-                match action {
-                    Action::BackIfDone | Action::Copy if !self.done => return None,
-                    _ => return Some(*action),
-                }
+                return Self::is_action_enabled(action, self.done).then_some(*action);
             }
         }
         None

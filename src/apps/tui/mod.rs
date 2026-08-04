@@ -16,6 +16,7 @@ pub mod selection;
 pub mod tasks;
 pub mod themes;
 pub mod widgets;
+pub mod workflow;
 pub mod wrap;
 
 #[cfg(test)]

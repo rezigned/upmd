@@ -101,6 +101,7 @@ impl Menu {
             column_offset: Cell::new(0),
         }
     }
+
     /// Advances the spinner tick counter (driven by Msg::Tick).
     pub fn tick(&mut self) {
         self.spinner.tick();
