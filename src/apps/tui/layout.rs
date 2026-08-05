@@ -57,6 +57,24 @@ impl Area {
         self.update(self.last_area, menu_width);
     }
 
+    pub fn preview_viewport_rows(&self) -> usize {
+        self.preview
+            .height
+            .saturating_sub(crate::apps::config::BORDER_HEIGHT as u16) as usize
+    }
+
+    pub fn output_pty_size(&self) -> crate::pty::process::Size {
+        crate::pty::process::Size::from((
+            self.last_area
+                .width
+                .max(crate::apps::config::PTY_DEFAULT_COLS),
+            self.last_area
+                .height
+                .saturating_sub(crate::apps::config::OUTPUT_FOOTER_HEIGHT)
+                .max(crate::apps::config::PTY_DEFAULT_ROWS),
+        ))
+    }
+
     /// Returns the printable PTY size based on the preview pane dimensions.
     pub fn pty_size(&self, extra_overhead: u16) -> crate::pty::process::Size {
         let overhead = crate::apps::config::PREVIEW_CODE_WRAP_OVERHEAD as u16 + extra_overhead;

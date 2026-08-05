@@ -416,9 +416,21 @@ impl Preview {
         end.saturating_add(1).saturating_sub(viewport)
     }
 
-    /// Returns the first and last visual line index for non-output rows of
-    /// code block `id` (CodeInfo + CodeBody only, excluding Output).
-    pub fn source_visual_extent(&self, id: CodeId) -> Option<(usize, usize)> {
+    /// Reserves rows below a code block for an alternate-screen PTY and
+    /// minimally scrolls the preview when the remaining viewport is too small.
+    pub fn fit_inline_pty_rows(&self, id: CodeId, viewport: usize) -> Option<usize> {
+        let (start, end) = self.source_visual_extent(id)?;
+        let source_rows = end.saturating_sub(start).saturating_add(1);
+        let offset = self.state.borrow().offset();
+        let (rows, new_offset) = inline_pty_rows(viewport, end, source_rows, offset);
+
+        if new_offset != offset {
+            *self.state.borrow_mut().offset_mut() = new_offset;
+        }
+        Some(rows)
+    }
+
+    fn source_visual_extent(&self, id: CodeId) -> Option<(usize, usize)> {
         let visual_lines = self.visual_lines.borrow();
         let mut indices = visual_lines.iter().enumerate().filter_map(|(idx, line)| {
             let logical_line = self.logical_lines.get(line.logical_idx)?;
@@ -429,16 +441,6 @@ impl Preview {
         let first = indices.next()?;
         let end = indices.next_back().unwrap_or(first);
         Some((first, end))
-    }
-
-    /// Returns the current visual offset (first visible row index).
-    pub fn visual_offset(&self) -> usize {
-        self.state.borrow().offset()
-    }
-
-    /// Sets the visual offset.
-    pub fn set_visual_offset(&self, offset: usize) {
-        *self.state.borrow_mut().offset_mut() = offset;
     }
 
     pub fn inline_max_lines(&self) -> usize {
@@ -460,31 +462,23 @@ impl Preview {
         self.spinner.tick();
     }
 
-    pub fn matches(&self, term: &str) -> Vec<usize> {
+    pub fn search(&mut self, term: &str) -> Vec<usize> {
+        self.search.set_term(term);
         if term.is_empty() {
             return vec![];
         }
         self.search.matches(&self.visual_lines.borrow())
     }
 
+    pub fn select_search_match(&mut self, idx: usize) -> Option<CodeId> {
+        let max = self.visual_lines.len().saturating_sub(1);
+        self.select_and_scroll_smooth(idx.min(max));
+        self.selected_code_id()
+    }
+
     pub fn set_theme(&mut self, theme: &Theme) {
         self.theme.clone_from(theme);
         self.logical_lines.iter().for_each(|l| l.clear_cache());
-    }
-
-    pub fn set_search_term(&mut self, term: &str) {
-        self.search.set_term(term);
-    }
-
-    pub fn select_line(&mut self, idx: usize) {
-        let max = self.visual_lines.len().saturating_sub(1);
-        self.select_and_scroll_smooth(idx.min(max));
-    }
-
-    pub fn selected_code(&self) -> Option<&LogicalLine> {
-        let sel = self.state.borrow().selected()?;
-        let logical_idx = self.visual_lines.get(sel)?.logical_idx;
-        self.logical_lines.get(logical_idx)
     }
 
     pub fn selected_code_id(&self) -> Option<CodeId> {
@@ -907,10 +901,11 @@ impl Preview {
         }
     }
 }
+
 /// Computes how many PTY rows fit below a block's source lines in the viewport,
 /// returning `(rows, new_offset)`. Scrolls the viewport if fewer than 40% of
 /// the rows (min 8) remain below the source.
-pub(crate) fn inline_pty_rows(
+fn inline_pty_rows(
     viewport: usize,
     source_end: usize,
     source_rows: usize,
@@ -965,7 +960,7 @@ impl Component for Preview {
                 };
                 self.copy_result.set(Some(ok));
             }
-            Action::SelectCodeBlock(_) => {}
+            Action::SelectCodeBlock(id) => self.select_code(id),
             Action::Show(id) => self.select_code(id),
             Action::Select => {}
         }

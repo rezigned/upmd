@@ -306,21 +306,11 @@ impl App {
             return base;
         }
 
-        let viewport = self
-            .layout
-            .borrow()
+        let viewport = self.layout.borrow().preview_viewport_rows();
+        let rows = self
             .preview
-            .height
-            .saturating_sub(config::BORDER_HEIGHT as u16) as usize;
-        let Some((start, end)) = self.preview.source_visual_extent(id) else {
-            return base;
-        };
-        let source_rows = end.saturating_sub(start).saturating_add(1);
-        let offset = self.preview.visual_offset();
-        let (rows, new_offset) = preview::inline_pty_rows(viewport, end, source_rows, offset);
-        if new_offset != offset {
-            self.preview.set_visual_offset(new_offset);
-        }
+            .fit_inline_pty_rows(id, viewport)
+            .unwrap_or(base.height as usize);
         crate::pty::process::Size::from((base.width, rows as u16))
     }
 
@@ -902,13 +892,8 @@ impl App {
                 if let Some(id) = self.menu.selected() {
                     if self.tasks.contains(id) {
                         self.view = View::Output;
-                        let area = self.layout.borrow().last_area;
-                        let cols = area.width.max(config::PTY_DEFAULT_COLS);
-                        let rows = area
-                            .height
-                            .saturating_sub(config::OUTPUT_FOOTER_HEIGHT)
-                            .max(config::PTY_DEFAULT_ROWS);
-                        self.tasks.resize(cols, rows);
+                        let size = self.layout.borrow().output_pty_size();
+                        self.tasks.resize(size.width, size.height);
                     }
                 }
                 None
@@ -992,11 +977,8 @@ impl App {
             self.preview.rebuild_view(self.tasks.buffers());
 
             if self.view == View::Output {
-                let out_rows = rows
-                    .saturating_sub(config::OUTPUT_FOOTER_HEIGHT)
-                    .max(config::PTY_DEFAULT_ROWS);
-                let out_cols = cols.max(config::PTY_DEFAULT_COLS);
-                self.tasks.resize(out_cols, out_rows);
+                let size = self.layout.borrow().output_pty_size();
+                self.tasks.resize(size.width, size.height);
             } else {
                 self.resize_tasks_for_preview();
             }
@@ -1291,7 +1273,7 @@ impl App {
             }
             preview::Action::SelectCodeBlock(id) => {
                 self.keep_input_for_running_click_target(id);
-                self.preview.select_code(id);
+                self.preview.update(preview::Action::SelectCodeBlock(id));
                 if let Some(id) = self.preview.selected_code_id() {
                     self.menu.select_by_id(id);
                 }
@@ -1378,7 +1360,7 @@ impl App {
         if cmd.is_some() {
             match action {
                 tui::search::Action::Quit => {
-                    self.preview.set_search_term("");
+                    self.preview.search("");
                     self.overlay = None;
                     self.view = View::Home;
                 }
@@ -1390,15 +1372,10 @@ impl App {
             }
             return None;
         }
-        self.preview.set_search_term(search.term());
-        let result = self.preview.matches(search.term());
+        let result = self.preview.search(search.term());
         if let Some(index) = search.search(&result) {
-            self.preview.select_line(*index);
-
-            if let Some(code) = self.preview.selected_code() {
-                if let Some(id) = code.code_id {
-                    self.menu.select_by_id(id);
-                }
+            if let Some(id) = self.preview.select_search_match(*index) {
+                self.menu.select_by_id(id);
             } else {
                 self.menu.deselect();
             }
