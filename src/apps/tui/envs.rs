@@ -20,7 +20,7 @@ use keymap::{DerivedConfig, KeyMap};
 
 use upmd_runtime::{
     runtimes::tui::{Input, Output},
-    Cmd, Component,
+    Component, Effect,
 };
 
 const ENV_NAME: &str = "Name";
@@ -176,7 +176,10 @@ pub enum Action {
     Navigation(Navigation),
     ScrollUp,
     ScrollDown,
-    Quit,
+}
+
+pub enum Outcome {
+    Closed,
 }
 
 impl EnvVars {
@@ -248,9 +251,9 @@ impl EnvVars {
         self.selected = Some((current + step).min(max));
     }
 
-    fn update_list(&mut self, action: MainAction) -> Option<Cmd<Action>> {
+    fn update_list(&mut self, action: MainAction) -> Option<Outcome> {
         match action {
-            MainAction::Quit => Some(Cmd::msg(Action::Quit)),
+            MainAction::Quit => Some(Outcome::Closed),
             MainAction::Search => {
                 let search_keymap: DerivedConfig<SearchAction> =
                     KeymapConfig::parse_derived(&self.search_keymap_config);
@@ -283,7 +286,7 @@ impl EnvVars {
         }
     }
 
-    fn update_search(&mut self, action: SearchAction) -> Option<Cmd<Action>> {
+    fn update_search(&mut self, action: SearchAction) -> Option<Outcome> {
         match action {
             SearchAction::Prev => self.prev(),
             SearchAction::Next => self.next(),
@@ -314,7 +317,7 @@ impl EnvVars {
         None
     }
 
-    fn update_edit(&mut self, action: EditAction) -> Option<Cmd<Action>> {
+    fn update_edit(&mut self, action: EditAction) -> Option<Outcome> {
         match action {
             EditAction::Quit => self.exit_inline_edit(),
             EditAction::Save => self.save_inline_edit(),
@@ -604,10 +607,11 @@ impl EnvVars {
 }
 
 impl Component for EnvVars {
-    type Msg = Action;
+    type Action = Action;
+    type Outcome = Outcome;
 
-    fn update(&mut self, msg: Self::Msg) -> Option<Cmd<Self::Msg>> {
-        match msg {
+    fn update(&mut self, action: Action) -> Option<Effect<Action, Outcome>> {
+        let outcome = match action {
             Action::Main(action) => self.update_list(action),
             Action::Edit(action) => self.update_edit(action),
             Action::Search(action) => self.update_search(action),
@@ -632,13 +636,14 @@ impl Component for EnvVars {
                 self.select_offset_down(3);
                 None
             }
-            Action::Quit => Some(Cmd::msg(Action::Quit)),
-        }
+        };
+
+        outcome.map(Effect::Outcome)
     }
 }
 
 impl Input for EnvVars {
-    fn action(&self, event: CrosstermEvent) -> Option<Self::Msg> {
+    fn action(&self, event: CrosstermEvent) -> Option<Self::Action> {
         match event {
             CrosstermEvent::Mouse(mouse) => {
                 if mouse.kind == crossterm::event::MouseEventKind::ScrollUp {

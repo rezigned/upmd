@@ -58,7 +58,7 @@ const INLINE_PTY_MIN_ROWS: usize = 8;
 const CODE_NAVIGATION_CONTEXT_ROWS: usize = 3;
 use upmd_runtime::{
     runtimes::tui::{Input, Output},
-    Cmd, Component,
+    Component, Effect, NoOutcome,
 };
 
 mod search;
@@ -768,7 +768,7 @@ impl Preview {
 }
 
 impl Input for Preview {
-    fn action(&self, event: crossterm::event::Event) -> Option<Self::Msg> {
+    fn action(&self, event: crossterm::event::Event) -> Option<Self::Action> {
         match event {
             crossterm::event::Event::Key(key) => {
                 if let Some(action) = self.keymap.get_bound(&key) {
@@ -944,9 +944,10 @@ fn inline_pty_rows(
 }
 
 impl Component for Preview {
-    type Msg = Action;
+    type Action = Action;
+    type Outcome = NoOutcome;
 
-    fn update(&mut self, action: Action) -> Option<Cmd<Action>> {
+    fn update(&mut self, action: Action) -> Option<Effect<Action, NoOutcome>> {
         match action {
             Action::ScrollUp => self.scroll_up(),
             Action::ScrollDown => self.scroll_down(),

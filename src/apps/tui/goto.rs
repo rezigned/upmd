@@ -13,7 +13,7 @@ use ratatui::widgets::Paragraph;
 use upmd_parser::CodeId;
 use upmd_runtime::{
     runtimes::tui::{Input, Output},
-    Cmd, Component,
+    Component, Effect,
 };
 
 const MIN_PREVIEW_LAYOUT_WIDTH: u16 = 72;
@@ -60,6 +60,11 @@ pub enum Action {
     Quit,
     #[key("@any")]
     Input(char),
+}
+
+pub enum Outcome {
+    Selected(CodeId),
+    Cancelled,
 }
 
 impl Goto {
@@ -123,43 +128,46 @@ impl Shortcut for Goto {
 }
 
 impl Component for Goto {
-    type Msg = Action;
+    type Action = Action;
+    type Outcome = Outcome;
 
-    fn update(&mut self, msg: Self::Msg) -> Option<Cmd<Self::Msg>> {
+    fn update(&mut self, action: Action) -> Option<Effect<Action, Outcome>> {
         self.spinner.tick();
-        match msg {
+        match action {
             Action::Input(ch) => {
                 self.query.push(ch);
                 self.rebuild();
-                None
             }
             Action::Delete => {
                 self.query.pop();
                 self.rebuild();
-                None
             }
             Action::Next => {
                 if !self.matches.is_empty() {
                     self.selected = (self.selected + 1).min(self.matches.len().saturating_sub(1));
                     self.rebuild();
                 }
-                None
             }
             Action::Prev => {
                 if !self.matches.is_empty() {
                     self.selected = self.selected.saturating_sub(1);
                     self.rebuild();
                 }
-                None
             }
-            Action::Select => Some(Cmd::msg(Action::Select)),
-            Action::Quit => Some(Cmd::msg(Action::Quit)),
+            Action::Select => {
+                return self
+                    .selected_code_id()
+                    .map(Outcome::Selected)
+                    .map(Effect::Outcome);
+            }
+            Action::Quit => return upmd_runtime::effect!(outcome: Outcome::Cancelled),
         }
+        None
     }
 }
 
 impl Input for Goto {
-    fn action(&self, event: crossterm::event::Event) -> Option<Self::Msg> {
+    fn action(&self, event: crossterm::event::Event) -> Option<Self::Action> {
         match event {
             crossterm::event::Event::Key(key) => self.keymap.get_bound(&key),
             crossterm::event::Event::Mouse(mouse) => match mouse.kind {

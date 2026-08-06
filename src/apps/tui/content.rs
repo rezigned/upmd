@@ -5,7 +5,7 @@ use ratatui::{layout::Rect, Frame};
 use upmd_parser::{nodes::Code, CodeId, Codes, Document};
 use upmd_runtime::{
     runtimes::tui::{Input, Output},
-    Cmd, Component,
+    Component, Effect,
 };
 
 use crate::apps::{
@@ -20,7 +20,6 @@ use crate::apps::{
 pub struct Content {
     menu: menu::Menu,
     preview: preview::Preview,
-    effect: Option<Effect>,
 }
 
 #[derive(Clone, Debug)]
@@ -29,7 +28,7 @@ pub enum Action {
     Preview(preview::Action),
 }
 
-pub enum Effect {
+pub enum Outcome {
     CodeClicked {
         previous: Option<CodeId>,
         selected: CodeId,
@@ -75,11 +74,7 @@ impl Content {
             preview.select_code(id);
         }
 
-        Self {
-            menu,
-            preview,
-            effect: None,
-        }
+        Self { menu, preview }
     }
 
     pub fn select_code(&mut self, id: CodeId) {
@@ -260,28 +255,34 @@ impl Input for Content {
 }
 
 impl Component for Content {
-    type Msg = Action;
+    type Action = Action;
+    type Outcome = Outcome;
 
-    fn update(&mut self, message: Action) -> Option<Cmd<Action>> {
-        self.effect = None;
-
+    fn update(&mut self, message: Action) -> Option<Effect<Action, Outcome>> {
         match message {
             Action::Menu(action) => {
-                let command = self.menu.update(action.clone());
-                match action {
+                let command = Effect::into_command(self.menu.update(action.clone()))
+                    .map(|command| command.map(Action::Menu));
+                let outcome = match action {
                     menu::Action::Click(id) => {
                         let previous = self.selected_code_id();
                         self.select_code_in_place(id);
-                        self.effect = Some(Effect::CodeClicked {
+                        Some(Outcome::CodeClicked {
                             previous,
                             selected: id,
                             copied: None,
-                        });
+                        })
                     }
-                    menu::Action::TocClick(index) => self.select_heading(index),
-                    menu::Action::Navigation(_) => self.sync_from_menu(),
-                }
-                command.map(|cmd| cmd.map(Action::Menu))
+                    menu::Action::TocClick(index) => {
+                        self.select_heading(index);
+                        None
+                    }
+                    menu::Action::Navigation(_) => {
+                        self.sync_from_menu();
+                        None
+                    }
+                };
+                Effect::from_parts(command, outcome)
             }
             Action::Preview(action) => {
                 if action == preview::Action::ToggleToc {
@@ -290,27 +291,21 @@ impl Component for Content {
                 }
 
                 let previous = self.selected_code_id();
-                let command = self.preview.update(action);
+                let command = Effect::into_command(self.preview.update(action))
+                    .map(|command| command.map(Action::Preview));
                 self.sync_from_preview();
                 let copied = self.preview.take_copy_result();
-
-                self.effect = match action {
-                    preview::Action::SelectCodeBlock(id) => Some(Effect::CodeClicked {
+                let outcome = match action {
+                    preview::Action::SelectCodeBlock(id) => Outcome::CodeClicked {
                         previous,
                         selected: id,
                         copied,
-                    }),
-                    _ => Some(Effect::PreviewInteracted { copied }),
+                    },
+                    _ => Outcome::PreviewInteracted { copied },
                 };
 
-                command.map(|cmd| cmd.map(Action::Preview))
+                Effect::from_parts(command, Some(outcome))
             }
         }
-    }
-}
-
-impl Content {
-    pub fn take_effect(&mut self) -> Option<Effect> {
-        self.effect.take()
     }
 }

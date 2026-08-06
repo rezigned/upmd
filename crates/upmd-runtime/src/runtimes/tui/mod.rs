@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use ratatui::{backend::CrosstermBackend, Terminal};
 
-use crate::core::{Component, Engine};
+use crate::core::{Component, Engine, NoOutcome};
 
 /// TUI Runtime that manages a full-screen terminal interface.
 ///
@@ -158,7 +158,7 @@ impl<C: Component + Output> crate::core::Renderer<C> for Runtime {
     }
 }
 
-impl<C: Component + Input + Output> crate::Runtime<C> for Runtime {
+impl<C: Component<Outcome = NoOutcome> + Input + Output> crate::Runtime<C> for Runtime {
     type Error = io::Error;
 
     fn run(mut self, mut engine: Engine<C>) -> io::Result<()> {
@@ -207,7 +207,7 @@ impl<C: Component + Input + Output> crate::Runtime<C> for Runtime {
 
 /// Trait for handling TUI input events.
 pub trait Input: Component {
-    fn action(&self, event: crossterm::event::Event) -> Option<Self::Msg>;
+    fn action(&self, event: crossterm::event::Event) -> Option<Self::Action>;
 }
 
 /// Trait for rendering the component to a ratatui frame.
@@ -216,7 +216,7 @@ pub trait Output {
 }
 
 /// Runs a component in the TUI runtime with default crossterm behavior.
-pub fn run<C: Component + Input + Output>(component: C) -> io::Result<()> {
+pub fn run<C: Component<Outcome = NoOutcome> + Input + Output>(component: C) -> io::Result<()> {
     use crate::Runtime as R;
 
     let engine = Engine::new(component);

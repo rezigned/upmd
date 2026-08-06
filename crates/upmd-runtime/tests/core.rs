@@ -193,15 +193,21 @@ impl MockComponent {
 }
 
 impl Component for MockComponent {
-    type Msg = Msg;
+    type Action = Msg;
+    type Outcome = upmd_runtime::NoOutcome;
 
-    fn update(&mut self, msg: Msg) -> Option<Cmd<Msg>> {
+    fn update(&mut self, msg: Msg) -> Option<upmd_runtime::Effect<Self::Action, Self::Outcome>> {
         match msg {
-            Msg::Increment => self.value += 1,
-            Msg::Decrement => self.value -= 1,
-            Msg::Quit => return Some(Cmd::quit()),
+            Msg::Increment => {
+                self.value += 1;
+                None
+            }
+            Msg::Decrement => {
+                self.value -= 1;
+                None
+            }
+            Msg::Quit => upmd_runtime::effect!(Cmd::quit()),
         }
-        None
     }
 }
 
@@ -222,9 +228,10 @@ impl PriorityComponent {
 }
 
 impl Component for PriorityComponent {
-    type Msg = PriorityMsg;
+    type Action = PriorityMsg;
+    type Outcome = upmd_runtime::NoOutcome;
 
-    fn create(&mut self) -> Option<Cmd<Self::Msg>> {
+    fn create(&mut self) -> Option<Cmd<Self::Action>> {
         Some(Cmd::priority_stream(|bulk_tx, control_tx| {
             // Fill the low-priority queue with output-like traffic, then send a
             // lifecycle-like control message. The engine must observe Control
@@ -236,7 +243,10 @@ impl Component for PriorityComponent {
         }))
     }
 
-    fn update(&mut self, msg: Self::Msg) -> Option<Cmd<Self::Msg>> {
+    fn update(
+        &mut self,
+        msg: Self::Action,
+    ) -> Option<upmd_runtime::Effect<Self::Action, Self::Outcome>> {
         self.seen.push(msg);
         None
     }

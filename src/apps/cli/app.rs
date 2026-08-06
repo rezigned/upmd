@@ -561,9 +561,10 @@ impl crate::RunApp for App {
 }
 
 impl Component for App {
-    type Msg = Msg;
+    type Action = Msg;
+    type Outcome = upmd_runtime::NoOutcome;
 
-    fn create(&mut self) -> Option<Cmd<Self::Msg>> {
+    fn create(&mut self) -> Option<Cmd<Self::Action>> {
         if self.picker.is_some() {
             return None;
         }
@@ -576,13 +577,13 @@ impl Component for App {
         }
     }
 
-    fn update(&mut self, msg: Msg) -> Option<Cmd<Msg>> {
-        match msg {
+    fn update(&mut self, msg: Msg) -> Option<upmd_runtime::Effect<Self::Action, Self::Outcome>> {
+        upmd_runtime::Effect::command(match msg {
             Msg::Action(action) => self.handle_action(action),
             Msg::Navigation(nav) => self.handle_nav(nav),
             Msg::StreamUpdate(id, stream) => self.handle_stream_update(id, stream),
             Msg::Picker(action) => self.handle_picker_msg(action),
-        }
+        })
     }
 }
 

@@ -15,7 +15,7 @@ use ratatui::{
 
 use upmd_runtime::{
     runtimes::tui::{Input, Output},
-    Cmd, Component,
+    Component, Effect,
 };
 
 struct KeymapEntry {
@@ -49,6 +49,10 @@ pub enum Action {
     /// Must be last because @any catches all unmatched keys.
     #[key("@any")]
     Input(char),
+}
+
+pub enum Outcome {
+    Closed,
 }
 
 impl KeymapEntry {
@@ -274,11 +278,12 @@ impl Help {
 }
 
 impl Component for Help {
-    type Msg = Action;
+    type Action = Action;
+    type Outcome = Outcome;
 
-    fn update(&mut self, msg: Self::Msg) -> Option<Cmd<Self::Msg>> {
-        match msg {
-            Action::Quit => Some(Cmd::msg(Action::Quit)),
+    fn update(&mut self, action: Action) -> Option<Effect<Action, Outcome>> {
+        match action {
+            Action::Quit => upmd_runtime::effect!(outcome: Outcome::Closed),
             Action::Input('\0') => None,
             Action::Input(ch) => {
                 self.query.push(ch);
@@ -305,7 +310,7 @@ impl Component for Help {
 }
 
 impl Input for Help {
-    fn action(&self, event: crossterm::event::Event) -> Option<Self::Msg> {
+    fn action(&self, event: crossterm::event::Event) -> Option<Self::Action> {
         match event {
             crossterm::event::Event::Key(key) => self.keymap.get_bound(&key),
             crossterm::event::Event::Mouse(mouse) => match mouse.kind {
@@ -557,7 +562,7 @@ mod tests {
     fn input_appends_query_and_rebuilds_matches() {
         let mut help = help_with_items();
 
-        help.update(Action::Input('j'));
+        let _ = help.update(Action::Input('j'));
 
         assert_eq!(help.query, "j");
         assert_eq!(matched_symbols(&help), vec!["g"]);
@@ -567,14 +572,14 @@ mod tests {
     fn navigation_scrolls_rows_without_selecting_items() {
         let mut help = help_with_items();
 
-        help.update(Action::Next);
-        help.update(Action::Next);
+        let _ = help.update(Action::Next);
+        let _ = help.update(Action::Next);
         assert_eq!(help.scroll, 2);
 
-        help.update(Action::Prev);
+        let _ = help.update(Action::Prev);
         assert_eq!(help.scroll, 1);
 
-        help.update(Action::Input('j'));
+        let _ = help.update(Action::Input('j'));
         assert_eq!(help.scroll, 0);
         assert_eq!(matched_symbols(&help), vec!["g"]);
     }
@@ -586,7 +591,7 @@ mod tests {
         {
             let mut help = help_with_items();
             for ch in query.chars() {
-                help.update(Action::Input(ch));
+                let _ = help.update(Action::Input(ch));
             }
 
             assert_eq!(matched_symbols(&help), expected_symbols, "query {query:?}");

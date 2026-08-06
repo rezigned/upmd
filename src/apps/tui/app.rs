@@ -29,7 +29,7 @@ use std::{
 use upmd_parser::{CodeId, Parser};
 use upmd_runtime::{
     runtimes::tui::{Input, Output},
-    Cmd, Component,
+    Cmd, Component, Effect,
 };
 
 #[derive(Clone, Copy, Default, PartialEq)]
@@ -535,7 +535,6 @@ impl App {
 pub enum Msg {
     Content(content::Action),
     Overlay(overlay::Message),
-    Output(tui::output::Action),
     StreamUpdate(CodeId, crate::pty::stream::Stream),
     Notify(tui::notification::FlashMessage),
     Tick,
@@ -570,7 +569,8 @@ impl crate::RunApp for App {
 }
 
 impl Component for App {
-    type Msg = Msg;
+    type Action = Msg;
+    type Outcome = upmd_runtime::NoOutcome;
 
     fn create(&mut self) -> Option<Cmd<Msg>> {
         let tick_rate = self.config.tick_rate;
@@ -582,57 +582,60 @@ impl Component for App {
         }))
     }
 
-    fn update(&mut self, msg: Msg) -> Option<Cmd<Msg>> {
-        match msg {
+    fn update(&mut self, msg: Msg) -> Option<upmd_runtime::Effect<Self::Action, Self::Outcome>> {
+        let command = match msg {
             Msg::Event(event) => self.handle_event(event),
             Msg::Content(action) => self.handle_content_msg(action),
             Msg::Overlay(message) => self.handle_overlay_msg(message),
-            Msg::Output(action) => self.handle_output_action(action),
             Msg::StreamUpdate(id, stream) => self.handle_stream_update(id, stream),
             Msg::Notify(flash) => {
                 self.notification = Some(flash);
                 None
             }
-            Msg::Tick => {
-                if !self.started {
-                    self.started = true;
-                    if self.config.block.is_some() && self.config.yes {
-                        if let Some(id) = self.content.selected_code_id() {
-                            return self.execute(id);
-                        }
-                    } else if self.config.all {
-                        return self.start_all();
-                    }
-                }
-                if self.tasks.is_dirty() {
-                    self.content.rebuild(self.tasks.buffers());
-                    self.tasks.clear_dirty();
-                }
-                self.sync_task_statuses();
-                self.sync_input_mode();
-                self.content.tick();
-                let statuses = self.tasks.task_statuses();
-                if let Some(overlay) = &mut self.overlay {
-                    overlay.tick(&statuses);
-                }
-                self.output.tick();
-                self.workflow.tick(statuses);
+            Msg::Tick => self.handle_tick(),
+        };
 
-                // Clear expired flash notification.
-                if self
-                    .notification
-                    .as_ref()
-                    .is_some_and(|n| n.is_expired(std::time::Instant::now()))
-                {
-                    self.notification = None;
-                }
-                None
-            }
-        }
+        upmd_runtime::Effect::command(command)
     }
 }
 
 impl App {
+    fn handle_tick(&mut self) -> Option<Cmd<Msg>> {
+        if !self.started {
+            self.started = true;
+            if self.config.block.is_some() && self.config.yes {
+                if let Some(id) = self.content.selected_code_id() {
+                    return self.execute(id);
+                }
+            } else if self.config.all {
+                return self.start_all();
+            }
+        }
+        if self.tasks.is_dirty() {
+            self.content.rebuild(self.tasks.buffers());
+            self.tasks.clear_dirty();
+        }
+        self.sync_task_statuses();
+        self.sync_input_mode();
+        self.content.tick();
+        let statuses = self.tasks.task_statuses();
+        if let Some(overlay) = &mut self.overlay {
+            overlay.tick(&statuses);
+        }
+        self.output.tick();
+        self.workflow.tick(statuses);
+
+        // Clear expired flash notification.
+        if self
+            .notification
+            .as_ref()
+            .is_some_and(|n| n.is_expired(std::time::Instant::now()))
+        {
+            self.notification = None;
+        }
+        None
+    }
+
     fn menu_width(&self, total_width: u16) -> u16 {
         if self.zen {
             0
@@ -952,8 +955,9 @@ impl App {
         }
 
         if let Some(action) = self.output.action(event.clone()) {
-            if let Some(cmd) = self.output.update(action) {
-                return Some(cmd.map(Msg::Output));
+            let (_, outcome) = Effect::into_parts(self.output.update(action));
+            if let Some(outcome) = outcome {
+                return self.handle_output_action(outcome);
             }
         }
 
@@ -1087,10 +1091,10 @@ impl App {
     }
 
     fn handle_content_msg(&mut self, message: content::Action) -> Option<Cmd<Msg>> {
-        let command = self.content.update(message);
+        let (command, outcome) = Effect::into_parts(self.content.update(message));
 
-        match self.content.take_effect() {
-            Some(content::Effect::CodeClicked {
+        match outcome {
+            Some(content::Outcome::CodeClicked {
                 previous,
                 selected,
                 copied,
@@ -1099,7 +1103,7 @@ impl App {
                 self.enter_input_for_running_click_target(selected);
                 self.notify_copy_result(copied);
             }
-            Some(content::Effect::PreviewInteracted { copied }) => {
+            Some(content::Outcome::PreviewInteracted { copied }) => {
                 if self.view == View::Input {
                     self.view = View::Home;
                 }
@@ -1121,40 +1125,39 @@ impl App {
     }
 
     fn handle_overlay_msg(&mut self, message: overlay::Message) -> Option<Cmd<Msg>> {
-        let update = self.overlay.as_mut()?.update(message, &mut self.envs);
-        let command = update.command.map(|cmd| cmd.map(Msg::Overlay));
-        let effect_command = update
-            .effect
-            .and_then(|effect| self.apply_overlay_effect(effect));
-        effect_command.or(command)
+        let (command, outcome) =
+            Effect::into_parts(self.overlay.as_mut()?.update(message, &mut self.envs));
+        let command = command.map(|command| command.map(Msg::Overlay));
+        let outcome_command = outcome.and_then(|outcome| self.apply_overlay_outcome(outcome));
+        outcome_command.or(command)
     }
 
-    fn apply_overlay_effect(&mut self, effect: overlay::Effect) -> Option<Cmd<Msg>> {
-        match effect {
-            overlay::Effect::Close => {
+    fn apply_overlay_outcome(&mut self, outcome: overlay::Outcome) -> Option<Cmd<Msg>> {
+        match outcome {
+            overlay::Outcome::Close => {
                 self.overlay = None;
                 self.view = View::Home;
                 None
             }
-            overlay::Effect::Quit => Some(Cmd::quit()),
-            overlay::Effect::Reload => {
+            overlay::Outcome::Quit => Some(Cmd::quit()),
+            overlay::Outcome::Reload => {
                 self.overlay = None;
                 self.view = View::Home;
                 self.reload()
             }
-            overlay::Effect::Rerun(id) => {
+            overlay::Outcome::Rerun(id) => {
                 self.overlay = None;
                 self.view = View::Home;
                 self.auto_input_paused = false;
                 self.rerun_target(id)
             }
-            overlay::Effect::ClearSearch => {
+            overlay::Outcome::ClearSearch => {
                 self.content.search("");
                 self.overlay = None;
                 self.view = View::Home;
                 None
             }
-            overlay::Effect::RefreshSearch(term) => {
+            overlay::Outcome::RefreshSearch(term) => {
                 let results = self.content.search(&term);
                 let selected = self
                     .overlay
@@ -1165,24 +1168,24 @@ impl App {
                 }
                 None
             }
-            overlay::Effect::SelectCode(id) => {
+            overlay::Outcome::SelectCode(id) => {
                 self.content.select_code(id);
                 self.overlay = None;
                 self.view = View::Home;
                 None
             }
-            overlay::Effect::OpenFile(path) => self.open_markdown_file(path),
-            overlay::Effect::PreviewTheme(theme) => {
+            overlay::Outcome::OpenFile(path) => self.open_markdown_file(path),
+            overlay::Outcome::PreviewTheme(theme) => {
                 self.apply_theme(theme);
                 None
             }
-            overlay::Effect::SaveTheme(theme) => {
+            overlay::Outcome::SaveTheme(theme) => {
                 self.apply_theme(theme.clone());
                 self.overlay = None;
                 self.view = View::Home;
                 Some(self.save_theme_preference(theme))
             }
-            overlay::Effect::RestoreTheme(theme) => {
+            overlay::Outcome::RestoreTheme(theme) => {
                 self.apply_theme(theme);
                 self.overlay = None;
                 self.view = View::Home;
@@ -1596,7 +1599,7 @@ mod tests {
             Some(Path::new("/repo/README.md"))
         );
 
-        app.update(Msg::Overlay(overlay::Message::FilePicker(
+        let _ = app.update(Msg::Overlay(overlay::Message::FilePicker(
             file_picker::Action::Next,
         )));
         assert_eq!(
@@ -1653,12 +1656,12 @@ mod tests {
             AppConfig::default(),
         );
 
-        app.update(Msg::Overlay(overlay::Message::FilePicker(
+        let _ = app.update(Msg::Overlay(overlay::Message::FilePicker(
             file_picker::Action::Next,
         )));
         assert_eq!(selected_picker_path(&app), Some(install_path.as_path()));
 
-        app.update(Msg::Overlay(overlay::Message::FilePicker(
+        let _ = app.update(Msg::Overlay(overlay::Message::FilePicker(
             file_picker::Action::Select,
         )));
 

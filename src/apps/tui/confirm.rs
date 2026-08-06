@@ -6,7 +6,7 @@ use crate::runner::CodeId;
 
 use upmd_runtime::{
     runtimes::tui::{Input, Output},
-    Cmd, Component,
+    Component, Effect,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -38,6 +38,10 @@ pub enum Action {
     /// Cancels the dialog without taking action.
     #[key("esc")]
     Cancel,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
     Confirmed(ConfirmAction),
     Cancelled,
 }
@@ -92,29 +96,25 @@ impl Confirm {
 }
 
 impl Component for Confirm {
-    type Msg = Action;
+    type Action = Action;
+    type Outcome = Outcome;
 
-    fn update(&mut self, msg: Self::Msg) -> Option<Cmd<Self::Msg>> {
-        match msg {
+    fn update(&mut self, action: Action) -> Option<Effect<Action, Outcome>> {
+        match action {
             Action::Switch => {
                 self.selected = !self.selected;
                 None
             }
-            Action::Select => {
-                if self.selected {
-                    Some(Cmd::msg(Action::Confirmed(self.action)))
-                } else {
-                    Some(Cmd::msg(Action::Cancelled))
-                }
+            Action::Select if self.selected => {
+                upmd_runtime::effect!(outcome: Outcome::Confirmed(self.action))
             }
-            Action::Cancel => Some(Cmd::msg(Action::Cancelled)),
-            Action::Confirmed(_) | Action::Cancelled => Some(Cmd::msg(msg)),
+            Action::Select | Action::Cancel => upmd_runtime::effect!(outcome: Outcome::Cancelled),
         }
     }
 }
 
 impl Input for Confirm {
-    fn action(&self, event: crossterm::event::Event) -> Option<Self::Msg> {
+    fn action(&self, event: crossterm::event::Event) -> Option<Self::Action> {
         match event {
             crossterm::event::Event::Key(key) => self.keymap.get(&key).copied(),
             _ => None,

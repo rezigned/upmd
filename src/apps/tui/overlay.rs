@@ -5,7 +5,7 @@ use ratatui::{layout::Rect, text::Line, Frame};
 use upmd_parser::CodeId;
 use upmd_runtime::{
     runtimes::tui::{Input, Output},
-    Cmd, Component,
+    Component, Effect,
 };
 
 use crate::apps::{
@@ -40,7 +40,7 @@ pub(crate) enum Message {
     Dependencies(dependencies::Action),
 }
 
-pub(crate) enum Effect {
+pub(crate) enum Outcome {
     Close,
     Quit,
     Reload,
@@ -52,27 +52,6 @@ pub(crate) enum Effect {
     PreviewTheme(Theme),
     SaveTheme(Theme),
     RestoreTheme(Theme),
-}
-
-pub(crate) struct Update {
-    pub command: Option<Cmd<Message>>,
-    pub effect: Option<Effect>,
-}
-
-impl Update {
-    fn none() -> Self {
-        Self {
-            command: None,
-            effect: None,
-        }
-    }
-
-    fn effect(effect: Effect) -> Self {
-        Self {
-            command: None,
-            effect: Some(effect),
-        }
-    }
 }
 
 impl Overlay {
@@ -89,83 +68,78 @@ impl Overlay {
         }
     }
 
-    pub fn update(&mut self, message: Message, envs: &mut envs::EnvVars) -> Update {
+    pub fn update(
+        &mut self,
+        message: Message,
+        envs: &mut envs::EnvVars,
+    ) -> Option<Effect<Message, Outcome>> {
         match (self, message) {
             (Self::Confirm(component), Message::Confirm(action)) => {
-                let command = component.update(action);
-                match action {
-                    confirm::Action::Confirmed(confirm::ConfirmAction::Quit) => {
-                        Update::effect(Effect::Quit)
+                let (command, outcome) = Effect::into_parts(component.update(action));
+                let command = command.map(|command| command.map(Message::Confirm));
+                match outcome {
+                    Some(confirm::Outcome::Confirmed(confirm::ConfirmAction::Quit)) => {
+                        upmd_runtime::effect!(outcome: Outcome::Quit)
                     }
-                    confirm::Action::Confirmed(confirm::ConfirmAction::ReloadFile) => {
-                        Update::effect(Effect::Reload)
+                    Some(confirm::Outcome::Confirmed(confirm::ConfirmAction::ReloadFile)) => {
+                        upmd_runtime::effect!(outcome: Outcome::Reload)
                     }
-                    confirm::Action::Confirmed(confirm::ConfirmAction::ReRun(id)) => {
-                        Update::effect(Effect::Rerun(id))
+                    Some(confirm::Outcome::Confirmed(confirm::ConfirmAction::ReRun(id))) => {
+                        upmd_runtime::effect!(outcome: Outcome::Rerun(id))
                     }
-                    confirm::Action::Cancelled => Update::effect(Effect::Close),
-                    _ => Update {
-                        command: command.map(|cmd| cmd.map(Message::Confirm)),
-                        effect: None,
-                    },
+                    Some(confirm::Outcome::Cancelled) => {
+                        upmd_runtime::effect!(outcome: Outcome::Close)
+                    }
+                    None => Effect::command(command),
                 }
             }
             (Self::Help(component), Message::Help(action)) => {
-                if component.update(action).is_some() {
-                    Update::effect(Effect::Close)
-                } else {
-                    Update::none()
+                let (command, outcome) = Effect::into_parts(component.update(action));
+                match outcome {
+                    Some(help::Outcome::Closed) => upmd_runtime::effect!(outcome: Outcome::Close),
+                    None => Effect::command(command.map(|command| command.map(Message::Help))),
                 }
             }
             (Self::Envs, Message::Envs(action)) => {
-                let command = envs.update(action.clone());
-                if matches!(action, envs::Action::Quit) {
-                    Update::effect(Effect::Close)
-                } else {
-                    Update {
-                        command: command.map(|cmd| cmd.map(Message::Envs)),
-                        effect: None,
-                    }
-                }
+                let (command, outcome) = Effect::into_parts(envs.update(action));
+                let command = command.map(|command| command.map(Message::Envs));
+                let outcome = outcome.map(|envs::Outcome::Closed| Outcome::Close);
+                Effect::from_parts(command, outcome)
             }
             (Self::Search(component), Message::Search(action)) => {
-                let completed = component.update(action).is_some();
-                if completed {
-                    match action {
-                        search::Action::Quit => Update::effect(Effect::ClearSearch),
-                        search::Action::Select => Update::effect(Effect::Close),
-                        _ => Update::none(),
+                let (command, outcome) = Effect::into_parts(component.update(action));
+                let command = command.map(|command| command.map(Message::Search));
+                match outcome {
+                    Some(search::Outcome::Selected) => {
+                        upmd_runtime::effect!(outcome: Outcome::Close)
                     }
-                } else {
-                    Update::effect(Effect::RefreshSearch(component.term().to_string()))
+                    Some(search::Outcome::Cancelled) => {
+                        upmd_runtime::effect!(outcome: Outcome::ClearSearch)
+                    }
+                    None => Effect::from_parts(
+                        command,
+                        Some(Outcome::RefreshSearch(component.term().to_string())),
+                    ),
                 }
             }
             (Self::Goto(component), Message::Goto(action)) => {
-                let completed = component.update(action).is_some();
-                if !completed {
-                    return Update::none();
-                }
-                match action {
-                    goto::Action::Select => component
-                        .selected_code_id()
-                        .map(Effect::SelectCode)
-                        .map(Update::effect)
-                        .unwrap_or_else(Update::none),
-                    goto::Action::Quit => Update::effect(Effect::Close),
-                    _ => Update::none(),
-                }
+                let (command, outcome) = Effect::into_parts(component.update(action));
+                let command = command.map(|command| command.map(Message::Goto));
+                let outcome = outcome.map(|outcome| match outcome {
+                    goto::Outcome::Selected(id) => Outcome::SelectCode(id),
+                    goto::Outcome::Cancelled => Outcome::Close,
+                });
+                Effect::from_parts(command, outcome)
             }
             (Self::Themes(component), Message::Themes(action)) => {
-                let command = component.update(action.clone());
-                match action {
-                    themes::Action::Preview(theme) => Update::effect(Effect::PreviewTheme(theme)),
-                    themes::Action::Select(theme) => Update::effect(Effect::SaveTheme(theme)),
-                    themes::Action::Restore(theme) => Update::effect(Effect::RestoreTheme(theme)),
-                    _ => Update {
-                        command: command.map(|cmd| cmd.map(Message::Themes)),
-                        effect: None,
-                    },
-                }
+                let (command, outcome) = Effect::into_parts(component.update(action));
+                let command = command.map(|command| command.map(Message::Themes));
+                let outcome = outcome.map(|outcome| match outcome {
+                    themes::Outcome::Previewed(theme) => Outcome::PreviewTheme(theme),
+                    themes::Outcome::Selected(theme) => Outcome::SaveTheme(theme),
+                    themes::Outcome::Restored(theme) => Outcome::RestoreTheme(theme),
+                });
+                Effect::from_parts(command, outcome)
             }
             (
                 Self::FilePicker {
@@ -174,34 +148,22 @@ impl Overlay {
                 },
                 Message::FilePicker(action),
             ) => {
-                let completed = picker.update(action).is_some();
-                if !completed {
-                    return Update::none();
-                }
-                match action {
-                    file_picker::Action::Select => picker
-                        .selected_path()
-                        .map(PathBuf::from)
-                        .map(Effect::OpenFile)
-                        .map(Update::effect)
-                        .unwrap_or_else(Update::none),
-                    file_picker::Action::Quit if *quit_on_cancel => Update::effect(Effect::Quit),
-                    file_picker::Action::Quit => Update::effect(Effect::Close),
-                    _ => Update::none(),
-                }
+                let (command, outcome) = Effect::into_parts(picker.update(action));
+                let command = command.map(|command| command.map(Message::FilePicker));
+                let outcome = outcome.map(|outcome| match outcome {
+                    file_picker::Outcome::Selected(path) => Outcome::OpenFile(path),
+                    file_picker::Outcome::Cancelled if *quit_on_cancel => Outcome::Quit,
+                    file_picker::Outcome::Cancelled => Outcome::Close,
+                });
+                Effect::from_parts(command, outcome)
             }
             (Self::Dependencies(component), Message::Dependencies(action)) => {
-                let command = component.update(action);
-                if action == dependencies::Action::Quit {
-                    Update::effect(Effect::Close)
-                } else {
-                    Update {
-                        command: command.map(|cmd| cmd.map(Message::Dependencies)),
-                        effect: None,
-                    }
-                }
+                let (command, outcome) = Effect::into_parts(component.update(action));
+                let command = command.map(|command| command.map(Message::Dependencies));
+                let outcome = outcome.map(|dependencies::Outcome::Closed| Outcome::Close);
+                Effect::from_parts(command, outcome)
             }
-            _ => Update::none(),
+            _ => None,
         }
     }
 

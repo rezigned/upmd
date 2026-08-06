@@ -12,7 +12,7 @@ use unicode_width::UnicodeWidthStr;
 use upmd_parser::{CodeId, Codes};
 use upmd_runtime::{
     runtimes::tui::{Input, Output},
-    Cmd, Component,
+    Cmd, Component, Effect,
 };
 
 use crate::apps::{
@@ -57,6 +57,10 @@ pub enum Action {
     Quit,
     #[key("ctrl-c")]
     Exit,
+}
+
+pub enum Outcome {
+    Closed,
 }
 
 impl Dependencies {
@@ -369,10 +373,11 @@ impl Shortcut for Dependencies {
 }
 
 impl Component for Dependencies {
-    type Msg = Action;
+    type Action = Action;
+    type Outcome = Outcome;
 
-    fn update(&mut self, msg: Self::Msg) -> Option<Cmd<Self::Msg>> {
-        match msg {
+    fn update(&mut self, action: Action) -> Option<Effect<Action, Outcome>> {
+        match action {
             Action::Up => self.scroll_y = self.scroll_y.saturating_sub(1),
             Action::Down => self.scroll_y = self.scroll_y.saturating_add(1),
             Action::Left => self.scroll_x = self.scroll_x.saturating_sub(2),
@@ -383,15 +388,15 @@ impl Component for Dependencies {
                 self.scroll_x = 0;
                 self.scroll_y = 0;
             }
-            Action::Quit => return Some(Cmd::msg(Action::Quit)),
-            Action::Exit => return Some(Cmd::quit()),
+            Action::Quit => return upmd_runtime::effect!(outcome: Outcome::Closed),
+            Action::Exit => return upmd_runtime::effect!(Cmd::quit()),
         }
         None
     }
 }
 
 impl Input for Dependencies {
-    fn action(&self, event: crossterm::event::Event) -> Option<Self::Msg> {
+    fn action(&self, event: crossterm::event::Event) -> Option<Self::Action> {
         let crossterm::event::Event::Key(key) = event else {
             return None;
         };
@@ -771,12 +776,12 @@ sleep 0.5 && echo join
             "↑↓←→ scroll  pgup/pgdn page  home reset  esc/q close"
         );
 
-        Component::update(&mut deps, Action::Right);
-        Component::update(&mut deps, Action::Down);
+        let _ = Component::update(&mut deps, Action::Right);
+        let _ = Component::update(&mut deps, Action::Down);
         assert_eq!(deps.scroll_x, 2);
         assert_eq!(deps.scroll_y, 1);
 
-        Component::update(&mut deps, Action::Reset);
+        let _ = Component::update(&mut deps, Action::Reset);
         assert_eq!(deps.scroll_x, 0);
         assert_eq!(deps.scroll_y, 0);
     }

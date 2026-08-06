@@ -233,17 +233,73 @@ impl<Msg: Send + 'static> Cmd<Msg> {
     }
 }
 
+/// An outward consequence of applying an action to a component.
+///
+/// Commands deliver future actions back to the same component. Outcomes are
+/// synchronous semantic results for the component's parent.
+#[must_use = "component effects may contain a command or parent outcome"]
+pub enum Effect<Action, Outcome> {
+    /// Runtime work that may deliver future component actions.
+    Command(Cmd<Action>),
+    /// A semantic result for the parent component.
+    Outcome(Outcome),
+    /// Runtime work and a semantic parent result produced together.
+    Both {
+        command: Cmd<Action>,
+        outcome: Outcome,
+    },
+}
+
+impl<Action, Outcome> Effect<Action, Outcome> {
+    pub fn command(command: Option<Cmd<Action>>) -> Option<Self> {
+        command.map(Self::Command)
+    }
+
+    pub fn from_parts(command: Option<Cmd<Action>>, outcome: Option<Outcome>) -> Option<Self> {
+        match (command, outcome) {
+            (None, None) => None,
+            (Some(command), None) => Some(Self::Command(command)),
+            (None, Some(outcome)) => Some(Self::Outcome(outcome)),
+            (Some(command), Some(outcome)) => Some(Self::Both { command, outcome }),
+        }
+    }
+
+    pub fn into_parts(effect: Option<Self>) -> (Option<Cmd<Action>>, Option<Outcome>) {
+        match effect {
+            None => (None, None),
+            Some(Self::Command(command)) => (Some(command), None),
+            Some(Self::Outcome(outcome)) => (None, Some(outcome)),
+            Some(Self::Both { command, outcome }) => (Some(command), Some(outcome)),
+        }
+    }
+}
+
+/// Outcome type for root and leaf components that cannot emit a result.
+pub type NoOutcome = std::convert::Infallible;
+
+impl<Action> Effect<Action, NoOutcome> {
+    pub fn into_command(effect: Option<Self>) -> Option<Cmd<Action>> {
+        match effect {
+            None => None,
+            Some(Self::Command(command)) => Some(command),
+            Some(Self::Outcome(outcome)) => match outcome {},
+            Some(Self::Both { outcome, .. }) => match outcome {},
+        }
+    }
+}
+
 // COMPONENT
 
 /// The core trait for application state and logic, following The Elm Architecture.
 ///
-/// A component owns its state and defines how that state mutates in response to messages.
+/// A component owns its state and defines how that state mutates in response to actions.
 /// The runtime ensures `update` is the sole place where state is modified.
 ///
 /// # Implementers must define:
 ///
-/// - `Msg` - The message type for this component
-/// - `update()` - Handles messages and returns optional commands
+/// - `Action` - The input type that drives this component
+/// - `Outcome` - The semantic result type emitted to the parent
+/// - `update()` - Handles actions and returns commands, outcomes, or both
 ///
 /// # Optionally implement:
 ///
@@ -256,39 +312,40 @@ impl<Msg: Send + 'static> Cmd<Msg> {
 ///
 /// struct Counter { count: i32 }
 ///
-/// enum Msg { Increment, Decrement }
+/// enum Action { Increment, Decrement }
 ///
 /// impl Component for Counter {
-///     type Msg = Msg;
+///     type Action = Action;
+///     type Outcome = NoOutcome;
 ///
-///     fn update(&mut self, msg: Msg) -> Option<Cmd<Msg>> {
-///         match msg {
-///             Msg::Increment => self.count += 1,
-///             Msg::Decrement => self.count -= 1,
+///     fn update(&mut self, action: Action) -> Option<Effect<Action, NoOutcome>> {
+///         match action {
+///             Action::Increment => self.count += 1,
+///             Action::Decrement => self.count -= 1,
 ///         }
 ///         None
 ///     }
 /// }
 /// ```
 pub trait Component {
-    /// The message type this component uses for communication.
-    type Msg: Send + 'static;
+    /// Actions entering this component from input or commands.
+    type Action: Send + 'static;
+
+    /// Semantic results emitted synchronously to the parent component.
+    type Outcome;
 
     /// Called once before the run loop starts. Use for initial async work,
     /// such as loading configuration or fetching initial data.
     ///
     /// The returned command will be spawned on a background thread.
     /// Override this only if you need async initialization.
-    fn create(&mut self) -> Option<Cmd<Self::Msg>> {
+    fn create(&mut self) -> Option<Cmd<Self::Action>> {
         None
     }
 
-    /// The sole place where state is mutated. This method receives a message
-    /// and updates the component's state accordingly.
-    ///
-    /// Returns a command to perform side effects, or `None` if no side effects
-    /// are needed. Return `Cmd::quit()` to terminate the runtime.
-    fn update(&mut self, msg: Self::Msg) -> Option<Cmd<Self::Msg>>;
+    /// Applies an action, mutating local state and optionally producing runtime
+    /// work, a semantic result for the parent, or both.
+    fn update(&mut self, action: Self::Action) -> Option<Effect<Self::Action, Self::Outcome>>;
 }
 
 // RUNTIME
@@ -309,13 +366,15 @@ pub trait Component {
 /// use upmd_runtime::prelude::*;
 ///
 /// struct MyComponent { value: i32 }
-/// enum Msg { Increment }
+/// enum Action { Increment }
 ///
 /// impl Component for MyComponent {
-///     type Msg = Msg;
-///     fn update(&mut self, msg: Msg) -> Option<Cmd<Msg>> {
-///         match msg {
-///             Msg::Increment => self.value += 1,
+///     type Action = Action;
+///     type Outcome = NoOutcome;
+///
+///     fn update(&mut self, action: Action) -> Option<Effect<Action, NoOutcome>> {
+///         match action {
+///             Action::Increment => self.value += 1,
 ///         }
 ///         None
 ///     }
@@ -331,7 +390,7 @@ pub trait Component {
 ///     }
 /// }
 /// ```
-pub trait Runtime<C: Component> {
+pub trait Runtime<C: Component<Outcome = NoOutcome>> {
     /// Error type returned when the run loop fails to start.
     type Error;
 
@@ -412,7 +471,7 @@ impl Config {
 /// background commands. The engine drains UI messages first to ensure
 /// responsive input, then processes background commands within a time budget
 /// to maintain frame rate stability.
-pub struct Engine<C: Component> {
+pub struct Engine<C: Component<Outcome = NoOutcome>> {
     /// The component instance owning all application state.
     pub component: C,
     /// Whether the runtime loop should continue.
@@ -420,14 +479,14 @@ pub struct Engine<C: Component> {
     /// Whether the component has changed since last render.
     pub is_dirty: bool,
     /// High-priority message channel (UI events).
-    msg_tx: Sender<C::Msg>,
-    msg_rx: Receiver<C::Msg>,
+    msg_tx: Sender<C::Action>,
+    msg_rx: Receiver<C::Action>,
     /// Low-priority command channel (background tasks).
-    cmd_tx: Sender<C::Msg>,
-    cmd_rx: Receiver<C::Msg>,
+    cmd_tx: Sender<C::Action>,
+    cmd_rx: Receiver<C::Action>,
 }
 
-impl<C: Component> Engine<C> {
+impl<C: Component<Outcome = NoOutcome>> Engine<C> {
     /// Creates a new engine with the given component using default configuration.
     ///
     /// If the component implements `create()`, that command is spawned on a
@@ -446,13 +505,15 @@ impl<C: Component> Engine<C> {
     /// use upmd_runtime::prelude::*;
     ///
     /// struct MyComponent { value: i32 }
-    /// enum Msg { Increment }
+    /// enum Action { Increment }
     ///
     /// impl Component for MyComponent {
-    ///     type Msg = Msg;
-    ///     fn update(&mut self, msg: Msg) -> Option<Cmd<Msg>> {
-    ///         match msg {
-    ///             Msg::Increment => self.value += 1,
+    ///     type Action = Action;
+    ///     type Outcome = NoOutcome;
+    ///
+    ///     fn update(&mut self, action: Action) -> Option<Effect<Action, NoOutcome>> {
+    ///         match action {
+    ///             Action::Increment => self.value += 1,
     ///         }
     ///         None
     ///     }
@@ -540,7 +601,7 @@ impl<C: Component> Engine<C> {
     ///
     /// These messages are processed immediately in the next `tick` call,
     /// before any background commands.
-    pub fn send_msg(&self, msg: C::Msg) -> Result<(), SendError<C::Msg>> {
+    pub fn send_msg(&self, msg: C::Action) -> Result<(), SendError<C::Action>> {
         self.msg_tx.send(msg)
     }
 
@@ -551,10 +612,10 @@ impl<C: Component> Engine<C> {
         renderer.render(&self.component);
     }
 
-    fn update(&mut self, msg: C::Msg) {
+    fn update(&mut self, action: C::Action) {
         self.is_dirty = true;
-        if let Some(cmd) = self.component.update(msg) {
-            self.is_running = spawn_cmd(cmd, self.cmd_tx.clone(), self.msg_tx.clone());
+        if let Some(command) = Effect::into_command(self.component.update(action)) {
+            self.is_running = spawn_cmd(command, self.cmd_tx.clone(), self.msg_tx.clone());
         }
     }
 }
@@ -591,13 +652,14 @@ mod tests {
     struct CreateCommand(Option<Cmd<()>>);
 
     impl Component for CreateCommand {
-        type Msg = ();
+        type Action = ();
+        type Outcome = NoOutcome;
 
-        fn create(&mut self) -> Option<Cmd<Self::Msg>> {
+        fn create(&mut self) -> Option<Cmd<Self::Action>> {
             self.0.take()
         }
 
-        fn update(&mut self, (): ()) -> Option<Cmd<Self::Msg>> {
+        fn update(&mut self, (): ()) -> Option<Effect<Self::Action, Self::Outcome>> {
             None
         }
     }
@@ -613,5 +675,14 @@ mod tests {
         let command = Cmd::Batch(vec![Cmd::task(|| {}), Cmd::quit()]);
         let engine = Engine::new(CreateCommand(Some(command)));
         assert!(!engine.is_running);
+    }
+
+    #[test]
+    fn effect_can_contain_command_and_outcome() {
+        let effect: Option<Effect<(), i32>> = crate::effect!(Cmd::task(|| {}), outcome: 7);
+        let (command, outcome) = Effect::into_parts(effect);
+
+        assert!(command.is_some());
+        assert_eq!(outcome, Some(7));
     }
 }
