@@ -4,8 +4,12 @@ use crate::apps::config::{self, Config as AppConfig};
 use crate::apps::exec;
 use crate::apps::tui;
 use crate::apps::tui::{
-    confirm, content, dependencies, file_picker, layout, menu, preview, tasks::Tasks, themes,
-    workflow::State as WorkflowState, Shortcut,
+    confirm, content, dependencies, file_picker, layout,
+    overlay::{self, Overlay},
+    tasks::Tasks,
+    themes,
+    workflow::State as WorkflowState,
+    Shortcut,
 };
 use crate::apps::workflow::{Workflow, WorkflowTransition};
 use crate::utils::key_to_bytes;
@@ -34,48 +38,6 @@ enum View {
     Home,
     Input,
     Output,
-}
-
-enum Overlay {
-    Confirm(confirm::Confirm),
-    Help(tui::help::Help),
-    Envs,
-    Search(tui::search::Search),
-    Goto(tui::goto::Goto),
-    Themes(Box<themes::ThemeSelector>),
-    FilePicker {
-        picker: file_picker::FilePicker,
-        quit_on_cancel: bool,
-    },
-    Dependencies(dependencies::Dependencies),
-}
-
-impl Overlay {
-    fn action(&self, event: crossterm::event::Event, envs: &tui::envs::EnvVars) -> Option<Msg> {
-        match self {
-            Self::Confirm(confirm) => confirm.action(event).map(Msg::Confirm),
-            Self::Help(help) => help.action(event).map(Msg::Help),
-            Self::Envs => envs.action(event).map(Msg::Envs),
-            Self::Search(search) => search.action(event).map(Msg::Search),
-            Self::Goto(goto) => goto.action(event).map(Msg::Goto),
-            Self::Themes(themes) => themes.action(event).map(Msg::Themes),
-            Self::FilePicker { picker, .. } => picker.action(event).map(Msg::FilePicker),
-            Self::Dependencies(_) => Some(Msg::Event(event)),
-        }
-    }
-
-    fn render(&self, frame: &mut Frame, area: Rect, envs: &tui::envs::EnvVars) {
-        match self {
-            Self::Confirm(confirm) => confirm.render(frame, area),
-            Self::Help(help) => help.render(frame, area),
-            Self::Envs => envs.render(frame, area),
-            Self::Search(_) => {}
-            Self::Goto(goto) => goto.render(frame, area),
-            Self::Themes(themes) => themes.render(frame, area),
-            Self::FilePicker { picker, .. } => picker.render(frame, area),
-            Self::Dependencies(dependencies) => dependencies.render(frame, area),
-        }
-    }
 }
 
 /// Main TUI application component.
@@ -547,9 +509,9 @@ impl App {
     /// Clicking another running block keeps input mode active for that new
     /// block. Clicking a completed or empty block exits input mode before the
     /// selection is changed.
-    fn keep_input_for_running_click_target(&mut self, id: CodeId) {
+    fn keep_input_for_running_click_target(&mut self, previous: Option<CodeId>, id: CodeId) {
         if self.view == View::Input
-            && self.content.selected_code_id() != Some(id)
+            && previous != Some(id)
             && !self.tasks.get(id).is_some_and(|b| b.running())
         {
             self.view = View::Home;
@@ -571,16 +533,9 @@ impl App {
 /// Messages handled by the main TUI component's event loop.
 #[derive(Clone, Debug)]
 pub enum Msg {
-    Menu(menu::Action),
-    Confirm(confirm::Action),
-    Search(tui::search::Action),
-    Goto(tui::goto::Action),
-    Dependencies(dependencies::Action),
-    Help(tui::help::Action),
-    Envs(tui::envs::Action),
-    Themes(themes::Action),
-    FilePicker(file_picker::Action),
-    OutputAction(tui::output::Action),
+    Content(content::Action),
+    Overlay(overlay::Message),
+    Output(tui::output::Action),
     StreamUpdate(CodeId, crate::pty::stream::Stream),
     Notify(tui::notification::FlashMessage),
     Tick,
@@ -630,16 +585,9 @@ impl Component for App {
     fn update(&mut self, msg: Msg) -> Option<Cmd<Msg>> {
         match msg {
             Msg::Event(event) => self.handle_event(event),
-            Msg::Menu(action) => self.handle_menu_msg(action),
-            Msg::Confirm(action) => self.handle_confirm_msg(action),
-            Msg::FilePicker(action) => self.handle_file_picker_msg(action),
-            Msg::Search(action) => self.handle_search_msg(action),
-            Msg::Goto(action) => self.handle_goto_msg(action),
-            Msg::Dependencies(action) => self.handle_dependencies_msg(action),
-            Msg::Help(action) => self.handle_help_msg(action),
-            Msg::Envs(action) => self.handle_envs_msg(action),
-            Msg::Themes(action) => self.handle_themes_msg(action),
-            Msg::OutputAction(action) => self.handle_output_action(action),
+            Msg::Content(action) => self.handle_content_msg(action),
+            Msg::Overlay(message) => self.handle_overlay_msg(message),
+            Msg::Output(action) => self.handle_output_action(action),
             Msg::StreamUpdate(id, stream) => self.handle_stream_update(id, stream),
             Msg::Notify(flash) => {
                 self.notification = Some(flash);
@@ -663,14 +611,11 @@ impl Component for App {
                 self.sync_task_statuses();
                 self.sync_input_mode();
                 self.content.tick();
-                if let Some(Overlay::Goto(goto)) = &mut self.overlay {
-                    goto.tick();
+                let statuses = self.tasks.task_statuses();
+                if let Some(overlay) = &mut self.overlay {
+                    overlay.tick(&statuses);
                 }
                 self.output.tick();
-                let statuses = self.tasks.task_statuses();
-                if let Some(Overlay::Dependencies(dependencies)) = &mut self.overlay {
-                    dependencies.tick(statuses.clone());
-                }
                 self.workflow.tick(statuses);
 
                 // Clear expired flash notification.
@@ -925,12 +870,6 @@ impl App {
             return None;
         }
 
-        if let Some(Overlay::Dependencies(dependencies)) = &mut self.overlay {
-            let action = dependencies.action(event)?;
-            let cmd = dependencies.update(action)?;
-            return Some(cmd.map(Msg::Dependencies));
-        }
-
         match self.view {
             View::Home | View::Input => self.handle_home_event(event),
             View::Output => self.handle_output_event(event),
@@ -993,10 +932,7 @@ impl App {
         }
 
         if let Some(action) = self.content.action(event.clone()) {
-            return match action {
-                content::Action::Preview(action) => self.handle_preview_msg(action),
-                content::Action::Menu(action) => self.handle_menu_msg(action),
-            };
+            return Some(Cmd::msg(Msg::Content(action)));
         }
 
         if let crossterm::event::Event::Key(key) = event {
@@ -1017,7 +953,7 @@ impl App {
 
         if let Some(action) = self.output.action(event.clone()) {
             if let Some(cmd) = self.output.update(action) {
-                return Some(cmd.map(Msg::OutputAction));
+                return Some(cmd.map(Msg::Output));
             }
         }
 
@@ -1101,8 +1037,8 @@ impl App {
         }
         self.footer_right_text = Self::build_footer_right_text(&theme);
         self.content.set_theme(&theme);
-        if let Some(Overlay::Dependencies(dependencies)) = &mut self.overlay {
-            dependencies.set_theme(&theme);
+        if let Some(overlay) = &mut self.overlay {
+            overlay.set_theme(&theme);
         }
         self.workflow.set_theme(&theme);
         self.envs.set_theme(&theme);
@@ -1150,157 +1086,109 @@ impl App {
         })
     }
 
-    fn handle_menu_msg(&mut self, msg: menu::Action) -> Option<Cmd<Msg>> {
-        let cmd = self.content.update_menu(msg.clone());
+    fn handle_content_msg(&mut self, message: content::Action) -> Option<Cmd<Msg>> {
+        let command = self.content.update(message);
 
-        match msg {
-            menu::Action::Click(id) => {
-                self.keep_input_for_running_click_target(id);
-                self.content.select_code_in_place(id);
-                self.enter_input_for_running_click_target(id);
-                self.sync_input_mode();
-                return None;
+        match self.content.take_effect() {
+            Some(content::Effect::CodeClicked {
+                previous,
+                selected,
+                copied,
+            }) => {
+                self.keep_input_for_running_click_target(previous, selected);
+                self.enter_input_for_running_click_target(selected);
+                self.notify_copy_result(copied);
             }
-            menu::Action::TocClick(heading_idx) => {
-                self.content.select_heading(heading_idx);
-                self.sync_input_mode();
-                return None;
-            }
-            menu::Action::Navigation(_) => {}
-        }
-
-        self.content.sync_from_menu();
-
-        self.sync_input_mode();
-        cmd.map(|c| c.map(Msg::Menu))
-    }
-
-    fn handle_preview_msg(&mut self, action: preview::Action) -> Option<Cmd<Msg>> {
-        match action {
-            preview::Action::ToggleToc => {
-                self.content.toggle_toc();
-                self.sync_input_mode();
-                return None;
-            }
-            preview::Action::SelectCodeBlock(id) => {
-                self.keep_input_for_running_click_target(id);
-                self.content.select_code_in_place(id);
-                self.enter_input_for_running_click_target(id);
-                self.sync_input_mode();
-                let copied = self.content.take_copy_result();
-                if copied == Some(true) {
-                    self.notify_success("Copied");
-                } else if copied == Some(false) {
-                    self.notify_error("Failed to copy");
-                }
-                return None;
-            }
-            _ => {
-                // Non-code click (heading, paragraph): always unfocus.
+            Some(content::Effect::PreviewInteracted { copied }) => {
                 if self.view == View::Input {
                     self.view = View::Home;
                 }
-                self.content.update_preview(action);
-                if let Some(ok) = self.content.take_copy_result() {
-                    if ok {
-                        self.notify_success("Copied");
-                    } else {
-                        self.notify_error("Failed to copy");
-                    }
-                }
+                self.notify_copy_result(copied);
             }
+            None => {}
         }
 
-        self.content.sync_from_preview();
         self.sync_input_mode();
-        None
+        command.map(|cmd| cmd.map(Msg::Content))
     }
 
-    fn handle_confirm_msg(&mut self, action: confirm::Action) -> Option<Cmd<Msg>> {
-        let cmd = match &mut self.overlay {
-            Some(Overlay::Confirm(confirm)) => confirm.update(action),
-            _ => return None,
-        };
-        match action {
-            confirm::Action::Confirmed(confirm::ConfirmAction::Quit) => Some(Cmd::quit()),
-            confirm::Action::Confirmed(confirm::ConfirmAction::ReloadFile) => {
+    fn notify_copy_result(&mut self, copied: Option<bool>) {
+        match copied {
+            Some(true) => self.notify_success("Copied"),
+            Some(false) => self.notify_error("Failed to copy"),
+            None => {}
+        }
+    }
+
+    fn handle_overlay_msg(&mut self, message: overlay::Message) -> Option<Cmd<Msg>> {
+        let update = self.overlay.as_mut()?.update(message, &mut self.envs);
+        let command = update.command.map(|cmd| cmd.map(Msg::Overlay));
+        let effect_command = update
+            .effect
+            .and_then(|effect| self.apply_overlay_effect(effect));
+        effect_command.or(command)
+    }
+
+    fn apply_overlay_effect(&mut self, effect: overlay::Effect) -> Option<Cmd<Msg>> {
+        match effect {
+            overlay::Effect::Close => {
+                self.overlay = None;
+                self.view = View::Home;
+                None
+            }
+            overlay::Effect::Quit => Some(Cmd::quit()),
+            overlay::Effect::Reload => {
                 self.overlay = None;
                 self.view = View::Home;
                 self.reload()
             }
-            confirm::Action::Confirmed(confirm::ConfirmAction::ReRun(id)) => {
+            overlay::Effect::Rerun(id) => {
                 self.overlay = None;
                 self.view = View::Home;
                 self.auto_input_paused = false;
                 self.rerun_target(id)
             }
-            confirm::Action::Cancelled => {
+            overlay::Effect::ClearSearch => {
+                self.content.search("");
                 self.overlay = None;
                 self.view = View::Home;
                 None
             }
-            _ => cmd.map(|c| c.map(Msg::Confirm)),
-        }
-    }
-
-    fn handle_search_msg(&mut self, action: tui::search::Action) -> Option<Cmd<Msg>> {
-        let search = match &mut self.overlay {
-            Some(Overlay::Search(search)) => search,
-            _ => return None,
-        };
-        let cmd = search.update(action);
-
-        if cmd.is_some() {
-            match action {
-                tui::search::Action::Quit => {
-                    self.content.search("");
-                    self.overlay = None;
-                    self.view = View::Home;
+            overlay::Effect::RefreshSearch(term) => {
+                let results = self.content.search(&term);
+                let selected = self
+                    .overlay
+                    .as_mut()
+                    .and_then(|overlay| overlay.apply_search_results(&results));
+                if let Some(index) = selected {
+                    self.content.select_search_match(index);
                 }
-                tui::search::Action::Select => {
-                    self.overlay = None;
-                    self.view = View::Home;
-                }
-                _ => {}
+                None
             }
-            return None;
-        }
-        let result = self.content.search(search.term());
-        if let Some(index) = search.search(&result) {
-            self.content.select_search_match(*index);
-        }
-
-        None
-    }
-
-    /// Handles picker actions that change application-level state.
-    /// The picker owns navigation; the app owns file loading and cancellation.
-    fn handle_file_picker_msg(&mut self, action: file_picker::Action) -> Option<Cmd<Msg>> {
-        let (cmd, path, quit_on_cancel) = match &mut self.overlay {
-            Some(Overlay::FilePicker {
-                picker,
-                quit_on_cancel,
-            }) => {
-                let cmd = picker.update(action);
-                let path = picker.selected_path().map(PathBuf::from);
-                (cmd, path, *quit_on_cancel)
-            }
-            _ => return None,
-        };
-        cmd.as_ref()?;
-
-        match action {
-            file_picker::Action::Select => self.open_markdown_file(path?),
-            file_picker::Action::Quit => {
+            overlay::Effect::SelectCode(id) => {
+                self.content.select_code(id);
                 self.overlay = None;
-                if quit_on_cancel {
-                    Some(Cmd::quit())
-                } else {
-                    self.view = View::Home;
-                    None
-                }
+                self.view = View::Home;
+                None
             }
-            _ => cmd.map(|c| c.map(Msg::FilePicker)),
+            overlay::Effect::OpenFile(path) => self.open_markdown_file(path),
+            overlay::Effect::PreviewTheme(theme) => {
+                self.apply_theme(theme);
+                None
+            }
+            overlay::Effect::SaveTheme(theme) => {
+                self.apply_theme(theme.clone());
+                self.overlay = None;
+                self.view = View::Home;
+                Some(self.save_theme_preference(theme))
+            }
+            overlay::Effect::RestoreTheme(theme) => {
+                self.apply_theme(theme);
+                self.overlay = None;
+                self.view = View::Home;
+                self.notify_info("Theme restored");
+                None
+            }
         }
     }
 
@@ -1391,93 +1279,6 @@ impl App {
         Ok(())
     }
 
-    fn handle_dependencies_msg(&mut self, action: dependencies::Action) -> Option<Cmd<Msg>> {
-        if action == dependencies::Action::Quit {
-            self.overlay = None;
-            self.view = View::Home;
-        }
-        None
-    }
-
-    fn handle_goto_msg(&mut self, action: tui::goto::Action) -> Option<Cmd<Msg>> {
-        let (cmd, selected) = match &mut self.overlay {
-            Some(Overlay::Goto(goto)) => {
-                let cmd = goto.update(action);
-                (cmd, goto.selected_code_id())
-            }
-            _ => return None,
-        };
-
-        if cmd.is_some() {
-            match action {
-                tui::goto::Action::Select => {
-                    if let Some(id) = selected {
-                        self.content.select_code(id);
-                    }
-                    self.overlay = None;
-                    self.view = View::Home;
-                }
-                tui::goto::Action::Quit => {
-                    self.overlay = None;
-                    self.view = View::Home;
-                }
-                _ => {}
-            }
-        }
-
-        None
-    }
-
-    fn handle_help_msg(&mut self, action: tui::help::Action) -> Option<Cmd<Msg>> {
-        let closed = match &mut self.overlay {
-            Some(Overlay::Help(help)) => help.update(action).is_some(),
-            _ => return None,
-        };
-        if closed {
-            self.overlay = None;
-            self.view = View::Home;
-        }
-        None
-    }
-
-    fn handle_envs_msg(&mut self, action: tui::envs::Action) -> Option<Cmd<Msg>> {
-        let cmd = self.envs.update(action.clone());
-        if let tui::envs::Action::Quit = action {
-            self.overlay = None;
-            self.view = View::Home;
-            None
-        } else {
-            cmd.map(|c| c.map(Msg::Envs))
-        }
-    }
-
-    fn handle_themes_msg(&mut self, action: themes::Action) -> Option<Cmd<Msg>> {
-        let cmd = match &mut self.overlay {
-            Some(Overlay::Themes(themes)) => themes.update(action.clone()),
-            _ => return None,
-        };
-        match action {
-            themes::Action::Preview(theme) => {
-                self.apply_theme(theme);
-                None
-            }
-            themes::Action::Select(theme) => {
-                self.apply_theme(theme.clone());
-                self.overlay = None;
-                self.view = View::Home;
-                Some(self.save_theme_preference(theme))
-            }
-            themes::Action::Restore(theme) => {
-                self.apply_theme(theme);
-                self.overlay = None;
-                self.view = View::Home;
-                self.notify_info("Theme restored");
-                None
-            }
-            _ => cmd.map(|c| c.map(Msg::Themes)),
-        }
-    }
-
     fn handle_stream_update(
         &mut self,
         id: CodeId,
@@ -1565,7 +1366,7 @@ impl App {
 impl Input for App {
     fn action(&self, event: crossterm::event::Event) -> Option<Msg> {
         if let Some(overlay) = &self.overlay {
-            overlay.action(event, &self.envs)
+            overlay.action(event, &self.envs).map(Msg::Overlay)
         } else {
             Some(Msg::Event(event))
         }
@@ -1666,22 +1467,12 @@ impl App {
     }
 
     fn footer_content(&self) -> (Line<'static>, Line<'static>, Option<Line<'static>>) {
-        if let Some(overlay) = &self.overlay {
-            match overlay {
-                Overlay::Search(search) => {
-                    let badge = self.theme.mode_badge("SEARCH", self.theme.active);
-                    return (badge, search.footer_shortcuts(), search.footer_right());
-                }
-                Overlay::Goto(_) => {
-                    let badge = self.theme.mode_badge("GOTO", self.theme.active);
-                    return (badge, Line::default(), None);
-                }
-                Overlay::FilePicker { picker, .. } => {
-                    let badge = self.theme.mode_badge("OPEN", self.theme.active);
-                    return (badge, picker.footer_shortcuts(), None);
-                }
-                _ => {}
-            }
+        if let Some(content) = self
+            .overlay
+            .as_ref()
+            .and_then(|overlay| overlay.footer_content(&self.theme))
+        {
+            return content;
         }
 
         match self.view {
@@ -1805,7 +1596,9 @@ mod tests {
             Some(Path::new("/repo/README.md"))
         );
 
-        app.update(Msg::FilePicker(file_picker::Action::Next));
+        app.update(Msg::Overlay(overlay::Message::FilePicker(
+            file_picker::Action::Next,
+        )));
         assert_eq!(
             selected_picker_path(&app),
             Some(Path::new("/repo/docs/install.md"))
@@ -1860,10 +1653,14 @@ mod tests {
             AppConfig::default(),
         );
 
-        app.update(Msg::FilePicker(file_picker::Action::Next));
+        app.update(Msg::Overlay(overlay::Message::FilePicker(
+            file_picker::Action::Next,
+        )));
         assert_eq!(selected_picker_path(&app), Some(install_path.as_path()));
 
-        app.update(Msg::FilePicker(file_picker::Action::Select));
+        app.update(Msg::Overlay(overlay::Message::FilePicker(
+            file_picker::Action::Select,
+        )));
 
         assert!(app.overlay.is_none());
         assert_eq!(app.file_picker_root.as_deref(), Some(root.as_path()));

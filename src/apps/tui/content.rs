@@ -20,11 +20,24 @@ use crate::apps::{
 pub struct Content {
     menu: menu::Menu,
     preview: preview::Preview,
+    effect: Option<Effect>,
 }
 
+#[derive(Clone, Debug)]
 pub enum Action {
     Menu(menu::Action),
     Preview(preview::Action),
+}
+
+pub enum Effect {
+    CodeClicked {
+        previous: Option<CodeId>,
+        selected: CodeId,
+        copied: Option<bool>,
+    },
+    PreviewInteracted {
+        copied: Option<bool>,
+    },
 }
 
 impl Content {
@@ -62,7 +75,11 @@ impl Content {
             preview.select_code(id);
         }
 
-        Self { menu, preview }
+        Self {
+            menu,
+            preview,
+            effect: None,
+        }
     }
 
     pub fn select_code(&mut self, id: CodeId) {
@@ -219,26 +236,6 @@ impl Content {
             .mouse_to_pty_coords(id, mouse, pty_cols, pty_rows)
     }
 
-    pub fn action(&self, event: Event) -> Option<Action> {
-        if let Some(action) = self.preview.action(event.clone()) {
-            Some(Action::Preview(action))
-        } else {
-            self.menu.action(event).map(Action::Menu)
-        }
-    }
-
-    pub fn update_menu(&mut self, action: menu::Action) -> Option<Cmd<menu::Action>> {
-        self.menu.update(action)
-    }
-
-    pub fn update_preview(&mut self, action: preview::Action) {
-        self.preview.update(action);
-    }
-
-    pub fn take_copy_result(&self) -> Option<bool> {
-        self.preview.take_copy_result()
-    }
-
     pub fn search(&mut self, term: &str) -> Vec<usize> {
         self.preview.search(term)
     }
@@ -249,5 +246,71 @@ impl Content {
 
     pub fn render_menu(&self, frame: &mut Frame, area: Rect) {
         self.menu.render(frame, area);
+    }
+}
+
+impl Input for Content {
+    fn action(&self, event: Event) -> Option<Action> {
+        if let Some(action) = self.preview.action(event.clone()) {
+            Some(Action::Preview(action))
+        } else {
+            self.menu.action(event).map(Action::Menu)
+        }
+    }
+}
+
+impl Component for Content {
+    type Msg = Action;
+
+    fn update(&mut self, message: Action) -> Option<Cmd<Action>> {
+        self.effect = None;
+
+        match message {
+            Action::Menu(action) => {
+                let command = self.menu.update(action.clone());
+                match action {
+                    menu::Action::Click(id) => {
+                        let previous = self.selected_code_id();
+                        self.select_code_in_place(id);
+                        self.effect = Some(Effect::CodeClicked {
+                            previous,
+                            selected: id,
+                            copied: None,
+                        });
+                    }
+                    menu::Action::TocClick(index) => self.select_heading(index),
+                    menu::Action::Navigation(_) => self.sync_from_menu(),
+                }
+                command.map(|cmd| cmd.map(Action::Menu))
+            }
+            Action::Preview(action) => {
+                if action == preview::Action::ToggleToc {
+                    self.toggle_toc();
+                    return None;
+                }
+
+                let previous = self.selected_code_id();
+                let command = self.preview.update(action);
+                self.sync_from_preview();
+                let copied = self.preview.take_copy_result();
+
+                self.effect = match action {
+                    preview::Action::SelectCodeBlock(id) => Some(Effect::CodeClicked {
+                        previous,
+                        selected: id,
+                        copied,
+                    }),
+                    _ => Some(Effect::PreviewInteracted { copied }),
+                };
+
+                command.map(|cmd| cmd.map(Action::Preview))
+            }
+        }
+    }
+}
+
+impl Content {
+    pub fn take_effect(&mut self) -> Option<Effect> {
+        self.effect.take()
     }
 }
