@@ -1,4 +1,9 @@
-use crate::apps::{config::LOGO, tui::layout::centered_rect};
+use crate::apps::{
+    config::{KeymapConfig, LOGO},
+    navigation::Navigation,
+    theme::Theme,
+    tui::layout::centered_rect,
+};
 use keymap::{DerivedConfig, KeyMap};
 use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
@@ -8,14 +13,12 @@ use ratatui::{
     Frame,
 };
 
-use crate::apps::theme::Theme;
-
 use upmd_runtime::{
     runtimes::tui::{Input, Output},
     Cmd, Component,
 };
 
-pub struct KeymapEntry {
+struct KeymapEntry {
     section: &'static str,
     symbol: String,
     description: String,
@@ -70,7 +73,7 @@ impl KeymapEntry {
 
 /// Extracts user-facing keymap entries from a parsed keymap config, skipping
 /// implementation-only bindings (e.g. `@any`).
-pub fn collect_keymap_entries<'a, T>(
+fn collect_keymap_entries<'a, T>(
     section: &'static str,
     config: &'a DerivedConfig<T>,
 ) -> impl Iterator<Item = KeymapEntry> + 'a {
@@ -107,8 +110,79 @@ pub fn collect_keymap_entries<'a, T>(
     })
 }
 
+fn append_keymap_entries<T>(
+    items: &mut Vec<KeymapEntry>,
+    section: &'static str,
+    config: DerivedConfig<T>,
+) {
+    items.extend(collect_keymap_entries(section, &config));
+}
+
+fn keymap_entries(keymaps: &KeymapConfig) -> Vec<KeymapEntry> {
+    let mut items = Vec::new();
+    append_keymap_entries(&mut items, "home", keymaps.home::<super::app::Action>());
+    append_keymap_entries(
+        &mut items,
+        "output",
+        keymaps.output::<super::output::Action>(),
+    );
+    append_keymap_entries(
+        &mut items,
+        "cli",
+        keymaps.cli::<crate::apps::cli::app::Action>(),
+    );
+    append_keymap_entries(&mut items, "menu", keymaps.menu::<Navigation>());
+    append_keymap_entries(
+        &mut items,
+        "preview",
+        keymaps.preview::<super::preview::Action>(),
+    );
+    append_keymap_entries(
+        &mut items,
+        "confirm",
+        keymaps.confirm::<super::confirm::Action>(),
+    );
+    append_keymap_entries(
+        &mut items,
+        "search",
+        keymaps.search::<super::search::Action>(),
+    );
+    append_keymap_entries(&mut items, "goto", keymaps.goto::<super::goto::Action>());
+    append_keymap_entries(
+        &mut items,
+        "dependencies",
+        keymaps.dependencies::<super::dependencies::Action>(),
+    );
+    append_keymap_entries(
+        &mut items,
+        "file_picker",
+        keymaps.file_picker::<super::file_picker::Action>(),
+    );
+    append_keymap_entries(&mut items, "help", keymaps.help::<Action>());
+    append_keymap_entries(
+        &mut items,
+        "envs",
+        keymaps.envs::<super::envs::MainAction>(),
+    );
+    append_keymap_entries(
+        &mut items,
+        "envs_edit",
+        keymaps.envs_edit::<super::envs::EditAction>(),
+    );
+    append_keymap_entries(
+        &mut items,
+        "themes",
+        keymaps.themes::<super::themes::MainAction>(),
+    );
+    items
+}
+
 impl Help {
-    pub fn new(theme: Theme, keymap: DerivedConfig<Action>, all_items: Vec<KeymapEntry>) -> Self {
+    pub fn from_keymaps(theme: Theme, keymaps: &KeymapConfig) -> Self {
+        Self::new(theme, keymaps.help(), keymap_entries(keymaps))
+    }
+
+    fn new(theme: Theme, keymap: DerivedConfig<Action>, all_items: Vec<KeymapEntry>) -> Self {
         let mut help = Self {
             theme,
             keymap,

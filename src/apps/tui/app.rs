@@ -2,7 +2,6 @@
 
 use crate::apps::config::{self, Config as AppConfig};
 use crate::apps::exec;
-use crate::apps::navigation::Navigation;
 use crate::apps::tui;
 use crate::apps::tui::{
     confirm, content, dependencies, file_picker, layout, menu, preview, tasks::Tasks, themes,
@@ -170,22 +169,6 @@ pub enum Action {
 }
 
 impl App {
-    /// Creates the app in file-picker mode before a document is loaded.
-    pub fn from_file_picker(
-        root: PathBuf,
-        files: Vec<crate::markdown_files::MarkdownFile>,
-        config: AppConfig,
-    ) -> Self {
-        let theme = config.theme.clone();
-        let mut app = Self::build(upmd_parser::Document::default(), config.clone(), None);
-        app.overlay = Some(Overlay::FilePicker {
-            picker: file_picker::FilePicker::new(files, theme, config.keymap.file_picker()),
-            quit_on_cancel: true,
-        });
-        app.file_picker_root = Some(root);
-        app
-    }
-
     pub fn new(doc: upmd_parser::Document, config: AppConfig) -> std::result::Result<Self, String> {
         let selected = crate::apps::initial_code_id(&doc.codes, config.block.as_deref())?;
         Ok(Self::build(doc, config, selected))
@@ -615,7 +598,14 @@ impl crate::RunApp for App {
         files: Vec<crate::markdown_files::MarkdownFile>,
         config: AppConfig,
     ) -> Self {
-        Self::from_file_picker(root, files, config)
+        let theme = config.theme.clone();
+        let mut app = Self::build(upmd_parser::Document::default(), config.clone(), None);
+        app.overlay = Some(Overlay::FilePicker {
+            picker: file_picker::FilePicker::new(files, theme, config.keymap.file_picker()),
+            quit_on_cancel: true,
+        });
+        app.file_picker_root = Some(root);
+        app
     }
 
     fn run(self) -> Result<ExitCode> {
@@ -782,10 +772,9 @@ impl App {
                 None
             }
             Action::Help => {
-                self.overlay = Some(Overlay::Help(tui::help::Help::new(
+                self.overlay = Some(Overlay::Help(tui::help::Help::from_keymaps(
                     self.theme.clone(),
-                    self.config.keymap.help(),
-                    self.help_keymap_items(),
+                    &self.config.keymap,
                 )));
                 None
             }
@@ -1315,83 +1304,6 @@ impl App {
         }
     }
 
-    fn help_keymap_items(&self) -> Vec<tui::help::KeymapEntry> {
-        let mut items = Vec::new();
-        Self::append_help_entries(&mut items, "home", self.config.keymap.home::<Action>());
-        Self::append_help_entries(
-            &mut items,
-            "output",
-            self.config.keymap.output::<tui::output::Action>(),
-        );
-        Self::append_help_entries(
-            &mut items,
-            "cli",
-            self.config.keymap.cli::<crate::apps::cli::app::Action>(),
-        );
-        Self::append_help_entries(&mut items, "menu", self.config.keymap.menu::<Navigation>());
-        Self::append_help_entries(
-            &mut items,
-            "preview",
-            self.config.keymap.preview::<tui::preview::Action>(),
-        );
-        Self::append_help_entries(
-            &mut items,
-            "confirm",
-            self.config.keymap.confirm::<tui::confirm::Action>(),
-        );
-        Self::append_help_entries(
-            &mut items,
-            "search",
-            self.config.keymap.search::<tui::search::Action>(),
-        );
-        Self::append_help_entries(
-            &mut items,
-            "goto",
-            self.config.keymap.goto::<tui::goto::Action>(),
-        );
-        Self::append_help_entries(
-            &mut items,
-            "dependencies",
-            self.config
-                .keymap
-                .dependencies::<tui::dependencies::Action>(),
-        );
-        Self::append_help_entries(
-            &mut items,
-            "file_picker",
-            self.config.keymap.file_picker::<tui::file_picker::Action>(),
-        );
-        Self::append_help_entries(
-            &mut items,
-            "help",
-            self.config.keymap.help::<tui::help::Action>(),
-        );
-        Self::append_help_entries(
-            &mut items,
-            "envs",
-            self.config.keymap.envs::<tui::envs::MainAction>(),
-        );
-        Self::append_help_entries(
-            &mut items,
-            "envs_edit",
-            self.config.keymap.envs_edit::<tui::envs::EditAction>(),
-        );
-        Self::append_help_entries(
-            &mut items,
-            "themes",
-            self.config.keymap.themes::<tui::themes::MainAction>(),
-        );
-        items
-    }
-
-    fn append_help_entries<T>(
-        items: &mut Vec<tui::help::KeymapEntry>,
-        section: &'static str,
-        config: DerivedConfig<T>,
-    ) {
-        items.extend(tui::help::collect_keymap_entries(section, &config));
-    }
-
     /// Resolves picker root then opens the picker.
     /// Fallback chain: file_picker_root, config.file parent, cwd.
     /// `a/b/c.md` does not narrow the next picker to `a/b/`.
@@ -1854,7 +1766,7 @@ mod tests {
     }
 
     fn app_in_file_picker_mode() -> App {
-        App::from_file_picker(
+        <App as crate::RunApp>::from_picker(
             PathBuf::from("/repo"),
             vec![
                 markdown_file("/repo/README.md", "README.md"),
@@ -1933,7 +1845,7 @@ mod tests {
         fs::write(&readme_path, "# Read me\n").unwrap();
         fs::write(&install_path, "# Install\n\nUse this guide.\n").unwrap();
 
-        let mut app = App::from_file_picker(
+        let mut app = <App as crate::RunApp>::from_picker(
             root.clone(),
             vec![
                 MarkdownFile {
