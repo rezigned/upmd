@@ -578,12 +578,13 @@ impl Component for App {
     }
 
     fn update(&mut self, msg: Msg) -> Option<upmd_runtime::Effect<Self::Action, Self::Outcome>> {
-        upmd_runtime::Effect::command(match msg {
+        match msg {
             Msg::Action(action) => self.handle_action(action),
             Msg::Navigation(nav) => self.handle_nav(nav),
             Msg::StreamUpdate(id, stream) => self.handle_stream_update(id, stream),
             Msg::Picker(action) => self.handle_picker_msg(action),
-        })
+        }
+        .map(upmd_runtime::Effect::Command)
     }
 }
 

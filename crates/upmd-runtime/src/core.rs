@@ -251,10 +251,6 @@ pub enum Effect<Action, Outcome> {
 }
 
 impl<Action, Outcome> Effect<Action, Outcome> {
-    pub fn command(command: Option<Cmd<Action>>) -> Option<Self> {
-        command.map(Self::Command)
-    }
-
     pub fn from_parts(command: Option<Cmd<Action>>, outcome: Option<Outcome>) -> Option<Self> {
         match (command, outcome) {
             (None, None) => None,
@@ -263,27 +259,54 @@ impl<Action, Outcome> Effect<Action, Outcome> {
             (Some(command), Some(outcome)) => Some(Self::Both { command, outcome }),
         }
     }
-
-    pub fn into_parts(effect: Option<Self>) -> (Option<Cmd<Action>>, Option<Outcome>) {
-        match effect {
-            None => (None, None),
-            Some(Self::Command(command)) => (Some(command), None),
-            Some(Self::Outcome(outcome)) => (None, Some(outcome)),
-            Some(Self::Both { command, outcome }) => (Some(command), Some(outcome)),
-        }
-    }
 }
 
 /// Outcome type for root and leaf components that cannot emit a result.
 pub type NoOutcome = std::convert::Infallible;
 
-impl<Action> Effect<Action, NoOutcome> {
-    pub fn into_command(effect: Option<Self>) -> Option<Cmd<Action>> {
-        match effect {
+/// Extension methods for optional component effects.
+pub trait EffectExt {
+    /// Action delivered by commands contained in the effect.
+    type Action;
+    /// Semantic result emitted by the effect.
+    type Outcome;
+
+    /// Splits an optional effect into its command and outcome.
+    fn into_parts(self) -> (Option<Cmd<Self::Action>>, Option<Self::Outcome>);
+}
+
+impl<Action, Outcome> EffectExt for Option<Effect<Action, Outcome>> {
+    type Action = Action;
+    type Outcome = Outcome;
+
+    fn into_parts(self) -> (Option<Cmd<Action>>, Option<Outcome>) {
+        match self {
+            None => (None, None),
+            Some(Effect::Command(command)) => (Some(command), None),
+            Some(Effect::Outcome(outcome)) => (None, Some(outcome)),
+            Some(Effect::Both { command, outcome }) => (Some(command), Some(outcome)),
+        }
+    }
+}
+
+/// Command extraction for optional effects that cannot contain outcomes.
+pub trait CommandEffectExt {
+    /// Action delivered by the extracted command.
+    type Action;
+
+    /// Extracts the command from an optional effect.
+    fn into_command(self) -> Option<Cmd<Self::Action>>;
+}
+
+impl<Action> CommandEffectExt for Option<Effect<Action, NoOutcome>> {
+    type Action = Action;
+
+    fn into_command(self) -> Option<Cmd<Action>> {
+        match self {
             None => None,
-            Some(Self::Command(command)) => Some(command),
-            Some(Self::Outcome(outcome)) => match outcome {},
-            Some(Self::Both { outcome, .. }) => match outcome {},
+            Some(Effect::Command(command)) => Some(command),
+            Some(Effect::Outcome(outcome)) => match outcome {},
+            Some(Effect::Both { outcome, .. }) => match outcome {},
         }
     }
 }
@@ -614,7 +637,7 @@ impl<C: Component<Outcome = NoOutcome>> Engine<C> {
 
     fn update(&mut self, action: C::Action) {
         self.is_dirty = true;
-        if let Some(command) = Effect::into_command(self.component.update(action)) {
+        if let Some(command) = self.component.update(action).into_command() {
             self.is_running = spawn_cmd(command, self.cmd_tx.clone(), self.msg_tx.clone());
         }
     }
@@ -680,7 +703,7 @@ mod tests {
     #[test]
     fn effect_can_contain_command_and_outcome() {
         let effect: Option<Effect<(), i32>> = crate::effect!(Cmd::task(|| {}), outcome: 7);
-        let (command, outcome) = Effect::into_parts(effect);
+        let (command, outcome) = effect.into_parts();
 
         assert!(command.is_some());
         assert_eq!(outcome, Some(7));

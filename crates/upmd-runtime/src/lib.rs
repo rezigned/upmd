@@ -1,10 +1,16 @@
 pub mod runtimes;
 
 pub mod core;
-pub use core::{Cmd, Component, Config, Effect, Engine, NoOutcome, Renderer, Runtime};
+pub use core::{
+    Cmd, CommandEffectExt, Component, Config, Effect, EffectExt, Engine, NoOutcome, Renderer,
+    Runtime,
+};
 
 pub mod prelude {
-    pub use crate::core::{Cmd, Component, Config, Effect, Engine, NoOutcome, Renderer, Runtime};
+    pub use crate::core::{
+        Cmd, CommandEffectExt, Component, Config, Effect, EffectExt, Engine, NoOutcome, Renderer,
+        Runtime,
+    };
     pub use crate::effect;
     pub use std::thread;
     pub use std::time::{Duration, Instant};

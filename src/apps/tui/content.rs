@@ -5,7 +5,7 @@ use ratatui::{layout::Rect, Frame};
 use upmd_parser::{nodes::Code, CodeId, Codes, Document};
 use upmd_runtime::{
     runtimes::tui::{Input, Output},
-    Component, Effect,
+    CommandEffectExt, Component, Effect,
 };
 
 use crate::apps::{
@@ -261,7 +261,10 @@ impl Component for Content {
     fn update(&mut self, message: Action) -> Option<Effect<Action, Outcome>> {
         match message {
             Action::Menu(action) => {
-                let command = Effect::into_command(self.menu.update(action.clone()))
+                let command = self
+                    .menu
+                    .update(action.clone())
+                    .into_command()
                     .map(|command| command.map(Action::Menu));
                 let outcome = match action {
                     menu::Action::Click(id) => {
@@ -291,7 +294,10 @@ impl Component for Content {
                 }
 
                 let previous = self.selected_code_id();
-                let command = Effect::into_command(self.preview.update(action))
+                let command = self
+                    .preview
+                    .update(action)
+                    .into_command()
                     .map(|command| command.map(Action::Preview));
                 self.sync_from_preview();
                 let copied = self.preview.take_copy_result();

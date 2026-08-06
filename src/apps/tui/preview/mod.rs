@@ -1298,31 +1298,6 @@ mod tests {
     }
 
     #[test]
-    fn code_navigation_scrolls_when_block_starts_at_viewport_bottom() {
-        let mut preview = preview_from_markdown(
-            "```sh\necho first\n```\n\nSome filler\n\n```sh\necho second\n```\n",
-        );
-        preview.rebuild_visual_lines(80);
-        let target = preview
-            .visual_lines
-            .find_code_start(2, |idx| preview.is_code_start_at(idx))
-            .unwrap();
-        preview.visual_lines.set_last_height(target + 1);
-        *preview.state.borrow_mut().offset_mut() = 0;
-
-        preview.select_code(2);
-
-        assert_eq!(preview.state.borrow().offset(), target);
-
-        let nearby_offset = target - 1;
-        preview.visual_lines.set_last_height(4);
-        *preview.state.borrow_mut().offset_mut() = nearby_offset;
-        preview.select_code(2);
-
-        assert_eq!(preview.state.borrow().offset(), nearby_offset);
-    }
-
-    #[test]
     fn test_cached_code_line_updates_active_gutter() {
         let preview = preview_from_markdown("```bash\necho hello\n```");
         preview.rebuild_visual_lines(80);

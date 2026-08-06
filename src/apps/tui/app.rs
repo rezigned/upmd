@@ -27,9 +27,10 @@ use std::{
     cell::RefCell, collections::HashMap, path::PathBuf, process::ExitCode, thread, time::Duration,
 };
 use upmd_parser::{CodeId, Parser};
+use upmd_runtime::Effect;
 use upmd_runtime::{
     runtimes::tui::{Input, Output},
-    Cmd, Component, Effect,
+    Cmd, Component, EffectExt,
 };
 
 #[derive(Clone, Copy, Default, PartialEq)]
@@ -63,8 +64,6 @@ pub struct App {
     workflow: WorkflowState,
     last_cwd: Option<PathBuf>,
     started: bool,
-    /// Cached default footer right text (rebuilt when the theme changes).
-    footer_right_text: Line<'static>,
     /// Transient flash notification at the bottom right.
     notification: Option<tui::notification::FlashMessage>,
 }
@@ -166,71 +165,12 @@ impl App {
             last_cwd: None,
             notification: None,
             started: false,
-            footer_right_text: Self::build_footer_right_text(&theme),
         }
     }
+}
 
-    fn build_footer_right_text(theme: &crate::apps::theme::Theme) -> Line<'static> {
-        Line::from(vec![
-            Span::styled(config::APP_NAME, theme.active_fg_style()),
-            Span::raw(" "),
-            Span::styled(config::APP_VERSION, theme.muted_style()),
-        ])
-    }
-
-    /// Synchronizes input mode with the currently selected code block.
-    ///
-    /// This method keeps input mode alive once entered, but never enters it
-    /// from Home. New auto-entry happens from stream/tick paths when a selected
-    /// process becomes ready for input.
-    fn sync_input_mode(&mut self) {
-        let is_input_mode = self.content.selected_code_id().is_some_and(|id| {
-            self.tasks.contains(id) && !self.tasks.is_done(id) && self.view == View::Input
-        });
-
-        let new = match self.view {
-            View::Home | View::Input if is_input_mode => View::Input,
-            View::Home | View::Input => View::Home,
-            _ => return,
-        };
-        if self.view != new {
-            self.view = new;
-        }
-    }
-
-    fn pty_size_for_code(&self, id: CodeId) -> crate::pty::process::Size {
-        self.layout
-            .borrow()
-            .pty_size(self.content.code_prefix_overhead(id) as u16)
-    }
-
-    fn resize_tasks_for_preview(&mut self) {
-        if let Some(id) = self.content.selected_code_id() {
-            let fitted = self.inline_pty_size_for_code(id);
-            self.tasks.resize_task(id, fitted.width, fitted.height);
-        }
-    }
-
-    /// Sizes the PTY to the remaining preview rows below the selected block's
-    /// visible source lines, used when the process enters alternate screen.
-    /// Normal inline output is capped by `inline_max_lines` and passes through.
-    fn inline_pty_size_for_code(&self, id: CodeId) -> crate::pty::process::Size {
-        let base = self.pty_size_for_code(id);
-        let Some(task) = self.tasks.get(id) else {
-            return base;
-        };
-        if !task.parser.is_alternate_screen() {
-            return base;
-        }
-
-        let viewport = self.layout.borrow().preview_viewport_rows();
-        let rows = self
-            .content
-            .fit_inline_pty_rows(id, viewport)
-            .unwrap_or(base.height as usize);
-        crate::pty::process::Size::from((base.width, rows as u16))
-    }
-
+// Code execution and workflow coordination.
+impl App {
     fn execute_block(&mut self, id: CodeId) -> Option<Cmd<Msg>> {
         let code = self.content.code_by_id(id)?;
         let size = self.pty_size_for_code(id);
@@ -429,6 +369,124 @@ impl App {
         self.content.set_code_statuses(self.tasks.task_statuses());
     }
 
+    fn handle_stream_update(
+        &mut self,
+        id: CodeId,
+        stream: crate::pty::stream::Stream,
+    ) -> Option<Cmd<Msg>> {
+        let capture_env = matches!(&stream, crate::pty::stream::Stream::Env(_));
+        let capture_cwd = matches!(&stream, crate::pty::stream::Stream::Cwd(_));
+        let was_alternate_screen = self
+            .tasks
+            .get(id)
+            .is_some_and(|task| task.parser.is_alternate_screen());
+        let mut force_rebuild = self.tasks.handle_stream(id, &stream);
+        let entered_alternate_screen = !was_alternate_screen
+            && self
+                .tasks
+                .get(id)
+                .is_some_and(|task| task.parser.is_alternate_screen());
+        if entered_alternate_screen
+            && self.view != View::Output
+            && self.content.selected_code_id() == Some(id)
+        {
+            let size = self.inline_pty_size_for_code(id);
+            self.tasks.resize_task(id, size.width, size.height);
+            force_rebuild = true;
+        }
+        if matches!(
+            &stream,
+            crate::pty::stream::Stream::Exit(_) | crate::pty::stream::Stream::End
+        ) {
+            self.content.prefer_status_gutter_for(id);
+        }
+
+        self.capture_state(id, capture_env, capture_cwd);
+
+        if force_rebuild {
+            self.content.rebuild(self.tasks.buffers());
+            self.tasks.clear_dirty();
+        }
+        self.sync_input_mode();
+
+        // Auto-focus when the selected block becomes ready for input.
+        if self.view != View::Input
+            && self.overlay.is_none()
+            && !self.auto_input_paused
+            && self.content.selected_code_id() == Some(id)
+            && self.tasks.is_waiting_for_input(id)
+        {
+            self.view = View::Input;
+        }
+        self.sync_task_statuses();
+
+        if matches!(&stream, crate::pty::stream::Stream::End) {
+            let exit_code = self.tasks.get(id).and_then(|task| task.exit_code);
+            if exit_code != Some(0) {
+                self.workflow.discard_capture(id);
+            }
+            let result = self.workflow.advance(id, exit_code)?;
+            return self.handle_advance(result);
+        }
+        None
+    }
+}
+
+// PTY geometry, input, and focus policy.
+impl App {
+    /// Synchronizes input mode with the currently selected code block.
+    ///
+    /// This method keeps input mode alive once entered, but never enters it
+    /// from Home. New auto-entry happens from stream/tick paths when a selected
+    /// process becomes ready for input.
+    fn sync_input_mode(&mut self) {
+        let is_input_mode = self.content.selected_code_id().is_some_and(|id| {
+            self.tasks.contains(id) && !self.tasks.is_done(id) && self.view == View::Input
+        });
+
+        let new = match self.view {
+            View::Home | View::Input if is_input_mode => View::Input,
+            View::Home | View::Input => View::Home,
+            _ => return,
+        };
+        if self.view != new {
+            self.view = new;
+        }
+    }
+
+    fn pty_size_for_code(&self, id: CodeId) -> crate::pty::process::Size {
+        self.layout
+            .borrow()
+            .pty_size(self.content.code_prefix_overhead(id) as u16)
+    }
+
+    fn resize_tasks_for_preview(&mut self) {
+        if let Some(id) = self.content.selected_code_id() {
+            let fitted = self.inline_pty_size_for_code(id);
+            self.tasks.resize_task(id, fitted.width, fitted.height);
+        }
+    }
+
+    /// Sizes the PTY to the remaining preview rows below the selected block's
+    /// visible source lines, used when the process enters alternate screen.
+    /// Normal inline output is capped by `inline_max_lines` and passes through.
+    fn inline_pty_size_for_code(&self, id: CodeId) -> crate::pty::process::Size {
+        let base = self.pty_size_for_code(id);
+        let Some(task) = self.tasks.get(id) else {
+            return base;
+        };
+        if !task.parser.is_alternate_screen() {
+            return base;
+        }
+
+        let viewport = self.layout.borrow().preview_viewport_rows();
+        let rows = self
+            .content
+            .fit_inline_pty_rows(id, viewport)
+            .unwrap_or(base.height as usize);
+        crate::pty::process::Size::from((base.width, rows as u16))
+    }
+
     /// Sends raw text to the currently selected PTY as if the user typed it.
     fn send_text_to_pty(&mut self, text: &str) {
         if let Some(id) = self.content.selected_code_id() {
@@ -534,7 +592,7 @@ impl App {
 #[derive(Clone, Debug)]
 pub enum Msg {
     Content(content::Action),
-    Overlay(overlay::Message),
+    Overlay(overlay::Action),
     StreamUpdate(CodeId, crate::pty::stream::Stream),
     Notify(tui::notification::FlashMessage),
     Tick,
@@ -582,7 +640,7 @@ impl Component for App {
         }))
     }
 
-    fn update(&mut self, msg: Msg) -> Option<upmd_runtime::Effect<Self::Action, Self::Outcome>> {
+    fn update(&mut self, msg: Msg) -> Option<Effect<Self::Action, Self::Outcome>> {
         let command = match msg {
             Msg::Event(event) => self.handle_event(event),
             Msg::Content(action) => self.handle_content_msg(action),
@@ -595,9 +653,11 @@ impl Component for App {
             Msg::Tick => self.handle_tick(),
         };
 
-        upmd_runtime::Effect::command(command)
+        command.map(Effect::Command)
     }
 }
+
+// Runtime lifecycle, actions, and event routing.
 
 impl App {
     fn handle_tick(&mut self) -> Option<Cmd<Msg>> {
@@ -615,9 +675,11 @@ impl App {
             self.content.rebuild(self.tasks.buffers());
             self.tasks.clear_dirty();
         }
+
         self.sync_task_statuses();
         self.sync_input_mode();
         self.content.tick();
+
         let statuses = self.tasks.task_statuses();
         if let Some(overlay) = &mut self.overlay {
             overlay.tick(&statuses);
@@ -636,14 +698,6 @@ impl App {
         None
     }
 
-    fn menu_width(&self, total_width: u16) -> u16 {
-        if self.zen {
-            0
-        } else {
-            self.content.width(total_width)
-        }
-    }
-
     fn is_action_enabled(&self, action: &Action) -> bool {
         let selected_task = self
             .content
@@ -659,29 +713,6 @@ impl App {
             }
             Action::ToggleWorkflowGraph => self.workflow.has_graph(),
             _ => true,
-        }
-    }
-
-    fn is_action_visible_in_footer(&self, action: &Action) -> bool {
-        if !self.is_action_enabled(action) {
-            return false;
-        }
-
-        match self.view {
-            View::Input => matches!(action, Action::ExitInput | Action::Paste),
-            View::Home | View::Output => matches!(
-                action,
-                Action::Execute
-                    | Action::Input
-                    | Action::ViewOutput
-                    | Action::OpenFilePicker
-                    | Action::Search
-                    | Action::Goto
-                    | Action::SwitchTheme
-                    | Action::ToggleWorkflowGraph
-                    | Action::ToggleZen
-                    | Action::Help
-            ),
         }
     }
 
@@ -955,7 +986,7 @@ impl App {
         }
 
         if let Some(action) = self.output.action(event.clone()) {
-            let (_, outcome) = Effect::into_parts(self.output.update(action));
+            let (_, outcome) = self.output.update(action).into_parts();
             if let Some(outcome) = outcome {
                 return self.handle_output_action(outcome);
             }
@@ -1032,14 +1063,26 @@ impl App {
         }
         None
     }
+}
 
+impl Input for App {
+    fn action(&self, event: crossterm::event::Event) -> Option<Msg> {
+        if let Some(overlay) = &self.overlay {
+            overlay.action(event, &self.envs).map(Msg::Overlay)
+        } else {
+            Some(Msg::Event(event))
+        }
+    }
+}
+
+// Theme preferences and transient notifications.
+impl App {
     /// Applies a new theme to all UI components and rebuilds the preview.
     /// Skips expensive work when the theme name hasn't changed.
     fn apply_theme(&mut self, theme: crate::apps::theme::Theme) {
         if self.theme.name() == theme.name() {
             return;
         }
-        self.footer_right_text = Self::build_footer_right_text(&theme);
         self.content.set_theme(&theme);
         if let Some(overlay) = &mut self.overlay {
             overlay.set_theme(&theme);
@@ -1090,8 +1133,26 @@ impl App {
         })
     }
 
+    /// Shows an info flash notification at the bottom right.
+    pub fn notify_info(&mut self, text: impl Into<String>) {
+        self.notification = Some(tui::notification::info(text));
+    }
+
+    /// Shows a success flash notification at the bottom right.
+    pub fn notify_success(&mut self, text: impl Into<String>) {
+        self.notification = Some(tui::notification::success(text));
+    }
+
+    /// Shows an error flash notification at the bottom right.
+    pub fn notify_error(&mut self, text: impl Into<String>) {
+        self.notification = Some(tui::notification::error(text));
+    }
+}
+
+// Child component coordination.
+impl App {
     fn handle_content_msg(&mut self, message: content::Action) -> Option<Cmd<Msg>> {
-        let (command, outcome) = Effect::into_parts(self.content.update(message));
+        let (command, outcome) = self.content.update(message).into_parts();
 
         match outcome {
             Some(content::Outcome::CodeClicked {
@@ -1124,9 +1185,12 @@ impl App {
         }
     }
 
-    fn handle_overlay_msg(&mut self, message: overlay::Message) -> Option<Cmd<Msg>> {
-        let (command, outcome) =
-            Effect::into_parts(self.overlay.as_mut()?.update(message, &mut self.envs));
+    fn handle_overlay_msg(&mut self, message: overlay::Action) -> Option<Cmd<Msg>> {
+        let (command, outcome) = self
+            .overlay
+            .as_mut()?
+            .update(message, &mut self.envs)
+            .into_parts();
         let command = command.map(|command| command.map(Msg::Overlay));
         let outcome_command = outcome.and_then(|outcome| self.apply_overlay_outcome(outcome));
         outcome_command.or(command)
@@ -1194,7 +1258,10 @@ impl App {
             }
         }
     }
+}
 
+// File picker and active document lifecycle.
+impl App {
     /// Resolves picker root then opens the picker.
     /// Fallback chain: file_picker_root, config.file parent, cwd.
     /// `a/b/c.md` does not narrow the next picker to `a/b/`.
@@ -1282,68 +1349,6 @@ impl App {
         Ok(())
     }
 
-    fn handle_stream_update(
-        &mut self,
-        id: CodeId,
-        stream: crate::pty::stream::Stream,
-    ) -> Option<Cmd<Msg>> {
-        let capture_env = matches!(&stream, crate::pty::stream::Stream::Env(_));
-        let capture_cwd = matches!(&stream, crate::pty::stream::Stream::Cwd(_));
-        let was_alternate_screen = self
-            .tasks
-            .get(id)
-            .is_some_and(|task| task.parser.is_alternate_screen());
-        let mut force_rebuild = self.tasks.handle_stream(id, &stream);
-        let entered_alternate_screen = !was_alternate_screen
-            && self
-                .tasks
-                .get(id)
-                .is_some_and(|task| task.parser.is_alternate_screen());
-        if entered_alternate_screen
-            && self.view != View::Output
-            && self.content.selected_code_id() == Some(id)
-        {
-            let size = self.inline_pty_size_for_code(id);
-            self.tasks.resize_task(id, size.width, size.height);
-            force_rebuild = true;
-        }
-        if matches!(
-            &stream,
-            crate::pty::stream::Stream::Exit(_) | crate::pty::stream::Stream::End
-        ) {
-            self.content.prefer_status_gutter_for(id);
-        }
-
-        self.capture_state(id, capture_env, capture_cwd);
-
-        if force_rebuild {
-            self.content.rebuild(self.tasks.buffers());
-            self.tasks.clear_dirty();
-        }
-        self.sync_input_mode();
-
-        // Auto-focus when the selected block becomes ready for input.
-        if self.view != View::Input
-            && self.overlay.is_none()
-            && !self.auto_input_paused
-            && self.content.selected_code_id() == Some(id)
-            && self.tasks.is_waiting_for_input(id)
-        {
-            self.view = View::Input;
-        }
-        self.sync_task_statuses();
-
-        if matches!(&stream, crate::pty::stream::Stream::End) {
-            let exit_code = self.tasks.get(id).and_then(|task| task.exit_code);
-            if exit_code != Some(0) {
-                self.workflow.discard_capture(id);
-            }
-            let result = self.workflow.advance(id, exit_code)?;
-            return self.handle_advance(result);
-        }
-        None
-    }
-
     /// Reloads the active file and replaces all document-derived state.
     fn reload(&mut self) -> Option<Cmd<Msg>> {
         let doc = match exec::reload_document(self.config.file.as_deref()) {
@@ -1366,16 +1371,7 @@ impl App {
     }
 }
 
-impl Input for App {
-    fn action(&self, event: crossterm::event::Event) -> Option<Msg> {
-        if let Some(overlay) = &self.overlay {
-            overlay.action(event, &self.envs).map(Msg::Overlay)
-        } else {
-            Some(Msg::Event(event))
-        }
-    }
-}
-
+// Root layout and rendering.
 impl Output for App {
     fn render(&self, frame: &mut Frame, area: Rect) {
         if self.view == View::Output {
@@ -1434,6 +1430,7 @@ impl Output for App {
     }
 }
 
+// Rendering and footer helpers.
 impl App {
     fn render_notification(&self, frame: &mut Frame, area: Rect) {
         if let Some(ref flash) = self.notification {
@@ -1441,11 +1438,19 @@ impl App {
         }
     }
 
+    fn menu_width(&self, total_width: u16) -> u16 {
+        if self.zen {
+            0
+        } else {
+            self.content.width(total_width)
+        }
+    }
+
     /// Renders shortcuts for the active mode and selected task state.
     fn render_footer(&self, frame: &mut Frame, area: Rect) {
         let (badge, left, right) = self.footer_content();
 
-        let right_text = right.unwrap_or_else(|| self.footer_right_text.clone());
+        let right_text = right.or_else(|| self.footer_right()).unwrap_or_default();
         let badge_width = badge.width() as u16;
 
         let chunks = Layout::default()
@@ -1467,6 +1472,29 @@ impl App {
             self.theme.footer(right_text).alignment(Alignment::Right),
             chunks[2],
         );
+    }
+
+    fn is_action_visible_in_footer(&self, action: &Action) -> bool {
+        if !self.is_action_enabled(action) {
+            return false;
+        }
+
+        match self.view {
+            View::Input => matches!(action, Action::ExitInput | Action::Paste),
+            View::Home | View::Output => matches!(
+                action,
+                Action::Execute
+                    | Action::Input
+                    | Action::ViewOutput
+                    | Action::OpenFilePicker
+                    | Action::Search
+                    | Action::Goto
+                    | Action::SwitchTheme
+                    | Action::ToggleWorkflowGraph
+                    | Action::ToggleZen
+                    | Action::Help
+            ),
+        }
     }
 
     fn footer_content(&self) -> (Line<'static>, Line<'static>, Option<Line<'static>>) {
@@ -1506,21 +1534,6 @@ impl App {
             }
         }
     }
-
-    /// Shows an info flash notification at the bottom right.
-    pub fn notify_info(&mut self, text: impl Into<String>) {
-        self.notification = Some(tui::notification::info(text));
-    }
-
-    /// Shows a success flash notification at the bottom right.
-    pub fn notify_success(&mut self, text: impl Into<String>) {
-        self.notification = Some(tui::notification::success(text));
-    }
-
-    /// Shows an error flash notification at the bottom right.
-    pub fn notify_error(&mut self, text: impl Into<String>) {
-        self.notification = Some(tui::notification::error(text));
-    }
 }
 
 impl Shortcut for App {
@@ -1541,6 +1554,14 @@ impl Shortcut for App {
         ];
         spans.extend(shortcuts.spans);
         Line::from(spans)
+    }
+
+    fn footer_right(&self) -> Option<Line<'static>> {
+        Some(Line::from(vec![
+            Span::styled(config::APP_NAME, self.theme.active_fg_style()),
+            Span::raw(" "),
+            Span::styled(config::APP_VERSION, self.theme.muted_style()),
+        ]))
     }
 }
 
@@ -1599,7 +1620,7 @@ mod tests {
             Some(Path::new("/repo/README.md"))
         );
 
-        let _ = app.update(Msg::Overlay(overlay::Message::FilePicker(
+        let _ = app.update(Msg::Overlay(overlay::Action::FilePicker(
             file_picker::Action::Next,
         )));
         assert_eq!(
@@ -1656,12 +1677,12 @@ mod tests {
             AppConfig::default(),
         );
 
-        let _ = app.update(Msg::Overlay(overlay::Message::FilePicker(
+        let _ = app.update(Msg::Overlay(overlay::Action::FilePicker(
             file_picker::Action::Next,
         )));
         assert_eq!(selected_picker_path(&app), Some(install_path.as_path()));
 
-        let _ = app.update(Msg::Overlay(overlay::Message::FilePicker(
+        let _ = app.update(Msg::Overlay(overlay::Action::FilePicker(
             file_picker::Action::Select,
         )));
 
