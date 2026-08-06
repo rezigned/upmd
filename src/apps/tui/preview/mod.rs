@@ -55,6 +55,7 @@ use crate::apps::tui::widgets::Spinner;
 
 const INLINE_PTY_MIN_PERCENT: usize = 40;
 const INLINE_PTY_MIN_ROWS: usize = 8;
+const CODE_NAVIGATION_CONTEXT_ROWS: usize = 3;
 use upmd_runtime::{
     runtimes::tui::{Input, Output},
     Cmd, Component,
@@ -694,28 +695,34 @@ impl Preview {
         *state.offset_mut() = idx;
     }
 
-    /// Selects a code block by ID without scrolling the viewport.
-    ///
-    /// Used for click-to-select where the block is already visible and the
-    /// viewport should stay exactly where it is.
-    /// Selects a code block by ID, snapping to it only when off-screen.
+    /// Selects a code block by ID, snapping it to the viewport top unless
+    /// enough of the block is already visible to make the selection clear.
     pub fn select_code(&mut self, id: CodeId) {
-        if self.is_code_visible(id) {
+        let Some(idx) = self
+            .visual_lines
+            .find_code_start(id, |idx| self.is_code_start_at(idx))
+        else {
+            self.target_block.set(Some(id));
+            return;
+        };
+
+        if self.has_code_navigation_context(idx) {
             self.target_block.set(None);
-            if let Some(idx) = self
-                .visual_lines
-                .find_code_start(id, |idx| self.is_code_start_at(idx))
-            {
-                self.state.borrow_mut().select(Some(idx));
-            }
+            self.state.borrow_mut().select(Some(idx));
         } else {
             self.target_block.set(Some(id));
-            if let Some(idx) = self
-                .visual_lines
-                .find_code_start(id, |idx| self.is_code_start_at(idx))
-            {
-                self.select_and_scroll_smooth(idx);
-            }
+            self.select_and_scroll_smooth(idx);
+        }
+    }
+
+    /// Selects an already-visible code block without moving the viewport.
+    pub fn select_code_in_place(&mut self, id: CodeId) {
+        self.target_block.set(None);
+        if let Some(idx) = self
+            .visual_lines
+            .find_code_start(id, |idx| self.is_code_start_at(idx))
+        {
+            self.state.borrow_mut().select(Some(idx));
         }
     }
 
@@ -743,18 +750,15 @@ impl Preview {
         }
     }
 
-    /// Returns true if the code block's start line is within the current viewport.
-    pub fn is_code_visible(&self, id: CodeId) -> bool {
-        let Some(idx) = self
-            .visual_lines
-            .find_code_start(id, |i| self.is_code_start_at(i))
-        else {
-            return false;
-        };
+    fn has_code_navigation_context(&self, idx: usize) -> bool {
         let state = self.state.borrow();
         let offset = state.offset();
         let height = self.visual_lines.last_height();
-        idx >= offset && idx < offset + height
+        let required_rows = CODE_NAVIGATION_CONTEXT_ROWS.min(height);
+
+        height > 0
+            && idx >= offset
+            && idx.saturating_add(required_rows) <= offset.saturating_add(height)
     }
 
     /// Takes the result of the most recent clipboard copy attempt.
@@ -960,7 +964,7 @@ impl Component for Preview {
                 };
                 self.copy_result.set(Some(ok));
             }
-            Action::SelectCodeBlock(id) => self.select_code(id),
+            Action::SelectCodeBlock(id) => self.select_code_in_place(id),
             Action::Show(id) => self.select_code(id),
             Action::Select => {}
         }
@@ -1290,6 +1294,31 @@ mod tests {
                 .and_then(|line| line.code_id),
             Some(2)
         );
+    }
+
+    #[test]
+    fn code_navigation_scrolls_when_block_starts_at_viewport_bottom() {
+        let mut preview = preview_from_markdown(
+            "```sh\necho first\n```\n\nSome filler\n\n```sh\necho second\n```\n",
+        );
+        preview.rebuild_visual_lines(80);
+        let target = preview
+            .visual_lines
+            .find_code_start(2, |idx| preview.is_code_start_at(idx))
+            .unwrap();
+        preview.visual_lines.set_last_height(target + 1);
+        *preview.state.borrow_mut().offset_mut() = 0;
+
+        preview.select_code(2);
+
+        assert_eq!(preview.state.borrow().offset(), target);
+
+        let nearby_offset = target - 1;
+        preview.visual_lines.set_last_height(4);
+        *preview.state.borrow_mut().offset_mut() = nearby_offset;
+        preview.select_code(2);
+
+        assert_eq!(preview.state.borrow().offset(), nearby_offset);
     }
 
     #[test]

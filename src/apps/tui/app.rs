@@ -5,7 +5,7 @@ use crate::apps::exec;
 use crate::apps::navigation::Navigation;
 use crate::apps::tui;
 use crate::apps::tui::{
-    confirm, dependencies, file_picker, layout, menu, preview, tasks::Tasks, themes,
+    confirm, content, dependencies, file_picker, layout, menu, preview, tasks::Tasks, themes,
     workflow::State as WorkflowState, Shortcut,
 };
 use crate::apps::workflow::{Workflow, WorkflowTransition};
@@ -81,12 +81,11 @@ impl Overlay {
 
 /// Main TUI application component.
 ///
-/// Owns the menu, preview, tasks, and overlay components. Routes events,
+/// Owns the active content, tasks, and overlay components. Routes events,
 /// manages execution state, and renders the full TUI layout.
 pub struct App {
     config: AppConfig,
-    menu: menu::Menu,
-    preview: preview::Preview,
+    content: content::Content,
     tasks: Tasks,
     view: View,
     overlay: Option<Overlay>,
@@ -193,39 +192,13 @@ impl App {
     }
 
     fn build(doc: upmd_parser::Document, config: AppConfig, selected: Option<CodeId>) -> Self {
-        let upmd_parser::Document {
-            nodes,
-            codes,
-            headings,
-            ..
-        } = doc;
         let theme = config.theme.clone();
         let tasks = Tasks::new();
-
-        let mut menu = menu::Menu::new(
-            &codes,
-            &headings,
-            theme.clone(),
-            config.keymap.menu::<crate::apps::navigation::Navigation>(),
-        );
-        if let Some(id) = selected {
-            menu.select_by_id(id);
-        }
-        let mut preview = preview::Preview::new(
-            nodes,
-            codes,
-            theme.clone(),
-            tasks.buffers(),
-            config.tui.inline_max_lines(),
-            config.keymap.preview::<preview::Action>(),
-        );
-        if let Some(id) = selected {
-            preview.select_code(id);
-        }
+        let content = content::Content::new(doc, selected, &theme, tasks.buffers(), &config);
 
         App {
             config: config.clone(),
-            preview,
+            content,
             tasks,
             view: View::Home,
             overlay: None,
@@ -243,7 +216,6 @@ impl App {
                 config.keymap.search.clone(),
             ),
             file_picker_root: None,
-            menu,
             output: tui::output::Output::new(config.keymap.output()),
             workflow: WorkflowState::default(),
             last_cwd: None,
@@ -267,7 +239,7 @@ impl App {
     /// from Home. New auto-entry happens from stream/tick paths when a selected
     /// process becomes ready for input.
     fn sync_input_mode(&mut self) {
-        let is_input_mode = self.menu.selected().is_some_and(|id| {
+        let is_input_mode = self.content.selected_code_id().is_some_and(|id| {
             self.tasks.contains(id) && !self.tasks.is_done(id) && self.view == View::Input
         });
 
@@ -284,11 +256,11 @@ impl App {
     fn pty_size_for_code(&self, id: CodeId) -> crate::pty::process::Size {
         self.layout
             .borrow()
-            .pty_size(self.preview.code_prefix_overhead(id) as u16)
+            .pty_size(self.content.code_prefix_overhead(id) as u16)
     }
 
     fn resize_tasks_for_preview(&mut self) {
-        if let Some(id) = self.menu.selected() {
+        if let Some(id) = self.content.selected_code_id() {
             let fitted = self.inline_pty_size_for_code(id);
             self.tasks.resize_task(id, fitted.width, fitted.height);
         }
@@ -308,14 +280,14 @@ impl App {
 
         let viewport = self.layout.borrow().preview_viewport_rows();
         let rows = self
-            .preview
+            .content
             .fit_inline_pty_rows(id, viewport)
             .unwrap_or(base.height as usize);
         crate::pty::process::Size::from((base.width, rows as u16))
     }
 
     fn execute_block(&mut self, id: CodeId) -> Option<Cmd<Msg>> {
-        let code = self.preview.code_by_id(id)?;
+        let code = self.content.code_by_id(id)?;
         let size = self.pty_size_for_code(id);
         let envs = self.envs.data();
         let command = self
@@ -334,10 +306,10 @@ impl App {
             .map(|receiver| exec::stream_rx(id, receiver, Msg::StreamUpdate));
 
         if command.is_none() {
-            self.preview.prefer_status_gutter_for(id);
-            self.preview.rebuild_view(self.tasks.buffers());
+            self.content.prefer_status_gutter_for(id);
+            self.content.rebuild(self.tasks.buffers());
         }
-        self.sync_menu_running_state();
+        self.sync_task_statuses();
         command
     }
 
@@ -377,7 +349,7 @@ impl App {
         let graph = workflow.graph().clone();
         let dependencies = dependencies::Dependencies::new(
             "Workflow",
-            self.preview.codes(),
+            self.content.codes(),
             Some(Ok(graph)),
             "No active workflow",
             self.tasks.task_statuses(),
@@ -390,7 +362,7 @@ impl App {
     }
 
     fn start_all(&mut self) -> Option<Cmd<Msg>> {
-        match Workflow::for_all(self.preview.codes(), self.config.yes) {
+        match Workflow::for_all(self.content.codes(), self.config.yes) {
             Ok(workflow) => self.start_plan(workflow),
             Err(error) => {
                 self.notify_error(error);
@@ -400,7 +372,7 @@ impl App {
     }
 
     fn start_target(&mut self, id: CodeId) -> Option<Cmd<Msg>> {
-        match Workflow::for_target(self.preview.codes(), id) {
+        match Workflow::for_target(self.content.codes(), id) {
             Ok(workflow) => self.start_plan(workflow),
             Err(error) => {
                 self.notify_error(error);
@@ -410,7 +382,7 @@ impl App {
     }
 
     fn rerun_target(&mut self, id: CodeId) -> Option<Cmd<Msg>> {
-        match Workflow::for_target_rerun(self.preview.codes(), id) {
+        match Workflow::for_target_rerun(self.content.codes(), id) {
             Ok(workflow) => self.start_plan(workflow),
             Err(error) => {
                 self.notify_error(error);
@@ -504,17 +476,17 @@ impl App {
             return;
         }
         if let Some(first) = batch.first() {
-            self.navigate_to_code(*first);
+            self.content.select_code(*first);
         }
     }
 
-    fn sync_menu_running_state(&mut self) {
-        self.menu.set_code_statuses(self.tasks.task_statuses());
+    fn sync_task_statuses(&mut self) {
+        self.content.set_code_statuses(self.tasks.task_statuses());
     }
 
     /// Sends raw text to the currently selected PTY as if the user typed it.
     fn send_text_to_pty(&mut self, text: &str) {
-        if let Some(id) = self.menu.selected() {
+        if let Some(id) = self.content.selected_code_id() {
             self.tasks.send_text(id, text);
         }
     }
@@ -524,7 +496,7 @@ impl App {
     /// In output mode, resets scrollback so the user sees fresh output.
     /// Converts the event to raw bytes and sends them as stdin input.
     fn forward_to_pty(&mut self, event: crossterm::event::Event) {
-        if let Some(id) = self.menu.selected() {
+        if let Some(id) = self.content.selected_code_id() {
             if let crossterm::event::Event::Key(key) = event {
                 if self.view == View::Output {
                     self.tasks.reset_scroll(id);
@@ -542,7 +514,7 @@ impl App {
     /// scroll. Full-screen TUIs such as Neovim typically enable `?1006` SGR
     /// mouse mode, and receive wheel/click/drag events through stdin.
     fn forward_mouse_to_pty(&mut self, mouse: &crossterm::event::MouseEvent) -> bool {
-        let Some(id) = self.menu.selected() else {
+        let Some(id) = self.content.selected_code_id() else {
             return false;
         };
         let Some(buf) = self.tasks.get(id) else {
@@ -556,7 +528,7 @@ impl App {
         // accounts for scroll offset and blockquote prefix overhead.
         let (pty_rows, pty_cols) = buf.parser.screen().size();
         let Some((col, row)) = self
-            .preview
+            .content
             .mouse_to_pty_coords(id, mouse, pty_cols, pty_rows)
         else {
             return false;
@@ -575,14 +547,14 @@ impl App {
     /// Positive delta scrolls up (showing earlier output), negative scrolls
     /// down (showing later output). Rebuilds the preview after scrolling.
     fn scroll_inline(&mut self, delta: isize) {
-        if let Some(id) = self.menu.selected() {
+        if let Some(id) = self.content.selected_code_id() {
             if let Some(buf) = self.tasks.get_mut(id) {
                 if delta > 0 {
-                    buf.scroll_inline_up(self.preview.inline_max_lines());
+                    buf.scroll_inline_up(self.content.inline_max_lines());
                 } else {
-                    buf.scroll_inline_down(self.preview.inline_max_lines());
+                    buf.scroll_inline_down(self.content.inline_max_lines());
                 }
-                self.preview.rebuild_view(self.tasks.buffers());
+                self.content.rebuild(self.tasks.buffers());
             }
         }
     }
@@ -594,7 +566,7 @@ impl App {
     /// selection is changed.
     fn keep_input_for_running_click_target(&mut self, id: CodeId) {
         if self.view == View::Input
-            && self.menu.selected() != Some(id)
+            && self.content.selected_code_id() != Some(id)
             && !self.tasks.get(id).is_some_and(|b| b.running())
         {
             self.view = View::Home;
@@ -610,26 +582,6 @@ impl App {
             self.auto_input_paused = false;
             self.view = View::Input;
         }
-    }
-
-    /// Navigates the preview to a code block with smart-snap behavior.
-    ///
-    /// If the block is already visible in the viewport, only the selection
-    /// highlight is updated (no scroll). If it is off-screen, the viewport
-    /// snaps to the block's start line.
-    fn navigate_to_code(&mut self, id: CodeId) {
-        self.preview.select_code(id);
-        self.menu.select_by_id(id);
-    }
-
-    /// Navigates the preview to a TOC heading with smart-snap behavior.
-    ///
-    /// If the heading is already visible in the viewport, only the selection
-    /// highlight is updated (no scroll). If it is off-screen, the viewport
-    /// scrolls to the heading.
-    fn navigate_to_heading(&mut self, heading_idx: usize) {
-        self.preview.select_heading(heading_idx);
-        self.menu.select_by_heading_idx(heading_idx);
     }
 }
 
@@ -707,7 +659,7 @@ impl Component for App {
                 if !self.started {
                     self.started = true;
                     if self.config.block.is_some() && self.config.yes {
-                        if let Some(id) = self.menu.selected() {
+                        if let Some(id) = self.content.selected_code_id() {
                             return self.execute(id);
                         }
                     } else if self.config.all {
@@ -715,16 +667,15 @@ impl Component for App {
                     }
                 }
                 if self.tasks.is_dirty() {
-                    self.preview.rebuild_view(self.tasks.buffers());
+                    self.content.rebuild(self.tasks.buffers());
                     self.tasks.clear_dirty();
                 }
-                self.sync_menu_running_state();
+                self.sync_task_statuses();
                 self.sync_input_mode();
-                self.menu.tick();
+                self.content.tick();
                 if let Some(Overlay::Goto(goto)) = &mut self.overlay {
                     goto.tick();
                 }
-                self.preview.tick();
                 self.output.tick();
                 let statuses = self.tasks.task_statuses();
                 if let Some(Overlay::Dependencies(dependencies)) = &mut self.overlay {
@@ -751,12 +702,15 @@ impl App {
         if self.zen {
             0
         } else {
-            self.menu.width(total_width)
+            self.content.width(total_width)
         }
     }
 
     fn is_action_enabled(&self, action: &Action) -> bool {
-        let selected_task = self.menu.selected().and_then(|id| self.tasks.get(id));
+        let selected_task = self
+            .content
+            .selected_code_id()
+            .and_then(|id| self.tasks.get(id));
 
         match action {
             Action::ViewOutput => selected_task.is_some(),
@@ -800,11 +754,7 @@ impl App {
 
         match action {
             Action::Execute => {
-                if let Some(id) = self
-                    .menu
-                    .selected()
-                    .or_else(|| self.preview.selected_code_id())
-                {
+                if let Some(id) = self.content.focused_code_id() {
                     if self.tasks.contains(id) {
                         self.overlay = Some(Overlay::Confirm(confirm::Confirm::rerun(
                             id,
@@ -855,7 +805,7 @@ impl App {
                 use crate::apps::tui::goto::StatusKind;
                 let mut all_blocks = Vec::new();
                 let mut previews = HashMap::new();
-                for c in self.preview.codes() {
+                for c in self.content.codes() {
                     let kind = match self.tasks.get(c.id) {
                         Some(buf) if !buf.done() => StatusKind::Running,
                         Some(buf) if buf.exit_code == Some(0) => StatusKind::Success,
@@ -889,7 +839,7 @@ impl App {
                 None
             }
             Action::ViewOutput => {
-                if let Some(id) = self.menu.selected() {
+                if let Some(id) = self.content.selected_code_id() {
                     if self.tasks.contains(id) {
                         self.view = View::Output;
                         let size = self.layout.borrow().output_pty_size();
@@ -899,7 +849,7 @@ impl App {
                 None
             }
             Action::Input => {
-                if let Some(id) = self.menu.selected() {
+                if let Some(id) = self.content.selected_code_id() {
                     if self.tasks.contains(id) {
                         self.view = View::Input;
                         self.auto_input_paused = false;
@@ -928,14 +878,14 @@ impl App {
                 None
             }
             Action::DecreaseTocWidth | Action::IncreaseTocWidth => {
-                if matches!(self.menu.mode(), menu::MenuMode::Toc) {
+                if self.content.is_toc() {
                     let delta = if matches!(action, Action::DecreaseTocWidth) {
                         -2
                     } else {
                         2
                     };
                     let total = self.layout.borrow().total_width();
-                    self.menu.adjust_toc_width(delta, total);
+                    self.content.adjust_toc_width(delta, total);
                     self.layout
                         .borrow_mut()
                         .update_menu_width(self.menu_width(total));
@@ -945,8 +895,8 @@ impl App {
             Action::ShowDeps => {
                 self.overlay = Some(Overlay::Dependencies(
                     dependencies::Dependencies::for_target(
-                        self.preview.codes(),
-                        self.menu.selected(),
+                        self.content.codes(),
+                        self.content.selected_code_id(),
                         self.tasks.task_statuses(),
                         self.theme.clone(),
                         self.config.keymap.dependencies(),
@@ -973,8 +923,8 @@ impl App {
             drop(layout);
 
             // Rebuild visual lines for new width BEFORE PTY sizing.
-            self.preview.set_inline_max_lines(rows as usize);
-            self.preview.rebuild_view(self.tasks.buffers());
+            self.content.set_inline_max_lines(rows as usize);
+            self.content.rebuild(self.tasks.buffers());
 
             if self.view == View::Output {
                 let size = self.layout.borrow().output_pty_size();
@@ -1001,8 +951,8 @@ impl App {
     fn handle_home_event(&mut self, event: crossterm::event::Event) -> Option<Cmd<Msg>> {
         if self.view == View::Input {
             let input_active = self
-                .menu
-                .selected()
+                .content
+                .selected_code_id()
                 .and_then(|id| self.tasks.get(id))
                 .is_some_and(|b| b.running());
 
@@ -1022,7 +972,7 @@ impl App {
                 if input_active && inside_preview && self.forward_mouse_to_pty(mouse) {
                     return None;
                 }
-                let clicked_code = self.preview.code_id_at_mouse(mouse);
+                let clicked_code = self.content.code_id_at_mouse(mouse);
                 match mouse.kind {
                     MouseEventKind::ScrollUp => {
                         self.scroll_inline(1);
@@ -1033,7 +983,7 @@ impl App {
                         return None;
                     }
                     MouseEventKind::Up(_) | MouseEventKind::Down(_)
-                        if clicked_code != self.menu.selected() =>
+                        if clicked_code != self.content.selected_code_id() =>
                     {
                         self.view = View::Home;
                         self.auto_input_paused = true;
@@ -1053,12 +1003,11 @@ impl App {
             }
         }
 
-        if let Some(preview_action) = self.preview.action(event.clone()) {
-            return self.handle_preview_msg(preview_action);
-        }
-
-        if let Some(menu_msg) = self.menu.action(event.clone()) {
-            return self.handle_menu_msg(menu_msg);
+        if let Some(action) = self.content.action(event.clone()) {
+            return match action {
+                content::Action::Preview(action) => self.handle_preview_msg(action),
+                content::Action::Menu(action) => self.handle_menu_msg(action),
+            };
         }
 
         if let crossterm::event::Event::Key(key) = event {
@@ -1071,7 +1020,7 @@ impl App {
     }
 
     fn handle_output_event(&mut self, event: crossterm::event::Event) -> Option<Cmd<Msg>> {
-        let id = self.menu.selected();
+        let id = self.content.selected_code_id();
 
         if let Some(buf) = id.and_then(|id| self.tasks.get(id)) {
             self.output.update_state(buf);
@@ -1125,7 +1074,7 @@ impl App {
                 self.resize_tasks_for_preview();
             }
             tui::output::Action::BackIfDone => {
-                if let Some(id) = self.menu.selected() {
+                if let Some(id) = self.content.selected_code_id() {
                     if let Some(buf) = self.tasks.get(id) {
                         if buf.done() {
                             self.view = View::Home;
@@ -1135,7 +1084,7 @@ impl App {
                 }
             }
             tui::output::Action::Copy => {
-                if let Some(id) = self.menu.selected() {
+                if let Some(id) = self.content.selected_code_id() {
                     if let Some(buf) = self.tasks.get(id) {
                         if buf.done() && crate::utils::clipboard_copy(&buf.parser.contents_plain())
                         {
@@ -1162,15 +1111,14 @@ impl App {
             return;
         }
         self.footer_right_text = Self::build_footer_right_text(&theme);
-        self.preview.set_theme(&theme);
-        self.menu.set_theme(&theme);
+        self.content.set_theme(&theme);
         if let Some(Overlay::Dependencies(dependencies)) = &mut self.overlay {
             dependencies.set_theme(&theme);
         }
         self.workflow.set_theme(&theme);
         self.envs.set_theme(&theme);
         self.theme = theme;
-        self.preview.rebuild_view(self.tasks.buffers());
+        self.content.rebuild(self.tasks.buffers());
     }
 
     /// Toggles the transparency setting, rebuilds the theme, and persists the preference.
@@ -1214,37 +1162,25 @@ impl App {
     }
 
     fn handle_menu_msg(&mut self, msg: menu::Action) -> Option<Cmd<Msg>> {
-        let cmd = self.menu.update(msg.clone());
+        let cmd = self.content.update_menu(msg.clone());
 
         match msg {
             menu::Action::Click(id) => {
                 self.keep_input_for_running_click_target(id);
-                self.navigate_to_code(id);
+                self.content.select_code_in_place(id);
                 self.enter_input_for_running_click_target(id);
                 self.sync_input_mode();
                 return None;
             }
             menu::Action::TocClick(heading_idx) => {
-                self.navigate_to_heading(heading_idx);
+                self.content.select_heading(heading_idx);
                 self.sync_input_mode();
                 return None;
             }
             menu::Action::Navigation(_) => {}
         }
 
-        // Sync preview to menu's new selection after keyboard navigation.
-        match self.menu.mode() {
-            menu::MenuMode::CodeBlocks => {
-                if let Some(id) = self.menu.selected() {
-                    self.navigate_to_code(id);
-                }
-            }
-            menu::MenuMode::Toc => {
-                if let Some(idx) = self.menu.selected_toc_idx() {
-                    self.navigate_to_heading(idx);
-                }
-            }
-        }
+        self.content.sync_from_menu();
 
         self.sync_input_mode();
         cmd.map(|c| c.map(Msg::Menu))
@@ -1253,33 +1189,16 @@ impl App {
     fn handle_preview_msg(&mut self, action: preview::Action) -> Option<Cmd<Msg>> {
         match action {
             preview::Action::ToggleToc => {
-                match self.menu.mode() {
-                    menu::MenuMode::CodeBlocks => {
-                        self.menu.set_mode(menu::MenuMode::Toc);
-                        if let Some(logical) = self.preview.selected_logical_line() {
-                            let heading_idx = self.preview.heading_count_at_line(logical);
-                            self.menu.select_by_heading_idx(heading_idx);
-                        }
-                    }
-                    menu::MenuMode::Toc => {
-                        self.menu.set_mode(menu::MenuMode::CodeBlocks);
-                        if let Some(id) = self.preview.selected_code_id() {
-                            self.menu.select_by_id(id);
-                        }
-                    }
-                }
+                self.content.toggle_toc();
                 self.sync_input_mode();
                 return None;
             }
             preview::Action::SelectCodeBlock(id) => {
                 self.keep_input_for_running_click_target(id);
-                self.preview.update(preview::Action::SelectCodeBlock(id));
-                if let Some(id) = self.preview.selected_code_id() {
-                    self.menu.select_by_id(id);
-                }
+                self.content.select_code_in_place(id);
                 self.enter_input_for_running_click_target(id);
                 self.sync_input_mode();
-                let copied = self.preview.take_copy_result();
+                let copied = self.content.take_copy_result();
                 if copied == Some(true) {
                     self.notify_success("Copied");
                 } else if copied == Some(false) {
@@ -1292,8 +1211,8 @@ impl App {
                 if self.view == View::Input {
                     self.view = View::Home;
                 }
-                self.preview.update(action);
-                if let Some(ok) = self.preview.take_copy_result() {
+                self.content.update_preview(action);
+                if let Some(ok) = self.content.take_copy_result() {
                     if ok {
                         self.notify_success("Copied");
                     } else {
@@ -1303,22 +1222,7 @@ impl App {
             }
         }
 
-        // Sync menu selection to whatever is now visible in preview
-        match self.menu.mode() {
-            menu::MenuMode::CodeBlocks => {
-                if let Some(id) = self.preview.selected_code_id() {
-                    self.menu.select_by_id(id);
-                } else {
-                    self.menu.deselect();
-                }
-            }
-            menu::MenuMode::Toc => {
-                if let Some(logical) = self.preview.selected_logical_line() {
-                    let heading_idx = self.preview.heading_count_at_line(logical);
-                    self.menu.select_by_heading_idx(heading_idx);
-                }
-            }
-        }
+        self.content.sync_from_preview();
         self.sync_input_mode();
         None
     }
@@ -1360,7 +1264,7 @@ impl App {
         if cmd.is_some() {
             match action {
                 tui::search::Action::Quit => {
-                    self.preview.search("");
+                    self.content.search("");
                     self.overlay = None;
                     self.view = View::Home;
                 }
@@ -1372,13 +1276,9 @@ impl App {
             }
             return None;
         }
-        let result = self.preview.search(search.term());
+        let result = self.content.search(search.term());
         if let Some(index) = search.search(&result) {
-            if let Some(id) = self.preview.select_search_match(*index) {
-                self.menu.select_by_id(id);
-            } else {
-                self.menu.deselect();
-            }
+            self.content.select_search_match(*index);
         }
 
         None
@@ -1563,37 +1463,19 @@ impl App {
     /// Replaces the document and resets document-derived execution and UI state.
     fn load_document(&mut self, doc: upmd_parser::Document) -> Result<(), String> {
         let selected = crate::apps::initial_code_id(&doc.codes, self.config.block.as_deref())?;
-        let upmd_parser::Document {
-            nodes,
-            codes,
-            headings,
-            ..
-        } = doc;
         self.tasks.clear();
         self.auto_input_paused = false;
-        self.menu = menu::Menu::new(
-            &codes,
-            &headings,
-            self.theme.clone(),
-            self.config
-                .keymap
-                .menu::<crate::apps::navigation::Navigation>(),
-        );
-        self.preview = preview::Preview::new(
-            nodes,
-            codes,
-            self.theme.clone(),
+        self.content = content::Content::new(
+            doc,
+            selected,
+            &self.theme,
             self.tasks.buffers(),
-            self.config.tui.inline_max_lines(),
-            self.config.keymap.preview::<preview::Action>(),
+            &self.config,
         );
         self.workflow.clear();
         self.overlay = None;
         self.started = false;
 
-        if let Some(id) = selected {
-            self.navigate_to_code(id);
-        }
         Ok(())
     }
 
@@ -1618,7 +1500,7 @@ impl App {
             match action {
                 tui::goto::Action::Select => {
                     if let Some(id) = selected {
-                        self.navigate_to_code(id);
+                        self.content.select_code(id);
                     }
                     self.overlay = None;
                     self.view = View::Home;
@@ -1701,7 +1583,9 @@ impl App {
                 .tasks
                 .get(id)
                 .is_some_and(|task| task.parser.is_alternate_screen());
-        if entered_alternate_screen && self.view != View::Output && self.menu.selected() == Some(id)
+        if entered_alternate_screen
+            && self.view != View::Output
+            && self.content.selected_code_id() == Some(id)
         {
             let size = self.inline_pty_size_for_code(id);
             self.tasks.resize_task(id, size.width, size.height);
@@ -1711,13 +1595,13 @@ impl App {
             &stream,
             crate::pty::stream::Stream::Exit(_) | crate::pty::stream::Stream::End
         ) {
-            self.preview.prefer_status_gutter_for(id);
+            self.content.prefer_status_gutter_for(id);
         }
 
         self.capture_state(id, capture_env, capture_cwd);
 
         if force_rebuild {
-            self.preview.rebuild_view(self.tasks.buffers());
+            self.content.rebuild(self.tasks.buffers());
             self.tasks.clear_dirty();
         }
         self.sync_input_mode();
@@ -1726,12 +1610,12 @@ impl App {
         if self.view != View::Input
             && self.overlay.is_none()
             && !self.auto_input_paused
-            && self.menu.selected() == Some(id)
+            && self.content.selected_code_id() == Some(id)
             && self.tasks.is_waiting_for_input(id)
         {
             self.view = View::Input;
         }
-        self.sync_menu_running_state();
+        self.sync_task_statuses();
 
         if matches!(&stream, crate::pty::stream::Stream::End) {
             let exit_code = self.tasks.get(id).and_then(|task| task.exit_code);
@@ -1779,7 +1663,7 @@ impl Input for App {
 impl Output for App {
     fn render(&self, frame: &mut Frame, area: Rect) {
         if self.view == View::Output {
-            if let Some(id) = self.menu.selected() {
+            if let Some(id) = self.content.selected_code_id() {
                 if let Some(buf) = self.tasks.get(id) {
                     self.output.render(frame, area, buf, &self.theme);
                 }
@@ -1808,7 +1692,7 @@ impl Output for App {
         } else {
             (layout.preview, None)
         };
-        self.preview.render(frame, preview_area);
+        self.content.render_preview(frame, preview_area);
         if let (Some(deps), Some(graph_area)) = (workflow_graph, graph_area) {
             let block = self
                 .theme
@@ -1822,7 +1706,7 @@ impl Output for App {
         }
         // Render the menu last so its right border merges with both content panes.
         if !self.zen {
-            self.menu.render(frame, layout.menu);
+            self.content.render_menu(frame, layout.menu);
         }
         self.render_footer(frame, layout.footer);
 
@@ -1891,8 +1775,8 @@ impl App {
         match self.view {
             View::Input => {
                 let is_running = self
-                    .menu
-                    .selected()
+                    .content
+                    .selected_code_id()
                     .and_then(|id| self.tasks.get(id))
                     .is_some_and(|b| b.running());
                 let badge = if is_running {
@@ -2090,7 +1974,7 @@ mod tests {
         );
         app.workflow
             .set_graph(dependencies::Dependencies::for_target(
-                app.preview.codes(),
+                app.content.codes(),
                 Some(2),
                 HashMap::new(),
                 app.theme.clone(),
@@ -2102,7 +1986,7 @@ mod tests {
         assert!(!app.workflow.is_active());
         assert!(!app.workflow.has_graph());
         assert!(!app.started);
-        assert_eq!(app.menu.selected(), Some(2));
+        assert_eq!(app.content.selected_code_id(), Some(2));
     }
 
     #[test]
@@ -2110,12 +1994,12 @@ mod tests {
         let markdown = "```sh\necho first\n```\n\n```sh\necho second\n```\n";
         let mut app = app_for_reload(Path::new("unused.md"), markdown, true, Some("2"));
         app.config.file = None;
-        let selected_before = app.menu.selected();
+        let selected_before = app.content.selected_code_id();
         let had_plan = app.workflow.is_active();
 
         app.reload();
 
-        assert_eq!(app.menu.selected(), selected_before);
+        assert_eq!(app.content.selected_code_id(), selected_before);
         assert_eq!(app.workflow.is_active(), had_plan);
         let notification = app.notification.as_ref().unwrap();
         assert_eq!(notification.kind, tui::notification::FlashKind::Error);
@@ -2131,9 +2015,9 @@ mod tests {
         let area = Rect::new(0, 0, 80, 43);
         let menu_width = app.menu_width(area.width);
         app.layout.borrow_mut().update(area, menu_width);
-        app.preview.rebuild_view(app.tasks.buffers());
+        app.content.rebuild(app.tasks.buffers());
 
-        let code = app.preview.code_by_id(1).unwrap().clone();
+        let code = app.content.code_by_id(1).unwrap().clone();
         let size = app.pty_size_for_code(1);
         let rx = app
             .tasks
@@ -2181,7 +2065,7 @@ mod tests {
         .unwrap();
         app.workflow
             .set_graph(dependencies::Dependencies::for_target(
-                app.preview.codes(),
+                app.content.codes(),
                 Some(3),
                 HashMap::new(),
                 app.theme.clone(),

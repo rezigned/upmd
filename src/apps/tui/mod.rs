@@ -1,5 +1,6 @@
 pub mod app;
 pub mod confirm;
+pub mod content;
 pub mod dependencies;
 pub mod envs;
 pub mod file_picker;
