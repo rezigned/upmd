@@ -1,5 +1,5 @@
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::apps::theme::Theme;
 use crate::apps::tui::layout::centered_rect;
@@ -12,7 +12,7 @@ use ratatui::widgets::Paragraph;
 use std::collections::HashMap;
 use upmd_runtime::{
     runtimes::tui::{Input, Output},
-    Cmd, Component,
+    Component, Effect,
 };
 
 const MIN_PREVIEW_WIDTH: u16 = 72;
@@ -89,6 +89,10 @@ fn read_preview_prefix(path: &Path) -> std::io::Result<PreviewPrefix> {
 }
 
 pub use crate::apps::picker::PickerAction as Action;
+pub enum Outcome {
+    Selected(PathBuf),
+    Cancelled,
+}
 
 impl FilePicker {
     pub fn new(files: Vec<MarkdownFile>, theme: Theme, keymap: DerivedConfig<Action>) -> Self {
@@ -276,26 +280,29 @@ impl Shortcut for FilePicker {
 }
 
 impl Component for FilePicker {
-    type Msg = Action;
+    type Action = Action;
+    type Outcome = Outcome;
 
-    fn update(&mut self, msg: Self::Msg) -> Option<Cmd<Self::Msg>> {
-        if self.state.handle_navigation(&msg) {
+    fn update(&mut self, action: Action) -> Option<Effect<Action, Outcome>> {
+        if self.state.handle_navigation(&action) {
             self.refresh_preview();
             return None;
         }
-        match msg {
-            Action::Select | Action::Quit => {
-                // These are terminal actions handled by the app.
-                // Return a command so the app handler can pick them up.
-                Some(Cmd::msg(msg))
-            }
+
+        match action {
+            Action::Select => self
+                .selected_path()
+                .map(Path::to_path_buf)
+                .map(Outcome::Selected)
+                .map(Effect::Outcome),
+            Action::Quit => upmd_runtime::effect!(outcome: Outcome::Cancelled),
             _ => None,
         }
     }
 }
 
 impl Input for FilePicker {
-    fn action(&self, event: crossterm::event::Event) -> Option<Self::Msg> {
+    fn action(&self, event: crossterm::event::Event) -> Option<Self::Action> {
         match event {
             crossterm::event::Event::Key(key) => self.keymap.get_bound(&key),
             crossterm::event::Event::Mouse(mouse) => match mouse.kind {
@@ -391,8 +398,8 @@ mod tests {
     #[test]
     fn filters_by_display_path() {
         let mut picker = picker();
-        picker.update(Action::Input('i'));
-        picker.update(Action::Input('n'));
+        let _ = picker.update(Action::Input('i'));
+        let _ = picker.update(Action::Input('n'));
         assert_eq!(picker.state.matches.len(), 1);
         assert_eq!(
             picker.selected_path().unwrap(),
@@ -437,11 +444,11 @@ mod tests {
     fn query_with_no_matches_clears_selection_and_recovers_after_delete() {
         let mut picker = picker();
 
-        picker.update(Action::Input('z'));
+        let _ = picker.update(Action::Input('z'));
         assert!(picker.state.matches.is_empty());
         assert_eq!(picker.selected_path(), None);
 
-        picker.update(Action::Delete);
+        let _ = picker.update(Action::Delete);
         assert_eq!(picker.state.matches.len(), 2);
         assert_eq!(
             picker.selected_path().unwrap(),
@@ -452,13 +459,13 @@ mod tests {
     #[test]
     fn navigation_clamps_to_matches() {
         let mut picker = picker();
-        picker.update(Action::Next);
-        picker.update(Action::Next);
+        let _ = picker.update(Action::Next);
+        let _ = picker.update(Action::Next);
         assert_eq!(
             picker.selected_path().unwrap(),
             Path::new("/repo/docs/install.md")
         );
-        picker.update(Action::Prev);
+        let _ = picker.update(Action::Prev);
         assert_eq!(
             picker.selected_path().unwrap(),
             Path::new("/repo/README.md")

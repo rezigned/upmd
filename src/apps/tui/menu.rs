@@ -20,7 +20,7 @@ use keymap::DerivedConfig;
 
 use upmd_runtime::{
     runtimes::tui::{Input, Output},
-    Cmd, Component,
+    Component, Effect, NoOutcome,
 };
 pub enum MenuMode {
     CodeBlocks,
@@ -367,7 +367,7 @@ impl Menu {
 }
 
 impl Input for Menu {
-    fn action(&self, event: crossterm::event::Event) -> Option<Self::Msg> {
+    fn action(&self, event: crossterm::event::Event) -> Option<Self::Action> {
         match event {
             crossterm::event::Event::Key(key) => {
                 self.nav_keymap.get_bound(&key).map(Action::Navigation)
@@ -439,17 +439,17 @@ impl Menu {
 }
 
 impl Component for Menu {
-    type Msg = Action;
+    type Action = Action;
+    type Outcome = NoOutcome;
 
-    fn update(&mut self, msg: Self::Msg) -> Option<Cmd<Self::Msg>> {
-        match msg {
+    fn update(&mut self, action: Action) -> Option<Effect<Action, NoOutcome>> {
+        match action {
             Action::Navigation(Navigation::Prev) => self.previous(),
             Action::Navigation(Navigation::Next) => self.next(),
             Action::Navigation(Navigation::First) => self.first(),
             Action::Navigation(Navigation::Last) => self.last(),
             Action::Navigation(Navigation::PageUp) => self.page_up(),
             Action::Navigation(Navigation::PageDown) => self.page_down(),
-            // Click actions are handled by the parent app; nothing to do here.
             Action::Click(_) | Action::TocClick(_) => {}
         }
         None
@@ -614,11 +614,11 @@ mod tests {
 
         // Exercise the update() match arms that were previously no-ops.
         menu.model.state.select(Some(10));
-        menu.update(Action::Navigation(Navigation::PageUp));
+        let _ = menu.update(Action::Navigation(Navigation::PageUp));
         assert_eq!(menu.model.state.selected(), Some(0), "page_up from middle");
 
         menu.model.state.select(Some(5));
-        menu.update(Action::Navigation(Navigation::PageDown));
+        let _ = menu.update(Action::Navigation(Navigation::PageDown));
         assert_eq!(
             menu.model.state.selected(),
             Some(15),
@@ -626,7 +626,7 @@ mod tests {
         );
 
         menu.model.state.select(Some(18));
-        menu.update(Action::Navigation(Navigation::PageDown));
+        let _ = menu.update(Action::Navigation(Navigation::PageDown));
         assert_eq!(
             menu.model.state.selected(),
             Some(19),
@@ -634,7 +634,7 @@ mod tests {
         );
 
         menu.model.state.select(Some(0));
-        menu.update(Action::Navigation(Navigation::PageUp));
+        let _ = menu.update(Action::Navigation(Navigation::PageUp));
         assert_eq!(
             menu.model.state.selected(),
             Some(0),
@@ -644,7 +644,7 @@ mod tests {
         // page_size fallback when last_area is zero.
         menu.last_area.set(Rect::new(0, 0, 0, 0));
         menu.model.state.select(Some(9));
-        menu.update(Action::Navigation(Navigation::PageUp));
+        let _ = menu.update(Action::Navigation(Navigation::PageUp));
         assert_eq!(
             menu.model.state.selected(),
             Some(0),

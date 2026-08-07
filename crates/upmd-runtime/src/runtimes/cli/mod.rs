@@ -6,7 +6,7 @@
 use std::io::{self, IsTerminal};
 use std::time::Duration;
 
-use crate::core::{Component, Engine};
+use crate::core::{Component, Engine, NoOutcome};
 
 /// CLI Runtime with minimal terminal setup.
 ///
@@ -164,7 +164,7 @@ impl<C: Component + Output> crate::core::Renderer<C> for Runtime {
     }
 }
 
-impl<C: Component + Input + Output> crate::Runtime<C> for Runtime {
+impl<C: Component<Outcome = NoOutcome> + Input + Output> crate::Runtime<C> for Runtime {
     type Error = io::Error;
 
     fn run(mut self, mut engine: Engine<C>) -> io::Result<()> {
@@ -209,7 +209,7 @@ impl<C: Component + Input + Output> crate::Runtime<C> for Runtime {
 
 /// Trait for handling CLI input events.
 pub trait Input: Component {
-    fn action(&self, event: crossterm::event::Event) -> Option<Self::Msg>;
+    fn action(&self, event: crossterm::event::Event) -> Option<Self::Action>;
 }
 
 /// Trait for rendering the component to a terminal output handle.
@@ -227,7 +227,7 @@ pub trait Output {
 }
 
 /// Runs a component in the CLI runtime with default setup/cleanup.
-pub fn run<C: Component + Input + Output>(component: C) -> io::Result<()> {
+pub fn run<C: Component<Outcome = NoOutcome> + Input + Output>(component: C) -> io::Result<()> {
     use crate::Runtime as R;
     R::run(Runtime::new(), Engine::new(component))?;
     Ok(())

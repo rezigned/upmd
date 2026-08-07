@@ -55,9 +55,10 @@ use crate::apps::tui::widgets::Spinner;
 
 const INLINE_PTY_MIN_PERCENT: usize = 40;
 const INLINE_PTY_MIN_ROWS: usize = 8;
+const CODE_NAVIGATION_CONTEXT_ROWS: usize = 3;
 use upmd_runtime::{
     runtimes::tui::{Input, Output},
-    Cmd, Component,
+    Component, Effect, NoOutcome,
 };
 
 mod search;
@@ -416,9 +417,21 @@ impl Preview {
         end.saturating_add(1).saturating_sub(viewport)
     }
 
-    /// Returns the first and last visual line index for non-output rows of
-    /// code block `id` (CodeInfo + CodeBody only, excluding Output).
-    pub fn source_visual_extent(&self, id: CodeId) -> Option<(usize, usize)> {
+    /// Reserves rows below a code block for an alternate-screen PTY and
+    /// minimally scrolls the preview when the remaining viewport is too small.
+    pub fn fit_inline_pty_rows(&self, id: CodeId, viewport: usize) -> Option<usize> {
+        let (start, end) = self.source_visual_extent(id)?;
+        let source_rows = end.saturating_sub(start).saturating_add(1);
+        let offset = self.state.borrow().offset();
+        let (rows, new_offset) = inline_pty_rows(viewport, end, source_rows, offset);
+
+        if new_offset != offset {
+            *self.state.borrow_mut().offset_mut() = new_offset;
+        }
+        Some(rows)
+    }
+
+    fn source_visual_extent(&self, id: CodeId) -> Option<(usize, usize)> {
         let visual_lines = self.visual_lines.borrow();
         let mut indices = visual_lines.iter().enumerate().filter_map(|(idx, line)| {
             let logical_line = self.logical_lines.get(line.logical_idx)?;
@@ -429,16 +442,6 @@ impl Preview {
         let first = indices.next()?;
         let end = indices.next_back().unwrap_or(first);
         Some((first, end))
-    }
-
-    /// Returns the current visual offset (first visible row index).
-    pub fn visual_offset(&self) -> usize {
-        self.state.borrow().offset()
-    }
-
-    /// Sets the visual offset.
-    pub fn set_visual_offset(&self, offset: usize) {
-        *self.state.borrow_mut().offset_mut() = offset;
     }
 
     pub fn inline_max_lines(&self) -> usize {
@@ -460,31 +463,23 @@ impl Preview {
         self.spinner.tick();
     }
 
-    pub fn matches(&self, term: &str) -> Vec<usize> {
+    pub fn search(&mut self, term: &str) -> Vec<usize> {
+        self.search.set_term(term);
         if term.is_empty() {
             return vec![];
         }
         self.search.matches(&self.visual_lines.borrow())
     }
 
+    pub fn select_search_match(&mut self, idx: usize) -> Option<CodeId> {
+        let max = self.visual_lines.len().saturating_sub(1);
+        self.select_and_scroll_smooth(idx.min(max));
+        self.selected_code_id()
+    }
+
     pub fn set_theme(&mut self, theme: &Theme) {
         self.theme.clone_from(theme);
         self.logical_lines.iter().for_each(|l| l.clear_cache());
-    }
-
-    pub fn set_search_term(&mut self, term: &str) {
-        self.search.set_term(term);
-    }
-
-    pub fn select_line(&mut self, idx: usize) {
-        let max = self.visual_lines.len().saturating_sub(1);
-        self.select_and_scroll_smooth(idx.min(max));
-    }
-
-    pub fn selected_code(&self) -> Option<&LogicalLine> {
-        let sel = self.state.borrow().selected()?;
-        let logical_idx = self.visual_lines.get(sel)?.logical_idx;
-        self.logical_lines.get(logical_idx)
     }
 
     pub fn selected_code_id(&self) -> Option<CodeId> {
@@ -700,28 +695,34 @@ impl Preview {
         *state.offset_mut() = idx;
     }
 
-    /// Selects a code block by ID without scrolling the viewport.
-    ///
-    /// Used for click-to-select where the block is already visible and the
-    /// viewport should stay exactly where it is.
-    /// Selects a code block by ID, snapping to it only when off-screen.
+    /// Selects a code block by ID, snapping it to the viewport top unless
+    /// enough of the block is already visible to make the selection clear.
     pub fn select_code(&mut self, id: CodeId) {
-        if self.is_code_visible(id) {
+        let Some(idx) = self
+            .visual_lines
+            .find_code_start(id, |idx| self.is_code_start_at(idx))
+        else {
+            self.target_block.set(Some(id));
+            return;
+        };
+
+        if self.has_code_navigation_context(idx) {
             self.target_block.set(None);
-            if let Some(idx) = self
-                .visual_lines
-                .find_code_start(id, |idx| self.is_code_start_at(idx))
-            {
-                self.state.borrow_mut().select(Some(idx));
-            }
+            self.state.borrow_mut().select(Some(idx));
         } else {
             self.target_block.set(Some(id));
-            if let Some(idx) = self
-                .visual_lines
-                .find_code_start(id, |idx| self.is_code_start_at(idx))
-            {
-                self.select_and_scroll_smooth(idx);
-            }
+            self.select_and_scroll_smooth(idx);
+        }
+    }
+
+    /// Selects an already-visible code block without moving the viewport.
+    pub fn select_code_in_place(&mut self, id: CodeId) {
+        self.target_block.set(None);
+        if let Some(idx) = self
+            .visual_lines
+            .find_code_start(id, |idx| self.is_code_start_at(idx))
+        {
+            self.state.borrow_mut().select(Some(idx));
         }
     }
 
@@ -749,18 +750,15 @@ impl Preview {
         }
     }
 
-    /// Returns true if the code block's start line is within the current viewport.
-    pub fn is_code_visible(&self, id: CodeId) -> bool {
-        let Some(idx) = self
-            .visual_lines
-            .find_code_start(id, |i| self.is_code_start_at(i))
-        else {
-            return false;
-        };
+    fn has_code_navigation_context(&self, idx: usize) -> bool {
         let state = self.state.borrow();
         let offset = state.offset();
         let height = self.visual_lines.last_height();
-        idx >= offset && idx < offset + height
+        let required_rows = CODE_NAVIGATION_CONTEXT_ROWS.min(height);
+
+        height > 0
+            && idx >= offset
+            && idx.saturating_add(required_rows) <= offset.saturating_add(height)
     }
 
     /// Takes the result of the most recent clipboard copy attempt.
@@ -770,7 +768,7 @@ impl Preview {
 }
 
 impl Input for Preview {
-    fn action(&self, event: crossterm::event::Event) -> Option<Self::Msg> {
+    fn action(&self, event: crossterm::event::Event) -> Option<Self::Action> {
         match event {
             crossterm::event::Event::Key(key) => {
                 if let Some(action) = self.keymap.get_bound(&key) {
@@ -907,10 +905,11 @@ impl Preview {
         }
     }
 }
+
 /// Computes how many PTY rows fit below a block's source lines in the viewport,
 /// returning `(rows, new_offset)`. Scrolls the viewport if fewer than 40% of
 /// the rows (min 8) remain below the source.
-pub(crate) fn inline_pty_rows(
+fn inline_pty_rows(
     viewport: usize,
     source_end: usize,
     source_rows: usize,
@@ -945,9 +944,10 @@ pub(crate) fn inline_pty_rows(
 }
 
 impl Component for Preview {
-    type Msg = Action;
+    type Action = Action;
+    type Outcome = NoOutcome;
 
-    fn update(&mut self, action: Action) -> Option<Cmd<Action>> {
+    fn update(&mut self, action: Action) -> Option<Effect<Action, NoOutcome>> {
         match action {
             Action::ScrollUp => self.scroll_up(),
             Action::ScrollDown => self.scroll_down(),
@@ -965,7 +965,7 @@ impl Component for Preview {
                 };
                 self.copy_result.set(Some(ok));
             }
-            Action::SelectCodeBlock(_) => {}
+            Action::SelectCodeBlock(id) => self.select_code_in_place(id),
             Action::Show(id) => self.select_code(id),
             Action::Select => {}
         }

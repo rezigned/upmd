@@ -1,4 +1,9 @@
-use crate::apps::{config::LOGO, tui::layout::centered_rect};
+use crate::apps::{
+    config::{KeymapConfig, LOGO},
+    navigation::Navigation,
+    theme::Theme,
+    tui::layout::centered_rect,
+};
 use keymap::{DerivedConfig, KeyMap};
 use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
@@ -8,14 +13,12 @@ use ratatui::{
     Frame,
 };
 
-use crate::apps::theme::Theme;
-
 use upmd_runtime::{
     runtimes::tui::{Input, Output},
-    Cmd, Component,
+    Component, Effect,
 };
 
-pub struct KeymapEntry {
+struct KeymapEntry {
     section: &'static str,
     symbol: String,
     description: String,
@@ -48,6 +51,10 @@ pub enum Action {
     Input(char),
 }
 
+pub enum Outcome {
+    Closed,
+}
+
 impl KeymapEntry {
     fn new(
         section: &'static str,
@@ -70,7 +77,7 @@ impl KeymapEntry {
 
 /// Extracts user-facing keymap entries from a parsed keymap config, skipping
 /// implementation-only bindings (e.g. `@any`).
-pub fn collect_keymap_entries<'a, T>(
+fn collect_keymap_entries<'a, T>(
     section: &'static str,
     config: &'a DerivedConfig<T>,
 ) -> impl Iterator<Item = KeymapEntry> + 'a {
@@ -107,8 +114,79 @@ pub fn collect_keymap_entries<'a, T>(
     })
 }
 
+fn append_keymap_entries<T>(
+    items: &mut Vec<KeymapEntry>,
+    section: &'static str,
+    config: DerivedConfig<T>,
+) {
+    items.extend(collect_keymap_entries(section, &config));
+}
+
+fn keymap_entries(keymaps: &KeymapConfig) -> Vec<KeymapEntry> {
+    let mut items = Vec::new();
+    append_keymap_entries(&mut items, "home", keymaps.home::<super::app::Action>());
+    append_keymap_entries(
+        &mut items,
+        "output",
+        keymaps.output::<super::output::Action>(),
+    );
+    append_keymap_entries(
+        &mut items,
+        "cli",
+        keymaps.cli::<crate::apps::cli::app::Action>(),
+    );
+    append_keymap_entries(&mut items, "menu", keymaps.menu::<Navigation>());
+    append_keymap_entries(
+        &mut items,
+        "preview",
+        keymaps.preview::<super::preview::Action>(),
+    );
+    append_keymap_entries(
+        &mut items,
+        "confirm",
+        keymaps.confirm::<super::confirm::Action>(),
+    );
+    append_keymap_entries(
+        &mut items,
+        "search",
+        keymaps.search::<super::search::Action>(),
+    );
+    append_keymap_entries(&mut items, "goto", keymaps.goto::<super::goto::Action>());
+    append_keymap_entries(
+        &mut items,
+        "dependencies",
+        keymaps.dependencies::<super::dependencies::Action>(),
+    );
+    append_keymap_entries(
+        &mut items,
+        "file_picker",
+        keymaps.file_picker::<super::file_picker::Action>(),
+    );
+    append_keymap_entries(&mut items, "help", keymaps.help::<Action>());
+    append_keymap_entries(
+        &mut items,
+        "envs",
+        keymaps.envs::<super::envs::MainAction>(),
+    );
+    append_keymap_entries(
+        &mut items,
+        "envs_edit",
+        keymaps.envs_edit::<super::envs::EditAction>(),
+    );
+    append_keymap_entries(
+        &mut items,
+        "themes",
+        keymaps.themes::<super::themes::MainAction>(),
+    );
+    items
+}
+
 impl Help {
-    pub fn new(theme: Theme, keymap: DerivedConfig<Action>, all_items: Vec<KeymapEntry>) -> Self {
+    pub fn from_keymaps(theme: Theme, keymaps: &KeymapConfig) -> Self {
+        Self::new(theme, keymaps.help(), keymap_entries(keymaps))
+    }
+
+    fn new(theme: Theme, keymap: DerivedConfig<Action>, all_items: Vec<KeymapEntry>) -> Self {
         let mut help = Self {
             theme,
             keymap,
@@ -200,11 +278,12 @@ impl Help {
 }
 
 impl Component for Help {
-    type Msg = Action;
+    type Action = Action;
+    type Outcome = Outcome;
 
-    fn update(&mut self, msg: Self::Msg) -> Option<Cmd<Self::Msg>> {
-        match msg {
-            Action::Quit => Some(Cmd::msg(Action::Quit)),
+    fn update(&mut self, action: Action) -> Option<Effect<Action, Outcome>> {
+        match action {
+            Action::Quit => upmd_runtime::effect!(outcome: Outcome::Closed),
             Action::Input('\0') => None,
             Action::Input(ch) => {
                 self.query.push(ch);
@@ -231,7 +310,7 @@ impl Component for Help {
 }
 
 impl Input for Help {
-    fn action(&self, event: crossterm::event::Event) -> Option<Self::Msg> {
+    fn action(&self, event: crossterm::event::Event) -> Option<Self::Action> {
         match event {
             crossterm::event::Event::Key(key) => self.keymap.get_bound(&key),
             crossterm::event::Event::Mouse(mouse) => match mouse.kind {
@@ -483,7 +562,7 @@ mod tests {
     fn input_appends_query_and_rebuilds_matches() {
         let mut help = help_with_items();
 
-        help.update(Action::Input('j'));
+        let _ = help.update(Action::Input('j'));
 
         assert_eq!(help.query, "j");
         assert_eq!(matched_symbols(&help), vec!["g"]);
@@ -493,14 +572,14 @@ mod tests {
     fn navigation_scrolls_rows_without_selecting_items() {
         let mut help = help_with_items();
 
-        help.update(Action::Next);
-        help.update(Action::Next);
+        let _ = help.update(Action::Next);
+        let _ = help.update(Action::Next);
         assert_eq!(help.scroll, 2);
 
-        help.update(Action::Prev);
+        let _ = help.update(Action::Prev);
         assert_eq!(help.scroll, 1);
 
-        help.update(Action::Input('j'));
+        let _ = help.update(Action::Input('j'));
         assert_eq!(help.scroll, 0);
         assert_eq!(matched_symbols(&help), vec!["g"]);
     }
@@ -512,7 +591,7 @@ mod tests {
         {
             let mut help = help_with_items();
             for ch in query.chars() {
-                help.update(Action::Input(ch));
+                let _ = help.update(Action::Input(ch));
             }
 
             assert_eq!(matched_symbols(&help), expected_symbols, "query {query:?}");

@@ -1,5 +1,6 @@
 pub mod app;
 pub mod confirm;
+pub mod content;
 pub mod dependencies;
 pub mod envs;
 pub mod file_picker;
@@ -10,6 +11,7 @@ pub mod markdown;
 pub mod menu;
 pub mod notification;
 pub mod output;
+pub mod overlay;
 pub mod preview;
 pub mod search;
 pub mod selection;

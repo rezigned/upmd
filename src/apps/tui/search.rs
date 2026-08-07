@@ -4,7 +4,7 @@ use keymap::{DerivedConfig, KeyMap};
 
 use upmd_runtime::{
     runtimes::tui::{Input, Output},
-    Cmd, Component,
+    Component, Effect,
 };
 
 impl Shortcut for Search {
@@ -48,6 +48,11 @@ pub enum Action {
     /// Appends a character to the search query.
     #[key("@any")]
     Input(char),
+}
+
+pub enum Outcome {
+    Selected,
+    Cancelled,
 }
 
 impl Search {
@@ -96,34 +101,26 @@ impl Search {
 }
 
 impl Component for Search {
-    type Msg = Action;
+    type Action = Action;
+    type Outcome = Outcome;
 
-    fn update(&mut self, msg: Self::Msg) -> Option<Cmd<Self::Msg>> {
-        match msg {
-            Action::Input(c) => {
-                self.term.push(c);
-                None
-            }
+    fn update(&mut self, action: Action) -> Option<Effect<Action, Outcome>> {
+        match action {
+            Action::Input(c) => self.term.push(c),
             Action::Delete => {
                 self.term.pop();
-                None
             }
-            Action::Next => {
-                self.index = self.index.saturating_add(1);
-                None
-            }
-            Action::Prev => {
-                self.index = self.index.saturating_sub(1);
-                None
-            }
-            Action::Select => Some(Cmd::msg(Action::Select)),
-            Action::Quit => Some(Cmd::msg(Action::Quit)),
+            Action::Next => self.index = self.index.saturating_add(1),
+            Action::Prev => self.index = self.index.saturating_sub(1),
+            Action::Select => return upmd_runtime::effect!(outcome: Outcome::Selected),
+            Action::Quit => return upmd_runtime::effect!(outcome: Outcome::Cancelled),
         }
+        None
     }
 }
 
 impl Input for Search {
-    fn action(&self, event: crossterm::event::Event) -> Option<Self::Msg> {
+    fn action(&self, event: crossterm::event::Event) -> Option<Self::Action> {
         match event {
             crossterm::event::Event::Key(key) => self.keymap.get_bound(&key),
             _ => None,

@@ -7,7 +7,7 @@ use ratatui::{
     widgets::{Block, Paragraph, Wrap},
     Frame,
 };
-use upmd_runtime::{runtimes::tui::Input, Cmd, Component};
+use upmd_runtime::{runtimes::tui::Input, Component, Effect};
 
 #[derive(KeyMap, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Action {
@@ -310,15 +310,16 @@ impl Output {
 }
 
 impl Component for Output {
-    type Msg = Action;
+    type Action = Action;
+    type Outcome = Action;
 
-    fn update(&mut self, msg: Self::Msg) -> Option<Cmd<Self::Msg>> {
-        Some(Cmd::msg(msg))
+    fn update(&mut self, action: Action) -> Option<Effect<Action, Action>> {
+        upmd_runtime::effect!(outcome: action)
     }
 }
 
 impl Input for Output {
-    fn action(&self, event: crossterm::event::Event) -> Option<Self::Msg> {
+    fn action(&self, event: crossterm::event::Event) -> Option<Self::Action> {
         if let crossterm::event::Event::Key(key) = event {
             if let Some(action) = self.keymap.get(&key) {
                 return Self::is_action_enabled(action, self.done).then_some(*action);

@@ -18,7 +18,7 @@ use keymap::{DerivedConfig, KeyMap};
 
 use upmd_runtime::{
     runtimes::tui::{Input, Output},
-    Cmd, Component,
+    Component, Effect,
 };
 
 /// Searchable table for switching application themes.
@@ -69,11 +69,14 @@ pub enum Action {
     Main(MainAction),
     Search(SearchAction),
     Navigation(Navigation),
-    Preview(Theme),
-    Select(Theme),
-    Restore(Theme),
     ScrollUp,
     ScrollDown,
+}
+
+pub enum Outcome {
+    Previewed(Theme),
+    Selected(Theme),
+    Restored(Theme),
 }
 
 impl ThemeSelector {
@@ -127,11 +130,11 @@ impl ThemeSelector {
             .and_then(|idx| self.active_items().get(idx).map(|i| i.name.clone()))
     }
 
-    fn preview_selected(&mut self) -> Option<Cmd<Action>> {
+    fn preview_selected(&mut self) -> Option<Outcome> {
         self.selected_theme().map(|name| {
             let theme = Theme::new(&name, self.transparent);
             self.theme = theme.clone();
-            Cmd::msg(Action::Preview(theme))
+            Outcome::Previewed(theme)
         })
     }
 
@@ -198,12 +201,12 @@ impl ThemeSelector {
         }
     }
 
-    fn update_list(&mut self, action: MainAction) -> Option<Cmd<Action>> {
+    fn update_list(&mut self, action: MainAction) -> Option<Outcome> {
         match action {
             MainAction::Quit => {
                 let name = self.original_theme.clone().unwrap_or_default();
                 let theme = Theme::new(&name, self.transparent);
-                Some(Cmd::msg(Action::Restore(theme)))
+                Some(Outcome::Restored(theme))
             }
             MainAction::Search => {
                 let search_keymap: DerivedConfig<SearchAction> =
@@ -214,12 +217,12 @@ impl ThemeSelector {
             }
             MainAction::Select => self.selected_theme().map(|name| {
                 let theme = Theme::new(&name, self.transparent);
-                Cmd::msg(Action::Select(theme))
+                Outcome::Selected(theme)
             }),
         }
     }
 
-    fn update_search(&mut self, action: SearchAction) -> Option<Cmd<Action>> {
+    fn update_search(&mut self, action: SearchAction) -> Option<Outcome> {
         match action {
             SearchAction::Prev => {
                 self.prev();
@@ -238,7 +241,7 @@ impl ThemeSelector {
             SearchAction::Select => {
                 return self.selected_theme().map(|name| {
                     let theme = Theme::new(&name, self.transparent);
-                    Cmd::msg(Action::Select(theme))
+                    Outcome::Selected(theme)
                 });
             }
             SearchAction::Input(_) | SearchAction::Delete => {}
@@ -344,10 +347,11 @@ impl ThemeSelector {
 }
 
 impl Component for ThemeSelector {
-    type Msg = Action;
+    type Action = Action;
+    type Outcome = Outcome;
 
-    fn update(&mut self, msg: Self::Msg) -> Option<Cmd<Self::Msg>> {
-        match msg {
+    fn update(&mut self, action: Action) -> Option<Effect<Action, Outcome>> {
+        let outcome = match action {
             Action::Main(action) => self.update_list(action),
             Action::Search(action) => self.update_search(action),
             Action::Navigation(nav) => {
@@ -358,36 +362,37 @@ impl Component for ThemeSelector {
                     Navigation::Next => self.next(),
                     Navigation::PageUp => self.page_up(),
                     Navigation::PageDown => self.page_down(),
-                };
+                }
                 self.preview_selected()
             }
-            Action::Preview(_) => None,
-            Action::Select(_) => None,
-            Action::Restore(_) => None,
             Action::ScrollUp => {
                 self.scroll_acc -= 1;
                 if self.scroll_acc <= -3 {
                     self.scroll_acc = 0;
                     self.prev();
-                    return self.preview_selected();
+                    self.preview_selected()
+                } else {
+                    None
                 }
-                None
             }
             Action::ScrollDown => {
                 self.scroll_acc += 1;
                 if self.scroll_acc >= 3 {
                     self.scroll_acc = 0;
                     self.next();
-                    return self.preview_selected();
+                    self.preview_selected()
+                } else {
+                    None
                 }
-                None
             }
-        }
+        };
+
+        outcome.map(Effect::Outcome)
     }
 }
 
 impl Input for ThemeSelector {
-    fn action(&self, event: CrosstermEvent) -> Option<Self::Msg> {
+    fn action(&self, event: CrosstermEvent) -> Option<Self::Action> {
         match event {
             CrosstermEvent::Mouse(mouse) => {
                 if mouse.kind == crossterm::event::MouseEventKind::ScrollUp {
