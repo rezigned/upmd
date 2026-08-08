@@ -88,6 +88,7 @@ impl VisualLines {
         theme: &Theme,
         target_block: &Cell<Option<CodeId>>,
         is_code_start_at: impl Fn(usize) -> bool,
+        rows_for: impl Fn(&LogicalLine) -> usize,
     ) -> Option<usize> {
         if width == 0 {
             return None;
@@ -103,6 +104,19 @@ impl VisualLines {
 
         let mut new_visual_lines = Vec::new();
         for (idx, logical_line) in logical_lines.iter().enumerate() {
+            if logical_line.is_image() {
+                // Represent image height as repeated visual rows. Only the
+                // first row carries alt text.
+                for row in 0..rows_for(logical_line).max(1) {
+                    new_visual_lines.push(VisualLine::wrapped(
+                        logical_line.code_id,
+                        idx,
+                        row,
+                        0..0,
+                    ));
+                }
+                continue;
+            }
             let line = logical_line.render_plain(&ctx);
             let prefix_width = logical_line.prefix_width();
             let wrap_width = if logical_line.has_code_gutter() {

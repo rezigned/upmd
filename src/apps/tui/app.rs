@@ -589,12 +589,13 @@ impl App {
 }
 
 /// Messages handled by the main TUI component's event loop.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub enum Msg {
     Content(content::Action),
     Overlay(overlay::Action),
     StreamUpdate(CodeId, crate::pty::stream::Stream),
     Notify(tui::notification::FlashMessage),
+    ImageDecoded(tui::preview::DecodedImage),
     Tick,
     Event(crossterm::event::Event),
 }
@@ -646,6 +647,10 @@ impl Component for App {
             Msg::Content(action) => self.handle_content_msg(action),
             Msg::Overlay(message) => self.handle_overlay_msg(message),
             Msg::StreamUpdate(id, stream) => self.handle_stream_update(id, stream),
+            Msg::ImageDecoded(decoded) => {
+                self.content.complete_image(decoded);
+                None
+            }
             Msg::Notify(flash) => {
                 self.notification = Some(flash);
                 None
@@ -695,7 +700,21 @@ impl App {
         {
             self.notification = None;
         }
-        None
+        let requests = self.content.take_image_requests();
+        if requests.is_empty() {
+            None
+        } else {
+            Some(Cmd::stream(move |tx| {
+                for path in requests {
+                    if tx
+                        .send(Msg::ImageDecoded(tui::preview::decode_image(path)))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }))
+        }
     }
 
     fn is_action_enabled(&self, action: &Action) -> bool {
