@@ -40,6 +40,7 @@ use std::collections::{HashMap, HashSet};
 use crate::apps::config::{
     BORDER_HEIGHT, CODE_GUTTER_WIDTH, INLINE_MAX_LINES_DEFAULT, INLINE_MAX_LINES_FRACTION,
     INLINE_MAX_LINES_MIN, OVERDRAW_FRACTION, PREVIEW_CONTENT_TOP_OFFSET, PREVIEW_CONTENT_X_OFFSET,
+    PREVIEW_FRAME_OVERHEAD,
 };
 use crate::apps::theme::Theme;
 use crate::runner::CodeId;
@@ -61,10 +62,14 @@ use upmd_runtime::{
     Component, Effect, NoOutcome,
 };
 
+mod images;
 mod search;
 mod selection;
 mod visual_lines;
 
+pub use images::image_base_dir;
+use images::ImageCache;
+pub(crate) use images::{decode_image, DecodedImage};
 use search::PreviewSearch;
 use selection::PreviewSelection;
 pub use visual_lines::{VisualLine, VisualLines};
@@ -115,6 +120,10 @@ pub struct Preview {
     copy_result: Cell<Option<bool>>,
     /// Prefix overhead in chars per code block (non-zero only for blockquote-nested blocks).
     code_prefix_overhead: HashMap<CodeId, usize>,
+    /// Cache of images referenced by the document, keyed by resolved path.
+    images: RefCell<ImageCache>,
+    /// Directory that relative image paths resolve against (the open document's dir).
+    image_base_dir: std::path::PathBuf,
 }
 
 #[derive(KeyMap, Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -153,6 +162,7 @@ impl Preview {
         outputs: &HashMap<CodeId, Task>,
         inline_max_lines_cap: usize,
         keymap: DerivedConfig<Action>,
+        image_base_dir: std::path::PathBuf,
     ) -> Self {
         let mut preview = Self {
             nodes,
@@ -172,6 +182,8 @@ impl Preview {
             copy_result: Cell::new(None),
             code_index: codes,
             code_prefix_overhead: HashMap::new(),
+            images: RefCell::new(ImageCache::new()),
+            image_base_dir,
         };
         preview.rebuild_view(outputs);
         if !preview.visual_lines.is_empty() {
@@ -182,6 +194,38 @@ impl Preview {
 
     pub fn prefer_status_gutter_for(&self, id: CodeId) {
         self.prefer_status_gutter.set(Some(id));
+    }
+
+    /// Requests loading of images in the viewport and a small overdraw margin.
+    fn request_visible_images(&self) {
+        let viewport = self.visual_lines.last_height();
+        let offset = self.state.borrow().offset();
+        let overdraw = viewport / OVERDRAW_FRACTION;
+        let start = offset.saturating_sub(overdraw);
+        let end = offset
+            .saturating_add(viewport)
+            .saturating_add(overdraw)
+            .min(self.visual_lines.len());
+        let visual_lines = self.visual_lines.borrow();
+        let mut images = self.images.borrow_mut();
+        for src in visual_lines[start..end]
+            .iter()
+            .filter(|line| line.wrap_idx == 0)
+            .filter_map(|line| self.logical_lines[line.logical_idx].image_src())
+        {
+            images.request(src, &self.image_base_dir);
+        }
+    }
+
+    pub(crate) fn take_image_requests(&self) -> Vec<std::path::PathBuf> {
+        self.images.borrow_mut().take_requests()
+    }
+
+    pub(crate) fn complete_image(&self, decoded: DecodedImage) {
+        let width = self.image_width(self.visual_lines.last_width());
+        if self.images.borrow_mut().complete(decoded, width) {
+            self.rebuild_visual_lines(self.visual_lines.last_width());
+        }
     }
 
     /// Rebuilds the logical lines from markdown nodes and then the visual lines.
@@ -257,6 +301,13 @@ impl Preview {
             &self.theme,
             &self.target_block,
             |idx| self.is_code_start_at(idx),
+            |line| {
+                if let Some(src) = line.image_src() {
+                    self.images.borrow().rows(src, &self.image_base_dir)
+                } else {
+                    1
+                }
+            },
         );
         if let Some(idx) = selected {
             // Explicit jump → scroll to target.
@@ -458,9 +509,13 @@ impl Preview {
         self.inline_max_lines.set(max_inline);
     }
 
-    /// Advances the spinner tick counter (driven by Msg::Tick).
     pub fn tick(&mut self) {
         self.spinner.tick();
+    }
+
+    /// Width available to images for a given preview width, in columns.
+    fn image_width(&self, preview_width: usize) -> usize {
+        preview_width.saturating_sub(PREVIEW_FRAME_OVERHEAD).max(1)
     }
 
     pub fn search(&mut self, term: &str) -> Vec<usize> {
@@ -592,6 +647,9 @@ impl Preview {
             viewport_width: self.visual_lines.last_width(),
         };
         let logical_line = &self.logical_lines[visual_line.logical_idx];
+        if logical_line.is_image() && visual_line.wrap_idx > 0 {
+            return Line::raw("");
+        }
         let source_line = logical_line.render_plain(&ctx);
         if logical_line.is_unwrappable() {
             source_line
@@ -987,7 +1045,10 @@ impl Output for Preview {
             .set_last_height(height.saturating_sub(BORDER_HEIGHT));
         self.last_area.set(area);
 
+        self.request_visible_images();
+
         if self.visual_lines.last_width() != width && width > 0 {
+            self.images.borrow_mut().set_width(self.image_width(width));
             self.rebuild_visual_lines(width);
         }
 
@@ -1048,34 +1109,51 @@ impl Output for Preview {
                 .or_insert_with(|| self.logical_lines[visual_line.logical_idx].render(&ctx));
         }
 
-        let items: Vec<ListItem> = window
-            .iter()
-            .enumerate()
-            .map(|(win_i, visual_line)| {
-                let visual_idx = win_start + win_i;
-                let source_line = rendered_logical
-                    .get(&visual_line.logical_idx)
-                    .expect("visible logical line was rendered");
-                let mut line = self.render_visual_line_from(visual_line, source_line, &ctx);
-                if let Some(term) = self.search.term() {
-                    line = highlight_line(line, term, self.theme.search_highlight_style());
+        let mut items = Vec::with_capacity(window.len());
+        let mut image_rows = Vec::new();
+        for (win_i, visual_line) in window.iter().enumerate() {
+            let visual_idx = win_start + win_i;
+            let logical_idx = visual_line.logical_idx;
+            let logical_line = &self.logical_lines[logical_idx];
+
+            if logical_line.is_image() {
+                // Record the first visible row of each image
+                let first_visible_row = win_i == 0 || window[win_i - 1].logical_idx != logical_idx;
+                if first_visible_row {
+                    let first_global = visual_idx as i32 - visual_line.wrap_idx as i32;
+                    image_rows.push((logical_idx, first_global));
                 }
 
-                if let Some((sel_start, sel_end)) = self
-                    .selection
-                    .range_for_line(visual_idx, line.to_string().chars().count())
-                {
-                    line = SelectionState::apply_range(
-                        line,
-                        sel_start,
-                        sel_end,
-                        self.theme.selection_style(),
-                    );
+                // The image widget paints continuation rows after the list.
+                if visual_line.wrap_idx > 0 {
+                    items.push(ListItem::new(Text::raw("")));
+                    continue;
                 }
+            }
 
-                ListItem::new(Text::from(line))
-            })
-            .collect();
+            let source_line = rendered_logical
+                .get(&logical_idx)
+                .expect("visible logical line was rendered");
+            let mut line = self.render_visual_line_from(visual_line, source_line, &ctx);
+            if let Some(term) = self.search.term() {
+                line = highlight_line(line, term, self.theme.search_highlight_style());
+            }
+
+            if let Some((sel_start, sel_end)) = self
+                .selection
+                .range_for_line(visual_idx, line.to_string().chars().count())
+            {
+                line = SelectionState::apply_range(
+                    line,
+                    sel_start,
+                    sel_end,
+                    self.theme.selection_style(),
+                );
+            }
+
+            items.push(ListItem::new(Text::from(line)));
+        }
+
         if cache_misses > 0 {
             tracing::debug!(
                 visual_rows = window.len(),
@@ -1100,6 +1178,43 @@ impl Output for Preview {
             .padding(Padding::horizontal(1));
 
         frame.render_stateful_widget(List::new(items).block(block), area, &mut render_state);
+
+        self.render_images(frame, area, original_offset, &image_rows);
+    }
+}
+
+impl Preview {
+    /// Draws loaded images over their reserved viewport rows.
+    fn render_images(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        original_offset: usize,
+        image_rows: &[(usize, i32)],
+    ) {
+        use ratatui_image::sliced::SignedPosition;
+
+        let images = self.images.borrow();
+        let base_dir = &self.image_base_dir;
+        let content_area = Rect::new(
+            area.x + PREVIEW_CONTENT_X_OFFSET,
+            area.y + PREVIEW_CONTENT_TOP_OFFSET,
+            area.width.saturating_sub(PREVIEW_FRAME_OVERHEAD as u16),
+            area.height.saturating_sub(BORDER_HEIGHT as u16),
+        );
+        for (logical_idx, first_global) in image_rows {
+            let Some(src) = self.logical_lines[*logical_idx].image_src() else {
+                continue;
+            };
+            if images.protocol(src, base_dir).is_none() {
+                continue;
+            }
+            let position = SignedPosition::from((
+                0,
+                i16::try_from(first_global - original_offset as i32).unwrap_or(i16::MIN),
+            ));
+            images.render(frame, src, base_dir, content_area, position);
+        }
     }
 }
 
@@ -1116,7 +1231,28 @@ mod tests {
         let theme = Theme::new("base16-ocean.dark", false);
         let outputs = HashMap::new();
         let keymap: DerivedConfig<Action> = toml::from_str("").unwrap();
-        Preview::new(doc.nodes, doc.codes, theme, &outputs, 10, keymap)
+        Preview::new(
+            doc.nodes,
+            doc.codes,
+            theme,
+            &outputs,
+            10,
+            keymap,
+            std::path::PathBuf::from("."),
+        )
+    }
+
+    #[test]
+    fn image_continuation_rows_have_no_copy_text() {
+        let preview = preview_from_markdown("![alt](image.png)");
+        let row = VisualLine {
+            code_id: None,
+            logical_idx: 0,
+            wrap_idx: 1,
+            char_range: 0..0,
+        };
+
+        assert!(preview.plain_visual_line(&row).to_string().is_empty());
     }
 
     fn render_visual_line(
@@ -1338,7 +1474,15 @@ mod tests {
         output.exit_code = Some(0);
         outputs.insert(1, output);
         let keymap: DerivedConfig<Action> = toml::from_str("").unwrap();
-        let preview = Preview::new(doc.nodes, doc.codes, theme, &outputs, 10, keymap);
+        let preview = Preview::new(
+            doc.nodes,
+            doc.codes,
+            theme,
+            &outputs,
+            10,
+            keymap,
+            std::path::PathBuf::from("."),
+        );
         preview.rebuild_visual_lines(80);
         let code_info = preview
             .logical_lines
@@ -1651,7 +1795,15 @@ mod tests {
         let theme = Theme::new("base16-ocean.dark", false);
         let outputs = std::collections::HashMap::new();
         let keymap: keymap::DerivedConfig<Action> = toml::from_str("").unwrap();
-        let preview = Preview::new(doc.nodes, doc.codes, theme, &outputs, 10, keymap);
+        let preview = Preview::new(
+            doc.nodes,
+            doc.codes,
+            theme,
+            &outputs,
+            10,
+            keymap,
+            std::path::PathBuf::from("."),
+        );
 
         // code block 1 is inside blockquote, code block 2 is flat
         assert!(

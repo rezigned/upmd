@@ -126,7 +126,33 @@ impl<'a> Parser<'a> {
     // Paragraph
 
     fn parse_paragraph(&mut self) -> Node {
-        let spans = self.parse_inline_content(TagEnd::Paragraph);
+        if matches!(self.iter.peek(), Some((Event::Start(Tag::Image { .. }), _))) {
+            return self.parse_block_image();
+        }
+
+        Node::Paragraph(trim_spans(self.parse_inline_content(TagEnd::Paragraph)))
+    }
+
+    /// Parses a paragraph whose first event is an image.
+    #[inline]
+    fn parse_block_image(&mut self) -> Node {
+        let Some((Event::Start(Tag::Image { dest_url, .. }), _)) = self.iter.next() else {
+            unreachable!("peeked image event must still be present");
+        };
+        let src = dest_url.into_string();
+        let mut spans = Vec::new();
+        let mut stack = Vec::new();
+        self.push_image(&src, &mut stack, &mut spans);
+
+        if matches!(self.iter.peek(), Some((Event::End(TagEnd::Paragraph), _))) {
+            self.iter.next();
+            return Node::Image {
+                alt: inline_text(&spans),
+                src,
+            };
+        }
+
+        self.parse_inline_until(TagEnd::Paragraph, &mut stack, &mut spans);
         Node::Paragraph(trim_spans(spans))
     }
 
@@ -413,6 +439,17 @@ impl<'a> Parser<'a> {
         self.parse_inline_until(TagEnd::Image, stack, out);
         stack.pop();
         let alt = inline_text(&out[start..]);
+
+        // Empty alt (`![](path)`) yields no spans, so emit one to keep the image.
+        if out.len() == start {
+            out.push(text_span(
+                String::new(),
+                &[InlineStyle::Image {
+                    alt: String::new(),
+                    src: dest_url.to_string(),
+                }],
+            ));
+        }
         for span in &mut out[start..] {
             if let Some(InlineStyle::Image { alt: a, .. }) = span
                 .style
@@ -753,14 +790,6 @@ mod tests {
                 }],
             ),
             (
-                "![alt](image.png)",
-                "alt",
-                vec![InlineStyle::Image {
-                    alt: "alt".into(),
-                    src: "image.png".into(),
-                }],
-            ),
-            (
                 "***both***",
                 "both",
                 vec![InlineStyle::Italic, InlineStyle::Bold],
@@ -787,6 +816,51 @@ mod tests {
             assert_eq!(inline_text(spans), expected_text, "input: {markdown:?}");
             assert_eq!(spans.len(), 1, "input: {markdown:?}");
             assert_eq!(spans[0].style, expected_styles, "input: {markdown:?}");
+        }
+    }
+
+    #[test]
+    fn test_parse_block_image() {
+        for (markdown, expected_alt, expected_src) in [
+            ("![alt](image.png)", "alt", "image.png"),
+            ("![alt](./img/a.png)", "alt", "./img/a.png"),
+            ("![](/abs/path.png)", "", "/abs/path.png"),
+        ] {
+            let nodes = Cmark::new().parse(markdown).nodes;
+            match &nodes[0] {
+                Node::Image { alt, src } => {
+                    assert_eq!(alt, expected_alt, "input: {markdown:?}");
+                    assert_eq!(src, expected_src, "input: {markdown:?}");
+                }
+                other => panic!("Expected standalone Image for {markdown:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_paragraph_with_mixed_text_and_image_stays_paragraph() {
+        let nodes = Cmark::new().parse("text ![alt](image.png)").nodes;
+        match &nodes[0] {
+            Node::Paragraph(spans) => {
+                assert!(spans.iter().any(|s| s.style.contains(&InlineStyle::Image {
+                    alt: "alt".into(),
+                    src: "image.png".into(),
+                })));
+            }
+            other => panic!("Expected Paragraph, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_multiple_images_stay_paragraph() {
+        for markdown in [
+            "![alt](image.png)![alt](image.png)",
+            "![](image.png)![](image.png)",
+        ] {
+            assert!(
+                matches!(Cmark::new().parse(markdown).nodes[0], Node::Paragraph(_)),
+                "input: {markdown:?}"
+            );
         }
     }
 

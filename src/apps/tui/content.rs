@@ -67,6 +67,7 @@ impl Content {
             outputs,
             config.tui.inline_max_lines(),
             config.keymap.preview::<preview::Action>(),
+            preview::image_base_dir(config.file.as_deref()),
         );
 
         if let Some(id) = selected {
@@ -178,6 +179,14 @@ impl Content {
     pub fn tick(&mut self) {
         self.menu.tick();
         self.preview.tick();
+    }
+
+    pub(crate) fn take_image_requests(&self) -> Vec<std::path::PathBuf> {
+        self.preview.take_image_requests()
+    }
+
+    pub(crate) fn complete_image(&self, decoded: preview::DecodedImage) {
+        self.preview.complete_image(decoded);
     }
 
     pub fn rebuild(&mut self, outputs: &HashMap<CodeId, Task>) {

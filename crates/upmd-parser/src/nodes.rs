@@ -3,7 +3,10 @@ use std::ops::Range;
 
 #[derive(Debug, Clone)]
 pub enum Node {
-    Heading { level: u8, text: Vec<InlineSpan> },
+    Heading {
+        level: u8,
+        text: Vec<InlineSpan>,
+    },
     Paragraph(Vec<InlineSpan>),
     BlockQuote(Vec<Node>),
     List(Vec<ListItem>),
@@ -11,6 +14,11 @@ pub enum Node {
     Table(Table),
     Text(Vec<InlineSpan>),
     ThematicBreak,
+    /// A standalone image paragraph (`![alt](src)` as its only content).
+    Image {
+        alt: String,
+        src: String,
+    },
 }
 
 /// A run of inline text with the formatting applied to it.

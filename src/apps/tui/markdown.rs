@@ -158,6 +158,11 @@ pub enum LogicalLineSource {
         /// Initial content retained for search and copy before viewport painting.
         initial: Line<'static>,
     },
+    /// A standalone image block rendered via ratatui_image.
+    Image {
+        alt: String,
+        src: String,
+    },
     ThematicBreak,
     #[default]
     Newline,
@@ -385,10 +390,23 @@ impl LogicalLine {
         matches!(self.source, LogicalLineSource::TableRow { .. })
     }
 
+    #[inline]
+    pub fn is_image(&self) -> bool {
+        matches!(self.source, LogicalLineSource::Image { .. })
+    }
+
+    /// Returns the image source path for image lines.
+    pub fn image_src(&self) -> Option<&str> {
+        match &self.source {
+            LogicalLineSource::Image { src, .. } => Some(src),
+            _ => None,
+        }
+    }
+
     /// Returns `true` for lines that must not be wrapped (already sized/formatted).
     #[inline]
     pub fn is_unwrappable(&self) -> bool {
-        self.is_table() || self.is_output() || self.is_code_info()
+        self.is_table() || self.is_output() || self.is_code_info() || self.is_image()
     }
 
     /// Returns text content, preferring raw text if available.
@@ -404,6 +422,7 @@ impl LogicalLine {
             }
             LogicalLineSource::Output(text) => text.to_string(),
             LogicalLineSource::TableRow { initial, .. } => initial.to_string(),
+            LogicalLineSource::Image { alt, .. } => alt.clone(),
             LogicalLineSource::ThematicBreak | LogicalLineSource::Newline => String::new(),
         }
     }
@@ -596,6 +615,9 @@ impl LogicalLine {
                 text.lines.first().cloned().unwrap_or_else(|| Line::raw(""))
             }
             LogicalLineSource::TableRow { initial, .. } => initial.clone(),
+            LogicalLineSource::Image { alt, .. } => {
+                Line::from(alt.clone()).style(ctx.theme.image_style())
+            }
             LogicalLineSource::ThematicBreak | LogicalLineSource::Newline => Line::raw(""),
         }
     }
@@ -1053,6 +1075,18 @@ impl<'a> MarkdownRenderer<'a> {
                 self.push_line(lines, LogicalLine::thematic_break(), state.quote_depth);
                 self.push_line(lines, LogicalLine::newline(None, false), state.quote_depth);
             }
+            Node::Image { alt, src } => {
+                let line = LogicalLine {
+                    source: LogicalLineSource::Image {
+                        alt: alt.clone(),
+                        src: src.clone(),
+                    },
+                    is_block_start: true,
+                    ..LogicalLine::default()
+                };
+                self.push_line(lines, line, state.quote_depth);
+                self.push_line(lines, LogicalLine::newline(None, false), state.quote_depth);
+            }
         }
     }
 
@@ -1480,6 +1514,7 @@ mod tests {
             LogicalLineSource::CodeBody(_) => "CodeBody".to_string(),
             LogicalLineSource::Output(_) => "Output".to_string(),
             LogicalLineSource::TableRow { .. } => "Table".to_string(),
+            LogicalLineSource::Image { .. } => "Image".to_string(),
             LogicalLineSource::ThematicBreak => "ThematicBreak".to_string(),
             LogicalLineSource::Newline => "Newline".to_string(),
         }

@@ -107,7 +107,7 @@ pub fn merge_envs(dest: &mut Envs, captured: &Envs) {
 /// PTY output can be effectively infinite (`yes` is the canonical case), so
 /// `Out` is best-effort on the low-priority queue. Lifecycle/state messages go
 /// to the high-priority queue so `Exit`/`End` cannot sit behind stale output.
-pub fn stream_rx<M: Clone + Send + 'static>(
+pub fn stream_rx<M: Send + 'static>(
     id: CodeId,
     rx: Receiver<Stream>,
     mk_msg: impl Fn(CodeId, Stream) -> M + Send + 'static,

@@ -23,6 +23,12 @@ Plain text, **bold**, *italic*, ~~strikethrough~~, `inline code`,
 Styles can be nested: ***bold italic***, **[a bold link](https://github.com/rezigned/upmd)**,
 and ~~*struck italic*~~.
 
+### Images
+
+A standalone image renders in the preview pane:
+
+![the upmd logo](.github/pages/upmd-logo.png)
+
 ### A heading with **bold**, *italic*, and `code`
 
 - A list item with **bold**, *italic*, ~~strikethrough~~, and `inline code`.
