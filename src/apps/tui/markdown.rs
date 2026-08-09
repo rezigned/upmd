@@ -386,6 +386,14 @@ impl LogicalLine {
         }
     }
 
+    /// Creates the decorative bottom rule used by H1 and H2 headings.
+    fn heading_rule() -> Self {
+        Self {
+            source: LogicalLineSource::ThematicBreak,
+            ..Self::default()
+        }
+    }
+
     pub fn into_lazy_text(mut self) -> Option<LazyText> {
         self.source.lazy_text_mut().map(std::mem::take)
     }
@@ -600,7 +608,9 @@ impl LogicalLine {
     fn render_synthetic(&self, ctx: &RenderContext<'_>) -> Option<Line<'static>> {
         match &self.source {
             LogicalLineSource::ThematicBreak => {
-                let width = ctx.viewport_width.saturating_sub(PREVIEW_FRAME_OVERHEAD);
+                let width = ctx
+                    .viewport_width
+                    .saturating_sub(PREVIEW_FRAME_OVERHEAD + self.prefix_width());
                 Some(Line::from(Span::styled(
                     "─".repeat(width),
                     ctx.theme.rule_style(),
@@ -1096,6 +1106,9 @@ impl<'a> MarkdownRenderer<'a> {
                     LogicalLine::heading_lazy_spans(content, *level),
                     state.quote_depth,
                 );
+                if *level <= 2 {
+                    self.push_line(lines, LogicalLine::heading_rule(), state.quote_depth);
+                }
                 state.snap.title_line = Some(line_idx);
             }
             Node::List(items) => self.push_list(items, lines, state),
@@ -1886,6 +1899,20 @@ mod tests {
     fn test_render_thematic_break() {
         let lines = render_nodes("above\n\n-----\n\nbelow");
         assert_snapshot!("thematic_break", logical_line_summary(&lines));
+    }
+
+    #[test]
+    fn test_render_github_heading_rules() {
+        for level in 1..=6 {
+            let lines = render_nodes(&format!("{} Heading", "#".repeat(level)));
+            assert_eq!(
+                lines
+                    .iter()
+                    .any(|line| matches!(line.source, LogicalLineSource::ThematicBreak)),
+                level <= 2,
+                "H{level}"
+            );
+        }
     }
 
     #[test]

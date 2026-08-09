@@ -1,10 +1,10 @@
 ---
 source: src/apps/tui/preview/mod.rs
-assertion_line: 1229
 expression: full_preview_text(&preview)
 ---
 bold italic strike `code` link
 
 ## Heading with bold
+────────────────────────────────────────────────────────
 • bold item
 • italic item
