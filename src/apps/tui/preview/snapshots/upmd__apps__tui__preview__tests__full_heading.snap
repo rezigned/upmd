@@ -1,7 +1,8 @@
 ---
 source: src/apps/tui/preview/mod.rs
-assertion_line: 1149
 expression: full_preview_text(&preview)
 ---
 # Title
+────────────────────────────────────────────────────────
 ## Subtitle
+────────────────────────────────────────────────────────

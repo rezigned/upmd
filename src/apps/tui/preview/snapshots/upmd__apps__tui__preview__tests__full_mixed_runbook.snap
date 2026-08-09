@@ -1,9 +1,9 @@
 ---
 source: src/apps/tui/preview/mod.rs
-assertion_line: 1212
 expression: full_preview_text(&preview)
 ---
 # Setup
+────────────────────────────────────
 Install deps.
 
 ▎ 1                            Bash 
