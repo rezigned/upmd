@@ -36,6 +36,7 @@ use ratatui::{
 };
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use crate::apps::config::{
     BORDER_HEIGHT, CODE_GUTTER_WIDTH, INLINE_MAX_LINES_DEFAULT, INLINE_MAX_LINES_FRACTION,
@@ -48,7 +49,9 @@ use keymap::{DerivedConfig, KeyMap};
 use upmd_parser::nodes::Node;
 use upmd_parser::Codes;
 
-use super::markdown::{apply_gutter, highlight_line, LogicalLine, MarkdownRenderer, RenderContext};
+use super::markdown::{
+    apply_gutter, highlight_line, LogicalLine, MarkdownHtml, MarkdownRenderer, RenderContext,
+};
 use super::selection::SelectionState;
 use super::wrap::{slice_line, CopyLine};
 use crate::apps::task::Task;
@@ -247,14 +250,26 @@ impl Preview {
         tracing::Span::current().record("lines", rendered.lines.len());
         self.logical_lines = rendered.lines;
         self.code_prefix_overhead = rendered.code_prefix_overhead;
-        // Preserve lazy syntax highlighting caches for unchanged source lines.
+
+        // Reuse caches from the previous render for unchanged lines. HTML
+        // blocks are reused by whole-block source; other lines match on text.
+        let old_html: HashMap<String, Rc<MarkdownHtml>> = old_lines
+            .iter()
+            .filter_map(LogicalLine::html_block)
+            .map(|block| (block.source().to_owned(), Rc::clone(block)))
+            .collect();
         let mut old_raw_iter = old_lines
             .into_iter()
             .filter_map(LogicalLine::into_lazy_text)
             .peekable();
 
-        // Match new source lines sequentially so unchanged text keeps its cache.
         for line in &mut self.logical_lines {
+            if let Some(block) = line.html_block() {
+                if let Some(cached) = old_html.get(block.source()) {
+                    line.reuse_html_block(cached);
+                }
+                continue;
+            }
             let Some(text) = line.lazy_text_mut() else {
                 continue;
             };
@@ -1240,6 +1255,45 @@ mod tests {
             keymap,
             std::path::PathBuf::from("."),
         )
+    }
+
+    #[test]
+    fn html_block_cache_rebuilds() {
+        let comment = "<!--\ninside comment\n-->\n";
+        let div = "<div>\ninside element\n</div>\n";
+        let block = |p: &Preview| {
+            Rc::clone(
+                p.logical_lines
+                    .iter()
+                    .find_map(LogicalLine::html_block)
+                    .expect("HTML block"),
+            )
+        };
+
+        for (name, updated, change_theme, expect_reuse) in [
+            ("unchanged", comment, false, true),
+            ("theme changed", comment, true, true),
+            ("source changed", div, false, false),
+        ] {
+            let mut preview = preview_from_markdown(comment);
+            let before = block(&preview);
+
+            if change_theme {
+                preview.set_theme(&Theme::new("base16-ocean.dark", true));
+            }
+            if updated != comment {
+                let doc = upmd_parser::new().parse(updated);
+                preview.nodes = doc.nodes;
+                preview.code_index = doc.codes;
+            }
+            preview.rebuild_view(&HashMap::new());
+
+            assert_eq!(
+                Rc::ptr_eq(&before, &block(&preview)),
+                expect_reuse,
+                "{name}"
+            );
+        }
     }
 
     #[test]

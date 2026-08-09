@@ -13,6 +13,7 @@ pub enum Node {
     Code(CodeId),
     Table(Table),
     Text(Vec<InlineSpan>),
+    HtmlBlock(String),
     ThematicBreak,
     /// A standalone image paragraph (`![alt](src)` as its only content).
     Image {
@@ -45,11 +46,21 @@ pub enum InlineStyle {
         alt: String,
         src: String,
     },
+    HtmlTag,
 }
 
 /// Concatenates span text into a single plain string (for search, copy, menus).
 pub fn inline_text(spans: &[InlineSpan]) -> String {
     spans.iter().map(|s| s.text.as_str()).collect()
+}
+
+/// Concatenates span text, excluding HTML tags (for semantic labels).
+pub fn semantic_text(spans: &[InlineSpan]) -> String {
+    spans
+        .iter()
+        .filter(|s| !s.style.contains(&InlineStyle::HtmlTag))
+        .map(|s| s.text.as_str())
+        .collect()
 }
 
 /// Heading metadata collected during parsing.

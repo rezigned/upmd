@@ -4,8 +4,8 @@ use pulldown_cmark::{
 };
 
 use super::nodes::{
-    inline_text, Alignment, Codes, InlineSpan, InlineStyle, ListItem, ListKind, Node, Table,
-    TableCell, TaskStatus,
+    inline_text, semantic_text, Alignment, Codes, InlineSpan, InlineStyle, ListItem, ListKind,
+    Node, Table, TableCell, TaskStatus,
 };
 use super::options;
 
@@ -105,6 +105,9 @@ impl<'a> Parser<'a> {
                         nodes.push(node);
                     }
                 }
+                Event::Start(Tag::HtmlBlock) => {
+                    nodes.push(self.parse_html_block());
+                }
                 Event::Start(Tag::Table(alignments)) => {
                     nodes.push(self.parse_table(&alignments));
                 }
@@ -168,7 +171,7 @@ impl<'a> Parser<'a> {
             HeadingLevel::H6 => 6,
         };
         let spans = self.parse_inline_content(TagEnd::Heading(level));
-        let text = inline_text(&spans);
+        let text = semantic_text(&spans);
         let text = text.trim().to_string();
         let spans = trim_spans(spans);
         self.headings.push(super::Heading {
@@ -208,6 +211,22 @@ impl<'a> Parser<'a> {
         let options = options::parse(&opts);
         let code_id = self.codes.push(content, options);
         Some(Node::Code(code_id))
+    }
+
+    // HTML block
+
+    fn parse_html_block(&mut self) -> Node {
+        let mut content = String::new();
+        loop {
+            match self.iter.next() {
+                Some((Event::End(TagEnd::HtmlBlock), _)) => break,
+                Some((Event::Html(html), _)) => content.push_str(&html),
+                Some((Event::Text(text), _)) => content.push_str(&text),
+                None => break,
+                _ => {}
+            }
+        }
+        Node::HtmlBlock(content)
     }
 
     // Table
@@ -301,6 +320,9 @@ impl<'a> Parser<'a> {
                         children.push(node);
                     }
                 }
+                Event::Start(Tag::HtmlBlock) => {
+                    children.push(self.parse_html_block());
+                }
                 Event::Start(Tag::List(start)) => {
                     children.push(Node::List(self.parse_list(depth + 1, start)));
                 }
@@ -359,6 +381,7 @@ impl<'a> Parser<'a> {
         match event {
             Event::Text(text) => out.push(text_span(text.into_string(), stack)),
             Event::Code(code) => out.push(code_span(&code, stack)),
+            Event::InlineHtml(tag) => out.push(html_span(&tag, stack)),
             Event::SoftBreak | Event::HardBreak => out.push(break_span(stack)),
             Event::Start(Tag::Emphasis) => {
                 self.parse_styled_until(InlineStyle::Italic, TagEnd::Emphasis, stack, out);
@@ -476,6 +499,16 @@ fn code_span(code: &str, stack: &[InlineStyle]) -> InlineSpan {
     style.push(InlineStyle::InlineCode);
     InlineSpan {
         text: format!("`{}`", code),
+        style,
+    }
+}
+
+/// Builds a span for an inline HTML tag, preserving its source text.
+fn html_span(html: &str, stack: &[InlineStyle]) -> InlineSpan {
+    let mut style = stack.to_vec();
+    style.push(InlineStyle::HtmlTag);
+    InlineSpan {
+        text: html.to_string(),
         style,
     }
 }
@@ -892,6 +925,31 @@ mod tests {
             assert_eq!(cell.spans.len(), 1, "input: {markdown:?}");
             assert_eq!(cell.spans[0].style, expected_styles, "input: {markdown:?}");
         }
+    }
+
+    #[test]
+    fn test_parse_html() {
+        for (input, expected) in [
+            (
+                "<div class=\"card\">\n<p>Hello</p>\n</div>\n",
+                "<div class=\"card\">\n<p>Hello</p>\n</div>\n",
+            ),
+            ("**bold** <b>tag</b> <br/>", "bold <b>tag</b> <br/>"),
+            ("# Title <b>with tag</b>\n", "Title <b>with tag</b>"),
+        ] {
+            let doc = Cmark::new().parse(input);
+            let text = match &doc.nodes[0] {
+                Node::HtmlBlock(content) => content.clone(),
+                Node::Paragraph(spans) => inline_text(spans),
+                Node::Heading { text, .. } => inline_text(text),
+                other => panic!("Expected {input:?} to start with a text node, got {other:?}"),
+            };
+            assert_eq!(text, expected, "input: {input:?}");
+        }
+
+        // Semantic heading labels exclude HTML tags.
+        let doc = Cmark::new().parse("# Title <b>with tag</b>\n");
+        assert_eq!(doc.headings[0].text, "Title with tag");
     }
 
     #[test]
