@@ -1,3 +1,24 @@
+## [0.2.2] - 2026-08-09
+
+### 🚀 Features
+
+- Render markdown images in the TUI preview via ratatui-image
+- Render raw HTML in the Markdown preview
+- Add rules under H1 and H2 headings
+
+### 🚜 Refactor
+
+- Consolidate TUI modes into unified overlay state
+- Extract workflow state into dedicated TUI module
+- Introduce inline PTY sizing and unified preview search
+- Unify menu and preview into a single Content component
+- Move help keymap collection into the help module
+- Extract overlay handling into a dedicated module
+- Redesign component effects
+
+### 🎨 Styling
+
+- Simplify overlay effects
 ## [0.2.1] - 2026-08-02
 
 ### 🚀 Features
@@ -11,6 +32,7 @@
 ### ⚙️ Miscellaneous Tasks
 
 - *(release)* Prepare 0.2.1 with cargo-release automation
+- *(release)* Bump version to 0.2.1
 ## [0.1.1] - 2026-07-25
 
 ### 🚀 Features
