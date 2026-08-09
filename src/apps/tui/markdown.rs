@@ -12,6 +12,7 @@
 
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use unicode_width::UnicodeWidthChar;
@@ -78,6 +79,56 @@ impl Default for LazyText {
             spans: Vec::new(),
             cached: std::cell::RefCell::new(None),
         }
+    }
+}
+
+#[derive(Debug)]
+pub struct MarkdownHtml {
+    source: String,
+    lines: Vec<String>,
+    cached: RefCell<Option<Text<'static>>>,
+}
+
+impl MarkdownHtml {
+    fn new(source: String) -> Self {
+        let lines = source.lines().map(str::to_owned).collect();
+        Self {
+            source,
+            lines,
+            cached: RefCell::new(None),
+        }
+    }
+
+    pub(crate) fn source(&self) -> &str {
+        &self.source
+    }
+
+    fn len(&self) -> usize {
+        self.lines.len()
+    }
+
+    fn raw_line(&self, row_idx: usize) -> &str {
+        self.lines.get(row_idx).map_or("", String::as_str)
+    }
+
+    fn line(&self, row_idx: usize, theme: &Theme) -> Line<'static> {
+        let mut cached = self.cached.borrow_mut();
+        if cached.is_none() {
+            let mut rendered = theme.highlight(&self.source, "html");
+            for line in &mut rendered.lines {
+                *line = expand_tabs_in_line(std::mem::take(line));
+            }
+            *cached = Some(rendered);
+        }
+        cached
+            .as_ref()
+            .and_then(|text| text.lines.get(row_idx))
+            .cloned()
+            .unwrap_or_else(|| expand_tabs_in_line(Line::raw(self.raw_line(row_idx).to_owned())))
+    }
+
+    fn clear_cache(&self) {
+        *self.cached.borrow_mut() = None;
     }
 }
 
@@ -150,6 +201,11 @@ pub enum LogicalLineSource {
     CodeInfo(CodeInfoLine),
     CodeBody(LazyText),
     Output(Text<'static>),
+    /// One row of a raw HTML block highlighted and cached as a complete block.
+    Html {
+        block: Rc<MarkdownHtml>,
+        row_idx: usize,
+    },
     TableRow {
         /// Raw table data and responsive render cache shared by every row.
         table: Rc<MarkdownTable>,
@@ -300,6 +356,15 @@ impl LogicalLine {
         }
     }
 
+    /// Creates one row of a raw HTML block.
+    pub fn html(block: Rc<MarkdownHtml>, row_idx: usize, is_block_start: bool) -> Self {
+        Self {
+            source: LogicalLineSource::Html { block, row_idx },
+            is_block_start,
+            ..Self::default()
+        }
+    }
+
     /// Creates a table row or border line.
     pub fn table(table: Rc<MarkdownTable>, row_idx: usize, initial: Line<'static>) -> Self {
         Self {
@@ -333,10 +398,26 @@ impl LogicalLine {
         self.source.lazy_text()
     }
 
+    pub fn html_block(&self) -> Option<&Rc<MarkdownHtml>> {
+        match &self.source {
+            LogicalLineSource::Html { block, .. } => Some(block),
+            _ => None,
+        }
+    }
+
+    pub fn reuse_html_block(&mut self, cached: &Rc<MarkdownHtml>) {
+        if let LogicalLineSource::Html { block, .. } = &mut self.source {
+            if block.source() == cached.source() {
+                *block = Rc::clone(cached);
+            }
+        }
+    }
+
     /// Clears cached content so the next render uses the current theme.
     pub fn clear_cache(&self) {
         match &self.source {
             LogicalLineSource::TableRow { table, .. } => table.clear_cache(),
+            LogicalLineSource::Html { block, .. } => block.clear_cache(),
             _ => {
                 if let Some(text) = self.lazy_text() {
                     *text.cached.borrow_mut() = None;
@@ -421,6 +502,7 @@ impl LogicalLine {
                 format!("{left} {}", info.right.trim_end())
             }
             LogicalLineSource::Output(text) => text.to_string(),
+            LogicalLineSource::Html { block, row_idx } => block.raw_line(*row_idx).to_owned(),
             LogicalLineSource::TableRow { initial, .. } => initial.to_string(),
             LogicalLineSource::Image { alt, .. } => alt.clone(),
             LogicalLineSource::ThematicBreak | LogicalLineSource::Newline => String::new(),
@@ -538,10 +620,15 @@ impl LogicalLine {
 
     /// Renders text-identical content without syntax highlighting.
     fn render_plain_content(&self, ctx: &RenderContext<'_>) -> Line<'static> {
-        if let Some(text) = self.lazy_text() {
-            expand_tabs_in_line(Line::raw(text.text.clone()))
-        } else {
-            self.render_content(ctx)
+        match &self.source {
+            LogicalLineSource::Html { block, row_idx } => {
+                expand_tabs_in_line(Line::raw(block.raw_line(*row_idx).to_owned()))
+            }
+            _ if self.lazy_text().is_some() => {
+                let text = self.lazy_text().expect("checked lazy text");
+                expand_tabs_in_line(Line::raw(text.text.clone()))
+            }
+            _ => self.render_content(ctx),
         }
     }
 
@@ -553,7 +640,7 @@ impl LogicalLine {
             | LogicalLineSource::CodeBody(text)
             | LogicalLineSource::Heading { text, .. } => {
                 let mut cache = text.cached.borrow_mut();
-                if let Some(ref hit) = *cache {
+                if let Some(hit) = &*cache {
                     return hit
                         .lines
                         .first()
@@ -587,6 +674,7 @@ impl LogicalLine {
                 *cache = Some(rendered);
                 line
             }
+            LogicalLineSource::Html { block, row_idx } => block.line(*row_idx, ctx.theme),
             LogicalLineSource::CodeInfo(info) => {
                 let prefix_width = self.prefix_width();
                 let wrap_width = ctx
@@ -957,6 +1045,17 @@ impl<'a> MarkdownRenderer<'a> {
     ) {
         use upmd_parser::nodes::Node;
         match node {
+            Node::HtmlBlock(html) => {
+                let block = Rc::new(MarkdownHtml::new(html.clone()));
+                for row_idx in 0..block.len() {
+                    self.push_line(
+                        lines,
+                        LogicalLine::html(Rc::clone(&block), row_idx, row_idx == 0),
+                        state.quote_depth,
+                    );
+                }
+                self.push_line(lines, LogicalLine::newline(None, false), state.quote_depth);
+            }
             Node::Text(t) => {
                 self.push_highlighted_lines(t, lines, true, state.quote_depth);
             }
@@ -1423,7 +1522,7 @@ fn split_span_lines(spans: &[InlineSpan]) -> Vec<Vec<InlineSpan>> {
 fn render_inline_spans(spans: &[InlineSpan], base_style: Style, theme: &Theme) -> Line<'static> {
     let rendered = spans
         .iter()
-        .map(|span| render_inline_span(span, base_style, theme))
+        .flat_map(|span| render_inline_span(span, base_style, theme))
         .collect::<Vec<_>>();
     Line::from(rendered).style(base_style)
 }
@@ -1434,7 +1533,7 @@ fn render_heading_spans(spans: &[InlineSpan], theme: &Theme) -> Line<'static> {
     let rendered = spans
         .iter()
         .enumerate()
-        .map(|(index, span)| {
+        .flat_map(|(index, span)| {
             let base_style = if index == 0 && span.text.starts_with('#') {
                 theme.markdown_heading_marker_style()
             } else {
@@ -1446,11 +1545,28 @@ fn render_heading_spans(spans: &[InlineSpan], theme: &Theme) -> Line<'static> {
     Line::from(rendered).style(heading_style)
 }
 
-fn render_inline_span(span: &InlineSpan, base_style: Style, theme: &Theme) -> Span<'static> {
+fn render_inline_span(span: &InlineSpan, base_style: Style, theme: &Theme) -> Vec<Span<'static>> {
+    if span.style.iter().any(|s| matches!(s, InlineStyle::HtmlTag)) {
+        return render_html_tag(span, base_style, theme);
+    }
     let style = span.style.iter().fold(base_style, |style, inline| {
         style.patch(inline_style(theme, inline))
     });
-    Span::styled(span.text.clone(), style)
+    vec![Span::styled(span.text.clone(), style)]
+}
+
+/// Highlights an inline HTML tag with the HTML syntax.
+fn render_html_tag(span: &InlineSpan, base_style: Style, theme: &Theme) -> Vec<Span<'static>> {
+    let rendered = theme.highlight(&span.text, "html");
+    let mut spans: Vec<Span<'static>> = rendered
+        .lines
+        .into_iter()
+        .flat_map(|line| line.spans)
+        .collect();
+    if spans.is_empty() {
+        spans.push(Span::styled(span.text.clone(), base_style));
+    }
+    spans
 }
 
 /// Maps an [`InlineStyle`] to the ratatui [`Style`] patched onto a semantic
@@ -1463,6 +1579,7 @@ fn inline_style(theme: &Theme, style: &InlineStyle) -> Style {
         InlineStyle::InlineCode => theme.inline_code_style(),
         InlineStyle::Link { .. } => theme.link_style(),
         InlineStyle::Image { .. } => theme.image_style(),
+        InlineStyle::HtmlTag => Style::default(),
     }
 }
 
@@ -1476,11 +1593,25 @@ mod tests {
     use std::collections::HashMap;
     use upmd_parser::Parser;
 
+    fn test_theme() -> Theme {
+        Theme::new("base16-ocean.dark", false)
+    }
+
+    fn test_ctx(theme: &Theme, width: usize) -> RenderContext<'_> {
+        RenderContext {
+            theme,
+            active_code_id: None,
+            prefer_status_gutter: None,
+            spinner_char: ' ',
+            viewport_width: width,
+        }
+    }
+
     fn render_markdown(markdown: &str) -> RenderedMarkdown {
         let doc = upmd_parser::new().parse(markdown);
         let nodes = &doc.nodes;
         let codes = &doc.codes;
-        let theme = Theme::new("base16-ocean.dark", false);
+        let theme = test_theme();
         let outputs = HashMap::new();
         let renderer = MarkdownRenderer::new(&theme, &outputs, codes, 10, 80);
         renderer.render(nodes)
@@ -1493,7 +1624,7 @@ mod tests {
         let doc = upmd_parser::new().parse(markdown);
         let nodes = &doc.nodes;
         let codes = &doc.codes;
-        let theme = Theme::new("base16-ocean.dark", false);
+        let theme = test_theme();
         let rendered = {
             let renderer = MarkdownRenderer::new(&theme, outputs, codes, 10, 80);
             renderer.render(nodes)
@@ -1513,6 +1644,7 @@ mod tests {
             LogicalLineSource::CodeInfo(_) => "CodeInfo".to_string(),
             LogicalLineSource::CodeBody(_) => "CodeBody".to_string(),
             LogicalLineSource::Output(_) => "Output".to_string(),
+            LogicalLineSource::Html { .. } => "Html".to_string(),
             LogicalLineSource::TableRow { .. } => "Table".to_string(),
             LogicalLineSource::Image { .. } => "Image".to_string(),
             LogicalLineSource::ThematicBreak => "ThematicBreak".to_string(),
@@ -1633,14 +1765,8 @@ mod tests {
 
     #[test]
     fn test_blockquote_list_item_renders_quote_and_list_prefixes() {
-        let theme = Theme::new("base16-ocean.dark", false);
-        let ctx = RenderContext {
-            theme: &theme,
-            active_code_id: None,
-            prefer_status_gutter: None,
-            spinner_char: ' ',
-            viewport_width: 80,
-        };
+        let theme = test_theme();
+        let ctx = test_ctx(&theme, 80);
         let lines = render_nodes("> - quoted item");
         let list_item = lines
             .iter()
@@ -1653,7 +1779,7 @@ mod tests {
 
     #[test]
     fn test_apply_gutter_prefers_active_color_without_prefer_status_gutter() {
-        let theme = Theme::new("base16-ocean.dark", false);
+        let theme = test_theme();
         let mut line = Line::from("done");
 
         apply_gutter(
@@ -1674,7 +1800,7 @@ mod tests {
 
     #[test]
     fn test_apply_gutter_prefers_status_color_with_prefer_status_gutter() {
-        let theme = Theme::new("base16-ocean.dark", false);
+        let theme = test_theme();
         let mut line = Line::from("done");
 
         apply_gutter(
@@ -1779,15 +1905,65 @@ mod tests {
     }
 
     #[test]
+    fn test_render_html_tabs_preserved_logically_expanded_visually() {
+        let lines = render_nodes("<pre>\n\tindented\n</pre>\n");
+        let html: Vec<&LogicalLine> = lines
+            .iter()
+            .filter(|l| matches!(l.source, LogicalLineSource::Html { .. }))
+            .collect();
+        assert_eq!(html.len(), 3);
+        assert_eq!(html[1].text_content(), "\tindented");
+
+        let theme = test_theme();
+        let ctx = test_ctx(&theme, 80);
+        let painted = html[1].render(&ctx).to_string();
+        assert!(!painted.contains('\t'));
+        assert!(painted.contains("    indented"));
+        assert_eq!(html[1].render_plain(&ctx).to_string(), painted);
+    }
+
+    #[test]
+    fn test_render_html_styles() {
+        let theme = test_theme();
+        let ctx = test_ctx(&theme, 80);
+
+        for (name, line) in [
+            (
+                "block",
+                render_nodes("<div class=\"card\">\n</div>\n")
+                    .iter()
+                    .find(|l| matches!(l.source, LogicalLineSource::Html { .. }))
+                    .unwrap()
+                    .render(&ctx),
+            ),
+            (
+                "inline",
+                render_nodes("x <img src=\"a.png\"> y")
+                    .iter()
+                    .find(|l| matches!(l.source, LogicalLineSource::Text(_)))
+                    .unwrap()
+                    .render(&ctx),
+            ),
+        ] {
+            let mut distinct: Vec<Color> = Vec::new();
+            for span in &line.spans {
+                if let Some(fg) = span.style.fg {
+                    if !distinct.contains(&fg) {
+                        distinct.push(fg);
+                    }
+                }
+            }
+            assert!(
+                distinct.len() >= 2,
+                "{name} HTML should use multiple syntax colors, got {distinct:?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_render_inline_heading_styles() {
-        let theme = Theme::new("base16-ocean.dark", false);
-        let ctx = RenderContext {
-            theme: &theme,
-            active_code_id: None,
-            prefer_status_gutter: None,
-            spinner_char: ' ',
-            viewport_width: 80,
-        };
+        let theme = test_theme();
+        let ctx = test_ctx(&theme, 80);
         let lines = render_nodes("# **Bold** title");
         let heading = lines
             .iter()
@@ -1800,14 +1976,8 @@ mod tests {
 
     #[test]
     fn test_render_inline_list_item_styles() {
-        let theme = Theme::new("base16-ocean.dark", false);
-        let ctx = RenderContext {
-            theme: &theme,
-            active_code_id: None,
-            prefer_status_gutter: None,
-            spinner_char: ' ',
-            viewport_width: 80,
-        };
+        let theme = test_theme();
+        let ctx = test_ctx(&theme, 80);
         let lines = render_nodes("- **bold item**");
         let item = lines
             .iter()
@@ -1871,14 +2041,8 @@ mod tests {
 
     #[test]
     fn test_render_table_inline_styles() {
-        let theme = Theme::new("base16-ocean.dark", false);
-        let ctx = RenderContext {
-            theme: &theme,
-            active_code_id: None,
-            prefer_status_gutter: None,
-            spinner_char: ' ',
-            viewport_width: 80,
-        };
+        let theme = test_theme();
+        let ctx = test_ctx(&theme, 80);
         let lines = render_nodes(
             "| Name | Reference |\n\
              |------|-----------|\n\
@@ -1967,14 +2131,8 @@ pytest tests/
             "\tos.Setenv(\"FROM_GO\", \"set by go\")"
         );
 
-        let theme = Theme::new("base16-ocean.dark", false);
-        let ctx = RenderContext {
-            theme: &theme,
-            active_code_id: None,
-            prefer_status_gutter: None,
-            spinner_char: ' ',
-            viewport_width: 80,
-        };
+        let theme = test_theme();
+        let ctx = test_ctx(&theme, 80);
         let import_line = code_bodies[1].render(&ctx).to_string();
         let call_line = code_bodies[2].render(&ctx).to_string();
 
@@ -2030,17 +2188,11 @@ pytest tests/
     #[test]
     fn test_render_table_narrow() {
         let doc = upmd_parser::new().parse("| Name | Age | City |\n|------|-----|------|\n| Alice | 30 | New York |\n| Bob | 25 | London |");
-        let theme = Theme::new("base16-ocean.dark", false);
+        let theme = test_theme();
+        let ctx = test_ctx(&theme, 25);
         let outputs = HashMap::new();
         let renderer = MarkdownRenderer::new(&theme, &outputs, &doc.codes, 10, 25);
         let lines = renderer.render(&doc.nodes).lines;
-        let ctx = RenderContext {
-            theme: &theme,
-            active_code_id: None,
-            prefer_status_gutter: None,
-            spinner_char: ' ',
-            viewport_width: 25,
-        };
         let summary: Vec<String> = lines
             .iter()
             .filter(|l| l.is_table())
@@ -2052,17 +2204,11 @@ pytest tests/
     #[test]
     fn test_render_table_wide() {
         let doc = upmd_parser::new().parse("| Name | Age | City |\n|------|-----|------|\n| Alice | 30 | New York |\n| Bob | 25 | London |");
-        let theme = Theme::new("base16-ocean.dark", false);
+        let theme = test_theme();
+        let ctx = test_ctx(&theme, 80);
         let outputs = HashMap::new();
         let renderer = MarkdownRenderer::new(&theme, &outputs, &doc.codes, 10, 80);
         let lines = renderer.render(&doc.nodes).lines;
-        let ctx = RenderContext {
-            theme: &theme,
-            active_code_id: None,
-            prefer_status_gutter: None,
-            spinner_char: ' ',
-            viewport_width: 80,
-        };
         let summary: Vec<String> = lines
             .iter()
             .filter(|l| l.is_table())
@@ -2090,7 +2236,7 @@ pytest tests/
         inline_max_lines: usize,
     ) -> String {
         let doc = upmd_parser::new().parse(markdown);
-        let theme = Theme::new("base16-ocean.dark", false);
+        let theme = test_theme();
         let renderer = MarkdownRenderer::new(&theme, outputs, &doc.codes, inline_max_lines, 80);
         let lines = renderer.render(&doc.nodes).lines;
         logical_line_summary(&lines)
@@ -2166,14 +2312,8 @@ pytest tests/
 
     #[test]
     fn render_plain_does_not_populate_content_cache() {
-        let theme = Theme::new("base16-ocean.dark", false);
-        let ctx = RenderContext {
-            theme: &theme,
-            active_code_id: None,
-            prefer_status_gutter: None,
-            spinner_char: ' ',
-            viewport_width: 80,
-        };
+        let theme = test_theme();
+        let ctx = test_ctx(&theme, 80);
         let line = LogicalLine::text_lazy_spans(
             vec![InlineSpan {
                 text: "let value = 1;".into(),
@@ -2195,7 +2335,7 @@ pytest tests/
 
     #[test]
     fn running_code_body_does_not_append_spinner() {
-        let theme = Theme::new("base16-ocean.dark", false);
+        let theme = test_theme();
         let ctx = RenderContext {
             theme: &theme,
             active_code_id: Some(1),

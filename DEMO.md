@@ -39,6 +39,23 @@ A standalone image renders in the preview pane:
 | Emphasis | **bold**, *italic*, and ***both*** |
 | Other | ~~strikethrough~~, `inline code`, and [link](https://upmd.rezigned.com/) |
 
+### Raw HTML
+
+Inline tags render with HTML syntax highlighting and keep their source text:
+a <b>bold</b> tag, an <em>emphasis</em> tag, a <br/> self-closing tag, and a
+<!-- comment -->.
+
+A complete HTML block is shown verbatim, line by line:
+
+<div class="card">
+  <h3>Example card</h3>
+  <p>HTML blocks keep their attributes and line breaks.</p>
+  <ul>
+    <li>first item</li>
+    <li>second item</li>
+  </ul>
+</div>
+
 ## Streamed output
 
 Output appears inline while the block runs. The preview follows new rows only when they extend below the viewport.
