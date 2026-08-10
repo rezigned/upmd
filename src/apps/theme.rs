@@ -485,38 +485,23 @@ fn syntect_style_to_ratatui(style: syn::Style) -> Style {
     out
 }
 
-/// Resolves ordinary text, heading markers, and heading text with one Syntect
-/// highlighter so all Markdown base styles come from the same parser pass.
+/// Resolves Markdown styles directly from the theme's scope rules.
 fn syntect_markdown_styles(theme: &syn::Theme) -> Option<MarkdownStyles> {
-    const HEADING: &str = "upmd-heading";
-    const PARAGRAPH: &str = "upmd-paragraph";
+    const HEADING: &str = "text.html.markdown markup.heading.markdown markup.heading.1.markdown entity.name.section.markdown";
+    const HEADING_MARKER: &str = "text.html.markdown markup.heading.markdown markup.heading.1.markdown punctuation.definition.heading.markdown";
 
-    let source = format!("# {HEADING}\n{PARAGRAPH}\n");
-    let syntax = find_syntax_or_default("markdown", &source);
-    let mut highlighter = HighlightLines::new(syntax, theme);
-
-    let mut heading_marker = None;
-    let mut heading = None;
-    let mut text = None;
-
-    for line in LinesWithEndings::from(&source) {
-        for (style, value) in highlighter.highlight_line(line, &SYNTAX).ok()? {
-            if value.contains('#') {
-                heading_marker = Some(syntect_style_to_ratatui(style));
-            }
-            if value.contains(HEADING) {
-                heading = Some(syntect_style_to_ratatui(style));
-            }
-            if value.contains(PARAGRAPH) {
-                text = Some(syntect_style_to_ratatui(style));
-            }
-        }
-    }
+    let highlighter = syn::Highlighter::new(theme);
+    let style = |scope: &str| {
+        let stack = ScopeStack::from_str(scope).ok()?;
+        Some(syntect_style_to_ratatui(
+            highlighter.style_for_stack(stack.as_slice()),
+        ))
+    };
 
     Some(MarkdownStyles {
-        text: text?,
-        heading_marker: heading_marker?,
-        heading: heading?,
+        text: syntect_style_to_ratatui(highlighter.get_default()),
+        heading_marker: style(HEADING_MARKER)?,
+        heading: style(HEADING)?,
     })
 }
 
