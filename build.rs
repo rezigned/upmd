@@ -30,16 +30,6 @@ pub fn bundled_theme_entries() -> &'static [(&'static str, &'static str)] {{
 {}
     ]
 }}
-
-#[cfg(test)]
-pub fn load_default_themes(set: &mut syntect::highlighting::ThemeSet) {{
-    for (name, content) in bundled_theme_entries() {{
-        let mut cursor = std::io::Cursor::new(content.as_bytes());
-        if let Ok(theme) = syntect::highlighting::ThemeSet::load_from_reader(&mut cursor) {{
-            set.themes.insert(name.to_string(), theme);
-        }}
-    }}
-}}
 "#,
         entries.join("\n")
     );

@@ -59,13 +59,6 @@ fn theme(name: &str) -> Arc<syn::Theme> {
         .unwrap_or_default()
 }
 
-#[cfg(test)]
-static THEMES: LazyLock<ThemeSet> = LazyLock::new(|| {
-    let mut set = ThemeSet::load_defaults();
-    load_default_themes(&mut set);
-    set
-});
-
 /// Brand accent for the "up" portion of the logo #00B8D4.
 pub const LOGO_ACCENT: Color = Color::Rgb(0x00, 0xB8, 0xD4);
 
@@ -718,13 +711,8 @@ fn calculate_info_background(base: Option<&Color>) -> Color {
 
 #[cfg(test)]
 mod tests {
-    use syntect::{
-        highlighting::{FontStyle, Style},
-        util::as_24_bit_terminal_escaped,
-    };
 
-    use super::{find_syntax_or_default, THEMES};
-    const RESET_ANSI: &str = "\u{1b}[m";
+    use super::find_syntax_or_default;
 
     #[test]
     fn test_theme_loading() {

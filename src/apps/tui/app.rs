@@ -23,9 +23,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
     Frame,
 };
-use std::{
-    cell::RefCell, collections::HashMap, path::PathBuf, process::ExitCode, thread, time::Duration,
-};
+use std::{cell::RefCell, collections::HashMap, path::PathBuf, process::ExitCode, time::Duration};
 use upmd_parser::{CodeId, Parser};
 use upmd_runtime::Effect;
 use upmd_runtime::{
@@ -631,16 +629,6 @@ impl Component for App {
     type Action = Msg;
     type Outcome = upmd_runtime::NoOutcome;
 
-    fn create(&mut self) -> Option<Cmd<Msg>> {
-        let tick_rate = self.config.tick_rate;
-        Some(Cmd::stream(move |tx| loop {
-            thread::sleep(Duration::from_millis(tick_rate));
-            if tx.send(Msg::Tick).is_err() {
-                break;
-            }
-        }))
-    }
-
     fn update(&mut self, msg: Msg) -> Option<Effect<Self::Action, Self::Outcome>> {
         let command = match msg {
             Msg::Event(event) => self.handle_event(event),
@@ -1091,6 +1079,14 @@ impl Input for App {
         } else {
             Some(Msg::Event(event))
         }
+    }
+
+    fn tick_rate(&self) -> Option<Duration> {
+        Some(Duration::from_millis(self.config.tick_rate))
+    }
+
+    fn tick_action(&self) -> Option<Msg> {
+        Some(Msg::Tick)
     }
 }
 
