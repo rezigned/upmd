@@ -173,9 +173,10 @@ impl<C: Component<Outcome = NoOutcome> + Input + Output> crate::Runtime<C> for R
         }
 
         let is_tty = self.terminal;
-        let frame_duration = Duration::from_millis(self.config.poll_timeout_ms);
+        let maximum_poll = Duration::from_millis(self.config.poll_timeout_ms);
         while engine.is_running {
-            if is_tty && crossterm::event::poll(frame_duration).unwrap_or(false) {
+            let poll_timeout = engine.poll_timeout(maximum_poll);
+            if is_tty && crossterm::event::poll(poll_timeout).unwrap_or(false) {
                 loop {
                     if let Ok(evt) = crossterm::event::read() {
                         if let Some(msg) = engine.component.action(evt) {
@@ -189,7 +190,7 @@ impl<C: Component<Outcome = NoOutcome> + Input + Output> crate::Runtime<C> for R
                 }
             } else if !is_tty {
                 // Non-terminal stdout has no keyboard event source to poll.
-                std::thread::sleep(frame_duration);
+                std::thread::sleep(poll_timeout);
             }
             // Process queued messages and background commands
             engine.tick();

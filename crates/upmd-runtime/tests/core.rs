@@ -156,6 +156,9 @@ fn spawn_cmd_for_test<Msg: Send + 'static>(cmd: Cmd<Msg>, tx: flume::Sender<Msg>
         Cmd::Quit => unreachable!(),
         Cmd::Stream(run) => run(tx),
         Cmd::PriorityStream(run) => run(tx.clone(), tx),
+        Cmd::After(_, msg) => {
+            tx.send(msg).ok();
+        }
         Cmd::Task(run) => run(),
         Cmd::Batch(cmds) => {
             for cmd in cmds {

@@ -4,7 +4,7 @@
 //! full-screen rendering and mouse support.
 
 use std::io::{self, Stdout};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use ratatui::{backend::CrosstermBackend, Terminal};
 
@@ -72,38 +72,6 @@ impl Config {
     pub fn poll(mut self, ms: u64) -> Self {
         self.poll_timeout_ms = ms;
         self
-    }
-}
-#[derive(Debug, Clone, Copy)]
-struct Ticker {
-    interval: Duration,
-    next: Instant,
-}
-
-impl Ticker {
-    fn new(interval: Duration, now: Instant) -> Self {
-        Self {
-            interval,
-            next: now + interval,
-        }
-    }
-
-    fn poll_timeout(self, maximum: Duration, now: Instant) -> Duration {
-        maximum.min(self.next.saturating_duration_since(now))
-    }
-
-    fn take_due(&mut self, now: Instant) -> bool {
-        if now < self.next {
-            return false;
-        }
-
-        let next = self.next + self.interval;
-        self.next = if next > now {
-            next
-        } else {
-            now + self.interval
-        };
-        true
     }
 }
 
@@ -201,15 +169,9 @@ impl<C: Component<Outcome = NoOutcome> + Input + Output> crate::Runtime<C> for R
         self.terminal =
             Some(Terminal::new(CrosstermBackend::new(io::stdout())).map_err(io::Error::other)?);
         let maximum_poll = Duration::from_millis(self.config.poll_timeout_ms);
-        let mut ticker = engine
-            .component
-            .tick_rate()
-            .map(|interval| Ticker::new(interval, Instant::now()));
 
         while engine.is_running {
-            let poll_timeout = ticker
-                .map(|ticker| ticker.poll_timeout(maximum_poll, Instant::now()))
-                .unwrap_or(maximum_poll);
+            let poll_timeout = engine.poll_timeout(maximum_poll);
             if crossterm::event::poll(poll_timeout).unwrap_or(false) {
                 loop {
                     if let Ok(event) = crossterm::event::read() {
@@ -222,14 +184,6 @@ impl<C: Component<Outcome = NoOutcome> + Input + Output> crate::Runtime<C> for R
                     if !crossterm::event::poll(Duration::ZERO).unwrap_or(false) {
                         break;
                     }
-                }
-            }
-            if ticker
-                .as_mut()
-                .is_some_and(|ticker| ticker.take_due(Instant::now()))
-            {
-                if let Some(action) = engine.component.tick_action() {
-                    engine.send_msg(action).ok();
                 }
             }
 
@@ -254,16 +208,6 @@ impl<C: Component<Outcome = NoOutcome> + Input + Output> crate::Runtime<C> for R
 /// Trait for handling TUI input events.
 pub trait Input: Component {
     fn action(&self, event: crossterm::event::Event) -> Option<Self::Action>;
-
-    /// Returns the interval for periodic actions.
-    fn tick_rate(&self) -> Option<Duration> {
-        None
-    }
-
-    /// Creates the action emitted at each interval.
-    fn tick_action(&self) -> Option<Self::Action> {
-        None
-    }
 }
 
 /// Trait for rendering the component to a ratatui frame.
@@ -278,32 +222,4 @@ pub fn run<C: Component<Outcome = NoOutcome> + Input + Output>(component: C) -> 
     let engine = Engine::new(component);
     R::run(Runtime::new(), engine)?;
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn ticker_limits_polling_and_coalesces_missed_intervals() {
-        let start = Instant::now();
-        let interval = Duration::from_millis(50);
-        let mut ticker = Ticker::new(interval, start);
-
-        assert_eq!(
-            ticker.poll_timeout(Duration::from_millis(16), start),
-            Duration::from_millis(16)
-        );
-        assert_eq!(
-            ticker.poll_timeout(Duration::from_millis(16), start + Duration::from_millis(40)),
-            Duration::from_millis(10)
-        );
-        assert!(!ticker.take_due(start + Duration::from_millis(49)));
-        assert!(ticker.take_due(start + interval));
-        assert_eq!(ticker.poll_timeout(interval, start + interval), interval);
-
-        let late = start + Duration::from_millis(500);
-        assert!(ticker.take_due(late));
-        assert_eq!(ticker.poll_timeout(interval, late), interval);
-    }
 }

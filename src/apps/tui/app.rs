@@ -628,6 +628,12 @@ impl crate::RunApp for App {
 impl Component for App {
     type Action = Msg;
     type Outcome = upmd_runtime::NoOutcome;
+    fn create(&mut self) -> Option<Cmd<Msg>> {
+        Some(Cmd::after(
+            Duration::from_millis(self.config.tick_rate),
+            Msg::Tick,
+        ))
+    }
 
     fn update(&mut self, msg: Msg) -> Option<Effect<Self::Action, Self::Outcome>> {
         let command = match msg {
@@ -643,7 +649,13 @@ impl Component for App {
                 self.notification = Some(flash);
                 None
             }
-            Msg::Tick => self.handle_tick(),
+            Msg::Tick => {
+                let next_tick = Cmd::after(Duration::from_millis(self.config.tick_rate), Msg::Tick);
+                Some(match self.handle_tick() {
+                    Some(command) => Cmd::Batch(vec![command, next_tick]),
+                    None => next_tick,
+                })
+            }
         };
 
         command.map(Effect::Command)
@@ -1079,14 +1091,6 @@ impl Input for App {
         } else {
             Some(Msg::Event(event))
         }
-    }
-
-    fn tick_rate(&self) -> Option<Duration> {
-        Some(Duration::from_millis(self.config.tick_rate))
-    }
-
-    fn tick_action(&self) -> Option<Msg> {
-        Some(Msg::Tick)
     }
 }
 
