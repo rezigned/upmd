@@ -903,15 +903,16 @@ impl App {
 
     fn handle_event(&mut self, event: crossterm::event::Event) -> Option<Cmd<Msg>> {
         if let crossterm::event::Event::Resize(cols, rows) = event {
-            // Re-compute TUI layout dimensions for the new terminal size
+            // Re-compute layout before rebuilding width-dependent visual lines
+            // and sizing active PTYs.
             let area = Rect::new(0, 0, cols, rows);
             let mut layout = self.layout.borrow_mut();
             layout.update(area, self.menu_width(area.width));
+            let preview_width = layout.preview.width as usize;
             drop(layout);
 
-            // Rebuild visual lines for new width BEFORE PTY sizing.
-            self.content.set_inline_max_lines(rows as usize);
-            self.content.rebuild(self.tasks.buffers());
+            self.content
+                .resize(self.tasks.buffers(), preview_width, rows as usize);
 
             if self.view == View::Output {
                 let size = self.layout.borrow().output_pty_size();

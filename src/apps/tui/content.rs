@@ -213,8 +213,8 @@ impl Content {
         self.preview.inline_max_lines()
     }
 
-    pub fn set_inline_max_lines(&self, height: usize) {
-        self.preview.set_inline_max_lines(height);
+    pub fn resize(&mut self, outputs: &HashMap<CodeId, Task>, width: usize, height: usize) {
+        self.preview.resize(outputs, width, height);
     }
 
     pub fn code_prefix_overhead(&self, id: CodeId) -> usize {

@@ -679,9 +679,7 @@ impl<C: Component<Outcome = NoOutcome>> Engine<C> {
                 let deadline = Instant::now() + delay;
                 let index = self
                     .scheduled
-                    .iter()
-                    .position(|scheduled| scheduled.deadline > deadline)
-                    .unwrap_or(self.scheduled.len());
+                    .partition_point(|scheduled| scheduled.deadline <= deadline);
                 self.scheduled.insert(index, Scheduled { deadline, action });
             }
             Cmd::Task(run) => {
@@ -701,18 +699,16 @@ impl<C: Component<Outcome = NoOutcome>> Engine<C> {
 
     fn deliver_due(&mut self) {
         let now = Instant::now();
-        let count = self
+        while self
             .scheduled
-            .iter()
-            .take_while(|scheduled| scheduled.deadline <= now)
-            .count();
+            .front()
+            .is_some_and(|scheduled| scheduled.deadline <= now)
+        {
+            let scheduled = self.scheduled.pop_front().unwrap();
+            self.update(scheduled.action);
 
-        for _ in 0..count {
-            if let Some(scheduled) = self.scheduled.pop_front() {
-                self.update(scheduled.action);
-                if !self.is_running {
-                    break;
-                }
+            if !self.is_running {
+                break;
             }
         }
     }

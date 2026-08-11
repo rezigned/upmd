@@ -237,7 +237,10 @@ impl Preview {
     /// or when the theme / inline cap changes.
     #[tracing::instrument(level = "info", skip_all, fields(lines))]
     pub fn rebuild_view(&mut self, outputs: &HashMap<CodeId, Task>) {
-        let width = self.visual_lines.last_width();
+        self.rebuild_view_at_width(outputs, self.visual_lines.last_width());
+    }
+
+    fn rebuild_view_at_width(&mut self, outputs: &HashMap<CodeId, Task>, width: usize) {
         let renderer = MarkdownRenderer::new(
             &self.theme,
             outputs,
@@ -290,6 +293,18 @@ impl Preview {
         self.search.rebuild_texts(&self.logical_lines);
 
         if width > 0 {
+            self.rebuild_visual_lines(width);
+        }
+    }
+
+    /// Updates layout-dependent lines while preserving stable logical lines
+    /// when only the viewport width changes.
+    pub fn resize(&mut self, outputs: &HashMap<CodeId, Task>, width: usize, height: usize) {
+        let inline_max_changed = self.set_inline_max_lines(height);
+        self.images.borrow_mut().set_width(self.image_width(width));
+        if inline_max_changed {
+            self.rebuild_view_at_width(outputs, width);
+        } else {
             self.rebuild_visual_lines(width);
         }
     }
@@ -518,10 +533,10 @@ impl Preview {
         self.visual_lines.visual_idx_of_logical(logical_idx)
     }
 
-    pub fn set_inline_max_lines(&self, height: usize) {
+    fn set_inline_max_lines(&self, height: usize) -> bool {
         let max_inline = (height / INLINE_MAX_LINES_FRACTION)
             .clamp(INLINE_MAX_LINES_MIN, self.inline_max_lines_cap);
-        self.inline_max_lines.set(max_inline);
+        self.inline_max_lines.replace(max_inline) != max_inline
     }
 
     pub fn tick(&mut self) {
