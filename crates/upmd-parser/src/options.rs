@@ -7,21 +7,22 @@ fn attrs_regex() -> &'static Regex {
     static RE: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(
             r#"(?x)
-        # Attribute key: ASCII letter followed by word chars and hyphens
-        (?P<ID>[a-zA-Z][\w\-]*)
-        # Colon separator, optional whitespace
-        \s*:\s*
+        # Attribute key: ASCII letter followed by ASCII word chars and hyphens
+        (?P<ID>[a-zA-Z][A-Za-z0-9_-]*)
+        # Colon separator, optional ASCII whitespace
+        # (\x20 instead of a literal space: (?x) ignores spaces in char classes)
+        [\x20\t]*:[\x20\t]*
         # Value: quoted (backslash escapes supported) or unquoted
         (?:
             # Quoted: double-quoted string allowing \" and \\ escapes
             "(?P<VALUE_QUOTED>[^"\\]*(?:\\.[^"\\]*)*)"
             |
-            # Unquoted: word chars, -, +, #, /, ., ~
+            # Unquoted: ASCII word chars, -, +, #, /, ., ~
             # so paths like /usr/bin/zsh work without quotes
-            (?P<VALUE_UNQUOTED>[\w+\#/\.\-~]+)
+            (?P<VALUE_UNQUOTED>[A-Za-z0-9_+\#/.~-]+)
         )
-        # Optional separator: comma with optional whitespace
-        \s*(?:,\s*)?"#,
+        # Optional separator: comma with optional ASCII whitespace
+        [\x20\t]*(?:,[\x20\t]*)?"#,
         )
         .unwrap()
     });
