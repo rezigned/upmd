@@ -19,6 +19,10 @@ pub struct Args {
     #[arg(long, default_value_t = false)]
     pub cli: bool,
 
+    /// Run non-interactively in CI (alias for `--cli --yes`).
+    #[arg(long, default_value_t = false)]
+    pub ci: bool,
+
     /// Working directory for code execution (default: current directory).
     #[arg(short = 'd', long, value_name = "DIR")]
     pub working_dir: Option<String>,
@@ -64,7 +68,17 @@ struct TuiArgs {
 
 /// Parses command line arguments and returns the result.
 pub fn parse() -> Result<Args, clap::Error> {
-    Ok(Args::parse())
+    Ok(Args::parse().resolve_aliases())
+}
+
+impl Args {
+    fn resolve_aliases(mut self) -> Self {
+        if self.ci {
+            self.cli = true;
+            self.yes = true;
+        }
+        self
+    }
 }
 
 impl From<Args> for Config {
@@ -103,4 +117,34 @@ pub fn build_config(args: Args, user_cfg: UserConfig) -> Config {
         binaries: user_cfg.binaries.unwrap_or_default(),
         working_dir,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    fn parse(args: &[&str]) -> Args {
+        Args::try_parse_from(args).unwrap().resolve_aliases()
+    }
+
+    #[test]
+    fn ci_flag_implies_cli_and_yes() {
+        for (argv, file, cli, yes) in [
+            (
+                &["upmd", "--ci", "README.md"][..],
+                Some("README.md"),
+                true,
+                true,
+            ),
+            (&["upmd", "--ci", "--all"][..], None, true, true),
+            (&["upmd", "--cli", "--yes"][..], None, true, true),
+            (&["upmd"][..], None, false, false),
+        ] {
+            let args = parse(argv);
+            assert_eq!(args.cli, cli, "{argv:?}");
+            assert_eq!(args.yes, yes, "{argv:?}");
+            assert_eq!(args.file.as_deref(), file, "{argv:?}");
+        }
+    }
 }
