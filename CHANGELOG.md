@@ -1,3 +1,23 @@
+## [0.2.3] - 2026-08-11
+
+### 🚀 Features
+
+- *(runtime)* Schedule delayed actions via Cmd::after
+- *(cli)* Add --ci alias for --cli --yes
+
+### 🐛 Bug Fixes
+
+- *(parser)* Match spaces around colons with ASCII attr regex
+
+### 🚜 Refactor
+
+- *(theme)* Resolve markdown styles from scope rules directly
+
+### ⚡ Performance
+
+- *(theme)* Load bundled themes lazily instead of building a ThemeSet at startup
+- *(tui)* Drop tick thread to save thread stack memory
+- *(tui)* Skip full re-render on resize
 ## [0.2.2] - 2026-08-09
 
 ### 🚀 Features
@@ -19,6 +39,10 @@
 ### 🎨 Styling
 
 - Simplify overlay effects
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* Bump version to 0.2.2
 ## [0.2.1] - 2026-08-02
 
 ### 🚀 Features
