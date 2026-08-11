@@ -60,8 +60,8 @@ upmd README.md
 # Run one named task and its dependencies
 upmd DEMO.md --block lint --yes
 
-# Run every task without prompts
-upmd --cli --all --yes README.md
+# Run all tasks non-interactively (CI)
+upmd --ci --all README.md
 ```
 
 > [!TIP]
