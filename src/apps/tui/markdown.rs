@@ -1013,7 +1013,7 @@ impl<'a> MarkdownRenderer<'a> {
         let mut lines = Vec::new();
         let mut state = RenderState::default();
         for node in nodes {
-            self.push_node(node, &mut lines, &mut state);
+            self.render_node(node, &mut lines, &mut state);
         }
         RenderedMarkdown {
             lines,
@@ -1047,7 +1047,7 @@ impl<'a> MarkdownRenderer<'a> {
         lines.push(line);
     }
 
-    fn push_node(
+    fn render_node(
         &self,
         node: &upmd_parser::nodes::Node,
         lines: &mut Vec<LogicalLine>,
@@ -1067,10 +1067,11 @@ impl<'a> MarkdownRenderer<'a> {
                 self.push_line(lines, LogicalLine::newline(None, false), state.quote_depth);
             }
             Node::Text(t) => {
-                self.push_highlighted_lines(t, lines, true, state.quote_depth);
+                self.render_highlighted_lines(t, lines, true, state.quote_depth);
             }
             Node::Paragraph(t) => {
-                if let Some(idx) = self.push_highlighted_lines(t, lines, true, state.quote_depth) {
+                if let Some(idx) = self.render_highlighted_lines(t, lines, true, state.quote_depth)
+                {
                     state.snap.description_line = Some(idx);
                 }
             }
@@ -1082,7 +1083,7 @@ impl<'a> MarkdownRenderer<'a> {
                 let parent_snap = std::mem::take(&mut state.snap);
                 state.quote_depth += 1;
                 for child in children {
-                    self.push_node(child, lines, state);
+                    self.render_node(child, lines, state);
                 }
                 state.quote_depth = state.quote_depth.saturating_sub(1);
                 state.snap = parent_snap;
@@ -1111,7 +1112,7 @@ impl<'a> MarkdownRenderer<'a> {
                 }
                 state.snap.title_line = Some(line_idx);
             }
-            Node::List(items) => self.push_list(items, lines, state),
+            Node::List(items) => self.render_list(items, lines, state),
             Node::Code(code_id) => {
                 let code = self
                     .codes
@@ -1145,19 +1146,11 @@ impl<'a> MarkdownRenderer<'a> {
                         TaskStatus::Idle => None,
                     }
                 });
-                let mut info = self.push_code_info(code, !is_start);
+                let mut info = self.render_code_info(code, !is_start);
                 info.gutter_fg = gutter_fg;
                 self.push_line(lines, info, state.quote_depth);
-                for mut line in self.push_code_body(code) {
-                    line.gutter_fg = gutter_fg;
-                    line.is_running = is_running;
-                    self.push_line(lines, line, state.quote_depth);
-                }
-                for mut line in self.push_code_output(code) {
-                    line.gutter_fg = gutter_fg;
-                    line.is_running = is_running;
-                    self.push_line(lines, line, state.quote_depth);
-                }
+                self.render_code_body(code, lines, state.quote_depth, gutter_fg, is_running);
+                self.render_code_output(code, lines, state.quote_depth, gutter_fg, is_running);
                 self.push_line(
                     lines,
                     LogicalLine::newline(Some(code.id), false),
@@ -1202,7 +1195,7 @@ impl<'a> MarkdownRenderer<'a> {
         }
     }
 
-    fn push_highlighted_lines(
+    fn render_highlighted_lines(
         &self,
         spans: &[InlineSpan],
         lines: &mut Vec<LogicalLine>,
@@ -1229,7 +1222,7 @@ impl<'a> MarkdownRenderer<'a> {
         }
     }
 
-    fn push_list(
+    fn render_list(
         &self,
         items: &[upmd_parser::nodes::ListItem],
         lines: &mut Vec<LogicalLine>,
@@ -1265,7 +1258,7 @@ impl<'a> MarkdownRenderer<'a> {
             // Render nested children (code blocks, sub-lists, etc.) in the same
             // quote scope so blockquote chrome applies consistently.
             for child in &item.children {
-                self.push_node(child, lines, state);
+                self.render_node(child, lines, state);
             }
         }
         // Skip trailing newline for nested lists to avoid blank lines between siblings.
@@ -1274,7 +1267,7 @@ impl<'a> MarkdownRenderer<'a> {
         }
     }
 
-    fn push_code_info(&self, code: &Code, is_start: bool) -> LogicalLine {
+    fn render_code_info(&self, code: &Code, is_start: bool) -> LogicalLine {
         let buffer = self.outputs.get(&code.id);
         let is_executed =
             |done: bool| buffer.is_some_and(|b| b.execution.is_some() && b.done == done);
@@ -1320,23 +1313,39 @@ impl<'a> MarkdownRenderer<'a> {
         LogicalLine::code_info(left, right, info_style, code.id, is_start, is_running)
     }
 
-    fn push_code_body(&self, code: &Code) -> Vec<LogicalLine> {
-        code.content
-            .lines()
-            .map(|line| LogicalLine::code_body(line.to_string(), &code.language, code.id))
-            .collect()
+    fn render_code_body(
+        &self,
+        code: &Code,
+        lines: &mut Vec<LogicalLine>,
+        quote_depth: usize,
+        gutter_fg: Option<Color>,
+        is_running: bool,
+    ) {
+        for body_line in code.content.lines() {
+            let mut line = LogicalLine::code_body(body_line.to_string(), &code.language, code.id);
+            line.gutter_fg = gutter_fg;
+            line.is_running = is_running;
+            self.push_line(lines, line, quote_depth);
+        }
     }
 
-    fn push_code_output(&self, code: &Code) -> Vec<LogicalLine> {
+    fn render_code_output(
+        &self,
+        code: &Code,
+        lines: &mut Vec<LogicalLine>,
+        quote_depth: usize,
+        gutter_fg: Option<Color>,
+        is_running: bool,
+    ) {
         let Some(buffer) = self.outputs.get(&code.id) else {
-            return Vec::new();
+            return;
         };
 
         let show_cursor = !buffer.done;
         let is_tui = buffer.parser.is_alternate_screen();
         let styled = buffer.parser.inline_contents(show_cursor);
         if styled.lines.is_empty() {
-            return Vec::new();
+            return;
         }
 
         let total = styled.lines.len();
@@ -1358,11 +1367,9 @@ impl<'a> MarkdownRenderer<'a> {
             let start = end.saturating_sub(self.inline_max_lines);
             (start, end)
         };
-        let visible = &styled.lines[start..end];
 
-        let mut out = Vec::with_capacity(visible.len());
         let bg = self.theme.output_background;
-        for mut line in visible.iter().cloned() {
+        for mut line in styled.lines.into_iter().skip(start).take(end - start) {
             let needs_bg = line.style.bg.is_none() || line.style.bg == Some(Color::Reset);
             if needs_bg {
                 line.style.bg = Some(bg);
@@ -1373,9 +1380,11 @@ impl<'a> MarkdownRenderer<'a> {
                     span.style.bg = Some(bg);
                 }
             }
-            out.push(LogicalLine::output(line, code.id));
+            let mut line = LogicalLine::output(line, code.id);
+            line.gutter_fg = gutter_fg;
+            line.is_running = is_running;
+            self.push_line(lines, line, quote_depth);
         }
-        out
     }
 }
 

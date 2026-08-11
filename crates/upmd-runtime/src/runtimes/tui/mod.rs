@@ -168,11 +168,11 @@ impl<C: Component<Outcome = NoOutcome> + Input + Output> crate::Runtime<C> for R
 
         self.terminal =
             Some(Terminal::new(CrosstermBackend::new(io::stdout())).map_err(io::Error::other)?);
+        let maximum_poll = Duration::from_millis(self.config.poll_timeout_ms);
 
         while engine.is_running {
-            if crossterm::event::poll(Duration::from_millis(self.config.poll_timeout_ms))
-                .unwrap_or(false)
-            {
+            let poll_timeout = engine.poll_timeout(maximum_poll);
+            if crossterm::event::poll(poll_timeout).unwrap_or(false) {
                 loop {
                     if let Ok(event) = crossterm::event::read() {
                         if let Some(msg) = engine.component.action(event) {

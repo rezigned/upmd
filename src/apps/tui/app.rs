@@ -23,9 +23,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
     Frame,
 };
-use std::{
-    cell::RefCell, collections::HashMap, path::PathBuf, process::ExitCode, thread, time::Duration,
-};
+use std::{cell::RefCell, collections::HashMap, path::PathBuf, process::ExitCode, time::Duration};
 use upmd_parser::{CodeId, Parser};
 use upmd_runtime::Effect;
 use upmd_runtime::{
@@ -630,15 +628,11 @@ impl crate::RunApp for App {
 impl Component for App {
     type Action = Msg;
     type Outcome = upmd_runtime::NoOutcome;
-
     fn create(&mut self) -> Option<Cmd<Msg>> {
-        let tick_rate = self.config.tick_rate;
-        Some(Cmd::stream(move |tx| loop {
-            thread::sleep(Duration::from_millis(tick_rate));
-            if tx.send(Msg::Tick).is_err() {
-                break;
-            }
-        }))
+        Some(Cmd::after(
+            Duration::from_millis(self.config.tick_rate),
+            Msg::Tick,
+        ))
     }
 
     fn update(&mut self, msg: Msg) -> Option<Effect<Self::Action, Self::Outcome>> {
@@ -655,7 +649,13 @@ impl Component for App {
                 self.notification = Some(flash);
                 None
             }
-            Msg::Tick => self.handle_tick(),
+            Msg::Tick => {
+                let next_tick = Cmd::after(Duration::from_millis(self.config.tick_rate), Msg::Tick);
+                Some(match self.handle_tick() {
+                    Some(command) => Cmd::Batch(vec![command, next_tick]),
+                    None => next_tick,
+                })
+            }
         };
 
         command.map(Effect::Command)
@@ -903,15 +903,16 @@ impl App {
 
     fn handle_event(&mut self, event: crossterm::event::Event) -> Option<Cmd<Msg>> {
         if let crossterm::event::Event::Resize(cols, rows) = event {
-            // Re-compute TUI layout dimensions for the new terminal size
+            // Re-compute layout before rebuilding width-dependent visual lines
+            // and sizing active PTYs.
             let area = Rect::new(0, 0, cols, rows);
             let mut layout = self.layout.borrow_mut();
             layout.update(area, self.menu_width(area.width));
+            let preview_width = layout.preview.width as usize;
             drop(layout);
 
-            // Rebuild visual lines for new width BEFORE PTY sizing.
-            self.content.set_inline_max_lines(rows as usize);
-            self.content.rebuild(self.tasks.buffers());
+            self.content
+                .resize(self.tasks.buffers(), preview_width, rows as usize);
 
             if self.view == View::Output {
                 let size = self.layout.borrow().output_pty_size();

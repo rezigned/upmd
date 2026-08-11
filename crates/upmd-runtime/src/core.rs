@@ -6,6 +6,7 @@
 pub use flume::Sender;
 use flume::{bounded, unbounded, Receiver, SendError};
 use std::{
+    collections::VecDeque,
     thread,
     time::{Duration, Instant},
 };
@@ -21,6 +22,7 @@ use std::{
 /// - `Cmd::stream(f)` - Spawns a background task that emits many messages
 /// - `Cmd::once(f)`  - Spawns a task that emits exactly one message
 /// - `Cmd::msg(m)`   - Immediately enqueues a message
+/// - `Cmd::after(delay, m)` - Delivers one message after a delay
 /// - `Cmd::quit()`   - Signals the runtime to terminate
 ///
 /// # Example
@@ -43,14 +45,13 @@ use std::{
 /// }
 /// ```
 pub enum Cmd<Msg> {
-    /// Spawns a background task emitting zero, one, or many messages.
+    /// Starts background work that emits zero, one, or many messages.
     Stream(Box<dyn FnOnce(Sender<Msg>) + Send>),
-    /// Spawns a background task with separate low- and high-priority senders.
+    /// Starts background work with separate low- and high-priority senders.
     PriorityStream(Box<dyn FnOnce(Sender<Msg>, Sender<Msg>) + Send>),
-    /// Spawns a fire-and-forget background task.
-    ///
-    /// The task runs on a background thread and does not send any messages
-    /// back to the runtime. Useful for side effects like file I/O.
+    /// Delivers one action after the requested delay.
+    After(Duration, Msg),
+    /// Runs fire-and-forget background work.
     Task(Box<dyn FnOnce() + Send>),
     /// Signals the runtime to terminate.
     Quit,
@@ -59,8 +60,8 @@ pub enum Cmd<Msg> {
 }
 
 impl<Msg: Send + 'static> Cmd<Msg> {
-    /// Creates a command that spawns a background task emitting potentially
-    /// many messages over time. The task receives a sender to enqueue messages.
+    /// Creates background work that emits potentially many messages.
+    /// The task receives a sender to enqueue messages.
     ///
     /// This is useful for long-running operations like file I/O, network requests,
     /// or timers that emit progress updates.
@@ -105,11 +106,12 @@ impl<Msg: Send + 'static> Cmd<Msg> {
         Cmd::PriorityStream(Box::new(f))
     }
 
-    /// Creates a command that spawns a fire-and-forget background task.
-    ///
-    /// The task runs on a background thread and does not send any messages
-    /// back to the runtime. This is useful for side effects like file I/O
-    /// where you don't need to wait for a result.
+    /// Creates a command that delivers one action after a delay.
+    pub fn after(delay: Duration, msg: Msg) -> Self {
+        Cmd::After(delay, msg)
+    }
+
+    /// Creates fire-and-forget background work.
     ///
     /// # Example
     ///
@@ -135,11 +137,7 @@ impl<Msg: Send + 'static> Cmd<Msg> {
         Cmd::Quit
     }
 
-    /// Creates a command that spawns a background task which computes and emits
-    /// exactly one message.
-    ///
-    /// The computation runs on a background thread, allowing the runtime to
-    /// continue processing while work is performed.
+    /// Creates background work that computes and emits exactly one message.
     ///
     /// # Example
     ///
@@ -225,6 +223,7 @@ impl<Msg: Send + 'static> Cmd<Msg> {
                     run(child_low_tx, child_high_tx);
                 })
             }
+            Cmd::After(delay, msg) => Cmd::After(delay, f(msg)),
             Cmd::Task(run) => Cmd::Task(run),
             Cmd::Batch(cmds) => {
                 Cmd::Batch(cmds.into_iter().map(|c| c.map(Clone::clone(&f))).collect())
@@ -357,11 +356,10 @@ pub trait Component {
     /// Semantic results emitted synchronously to the parent component.
     type Outcome;
 
-    /// Called once before the run loop starts. Use for initial async work,
-    /// such as loading configuration or fetching initial data.
+    /// Called once before the run loop starts. Use for initial work such as
+    /// loading configuration, fetching data, or scheduling an action.
     ///
-    /// The returned command will be spawned on a background thread.
-    /// Override this only if you need async initialization.
+    /// The platform runtime executes the returned command.
     fn create(&mut self) -> Option<Cmd<Self::Action>> {
         None
     }
@@ -422,6 +420,7 @@ pub trait Runtime<C: Component<Outcome = NoOutcome>> {
     /// The runtime is responsible for:
     /// - Polling input events and sending them to the engine
     /// - Calling `engine.tick()` to process messages
+    /// - Executing commands returned by the engine
     /// - Calling `engine.render()` when `is_dirty` is true
     fn run(self, engine: Engine<C>) -> Result<(), Self::Error>;
 }
@@ -488,6 +487,10 @@ impl Config {
     }
 }
 
+struct Scheduled<Action> {
+    deadline: Instant,
+    action: Action,
+}
 /// The runtime engine that coordinates messages, commands, and component state.
 ///
 /// Manages two channels: one for high-priority UI messages and one for
@@ -507,13 +510,14 @@ pub struct Engine<C: Component<Outcome = NoOutcome>> {
     /// Low-priority command channel (background tasks).
     cmd_tx: Sender<C::Action>,
     cmd_rx: Receiver<C::Action>,
+    /// Delayed actions ordered by deadline.
+    scheduled: VecDeque<Scheduled<C::Action>>,
 }
 
 impl<C: Component<Outcome = NoOutcome>> Engine<C> {
     /// Creates a new engine with the given component using default configuration.
     ///
-    /// If the component implements `create()`, that command is spawned on a
-    /// background thread before the loop starts.
+    /// Commands returned by `create()` are executed before the run loop starts.
     pub fn new(component: C) -> Self {
         Self::with_config(component, Config::default())
     }
@@ -547,6 +551,7 @@ impl<C: Component<Outcome = NoOutcome>> Engine<C> {
     /// let engine = Engine::with_config(component, config);
     /// ```
     pub fn with_config(mut component: C, config: Config) -> Self {
+        let initial_command = component.create();
         let (msg_tx, msg_rx) = match config.msg_bound {
             Some(bound) => bounded(bound),
             None => unbounded(),
@@ -558,18 +563,20 @@ impl<C: Component<Outcome = NoOutcome>> Engine<C> {
             Some(bound) => bounded(bound),
             None => unbounded(),
         };
-        let is_running = component
-            .create()
-            .is_none_or(|cmd| spawn_cmd(cmd, cmd_tx.clone(), msg_tx.clone()));
-        Self {
+        let mut engine = Self {
             component,
             msg_tx,
             msg_rx,
             cmd_tx,
             cmd_rx,
-            is_running,
+            scheduled: VecDeque::new(),
+            is_running: true,
             is_dirty: true,
+        };
+        if let Some(command) = initial_command {
+            engine.execute(command);
         }
+        engine
     }
 
     /// Processes all pending messages and commands.
@@ -582,6 +589,11 @@ impl<C: Component<Outcome = NoOutcome>> Engine<C> {
     /// If a high-priority message stops the engine, drain queued low-priority
     /// messages once before returning so accepted PTY output reaches the final render.
     pub fn tick(&mut self) {
+        self.deliver_due();
+        if !self.is_running {
+            return;
+        }
+
         // High-priority: drain all UI messages before touching background cmds
         while let Ok(msg) = self.msg_rx.try_recv() {
             self.update(msg);
@@ -628,6 +640,16 @@ impl<C: Component<Outcome = NoOutcome>> Engine<C> {
         self.msg_tx.send(msg)
     }
 
+    /// Returns the maximum time the platform can wait before the next action.
+    pub fn poll_timeout(&self, maximum: Duration) -> Duration {
+        self.scheduled
+            .front()
+            .map(|scheduled| {
+                maximum.min(scheduled.deadline.saturating_duration_since(Instant::now()))
+            })
+            .unwrap_or(maximum)
+    }
+
     /// Renders the component using the given renderer.
     ///
     /// Typically called after `tick` when `is_dirty` is true.
@@ -638,33 +660,57 @@ impl<C: Component<Outcome = NoOutcome>> Engine<C> {
     fn update(&mut self, action: C::Action) {
         self.is_dirty = true;
         if let Some(command) = self.component.update(action).into_command() {
-            self.is_running = spawn_cmd(command, self.cmd_tx.clone(), self.msg_tx.clone());
+            self.execute(command);
         }
     }
-}
 
-fn spawn_cmd<Msg: Send + 'static>(
-    cmd: Cmd<Msg>,
-    low_tx: Sender<Msg>,
-    high_tx: Sender<Msg>,
-) -> bool {
-    match cmd {
-        Cmd::Quit => false,
-        Cmd::Stream(run) => {
-            thread::spawn(move || run(low_tx));
-            true
+    fn execute(&mut self, command: Cmd<C::Action>) {
+        match command {
+            Cmd::Stream(run) => {
+                let tx = self.cmd_tx.clone();
+                thread::spawn(move || run(tx));
+            }
+            Cmd::PriorityStream(run) => {
+                let low_tx = self.cmd_tx.clone();
+                let high_tx = self.msg_tx.clone();
+                thread::spawn(move || run(low_tx, high_tx));
+            }
+            Cmd::After(delay, action) => {
+                let deadline = Instant::now() + delay;
+                let index = self
+                    .scheduled
+                    .partition_point(|scheduled| scheduled.deadline <= deadline);
+                self.scheduled.insert(index, Scheduled { deadline, action });
+            }
+            Cmd::Task(run) => {
+                thread::spawn(run);
+            }
+            Cmd::Quit => self.is_running = false,
+            Cmd::Batch(commands) => {
+                for command in commands {
+                    if !self.is_running {
+                        break;
+                    }
+                    self.execute(command);
+                }
+            }
         }
-        Cmd::PriorityStream(run) => {
-            thread::spawn(move || run(low_tx, high_tx));
-            true
+    }
+
+    fn deliver_due(&mut self) {
+        let now = Instant::now();
+        while self
+            .scheduled
+            .front()
+            .is_some_and(|scheduled| scheduled.deadline <= now)
+        {
+            let scheduled = self.scheduled.pop_front().unwrap();
+            self.update(scheduled.action);
+
+            if !self.is_running {
+                break;
+            }
         }
-        Cmd::Task(run) => {
-            thread::spawn(run);
-            true
-        }
-        Cmd::Batch(cmds) => cmds
-            .into_iter()
-            .all(|cmd| spawn_cmd(cmd, low_tx.clone(), high_tx.clone())),
     }
 }
 
@@ -687,6 +733,24 @@ mod tests {
         }
     }
 
+    struct Delayed {
+        delivered: bool,
+    }
+
+    impl Component for Delayed {
+        type Action = ();
+        type Outcome = NoOutcome;
+
+        fn create(&mut self) -> Option<Cmd<Self::Action>> {
+            Some(Cmd::after(Duration::ZERO, ()))
+        }
+
+        fn update(&mut self, (): ()) -> Option<Effect<Self::Action, Self::Outcome>> {
+            self.delivered = true;
+            None
+        }
+    }
+
     #[test]
     fn quit_from_create_stops_the_engine() {
         let engine = Engine::new(CreateCommand(Some(Cmd::quit())));
@@ -698,6 +762,15 @@ mod tests {
         let command = Cmd::Batch(vec![Cmd::task(|| {}), Cmd::quit()]);
         let engine = Engine::new(CreateCommand(Some(command)));
         assert!(!engine.is_running);
+    }
+
+    #[test]
+    fn delayed_command_delivers_action() {
+        let mut engine = Engine::new(Delayed { delivered: false });
+
+        engine.tick();
+
+        assert!(engine.component.delivered);
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use crossterm::event::Event as CrosstermEvent;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::Clear,
     Frame,
@@ -60,7 +60,8 @@ enum Route {
 #[derive(Clone)]
 pub(crate) struct Item {
     pub name: String,
-    pub theme: Theme,
+    /// Background, foreground, accent, and active colors.
+    pub swatches: [Color; 4],
     pub show: bool,
 }
 
@@ -90,10 +91,14 @@ impl ThemeSelector {
         let available = theme::available_themes();
         let items: Vec<Item> = available
             .into_iter()
-            .map(|name| Item {
-                theme: Theme::new(&name, transparent),
-                name,
-                show: true,
+            .map(|name| {
+                let t = Theme::new(&name, transparent);
+                let swatches = [t.background, t.foreground, t.accent, t.active];
+                Item {
+                    name,
+                    swatches,
+                    show: true,
+                }
             })
             .collect();
 
@@ -281,12 +286,7 @@ impl ThemeSelector {
                 let swatch_bg = if is_selected { Some(selected_bg) } else { None };
 
                 let mut spans = Vec::new();
-                let colors = [
-                    item.theme.background,
-                    item.theme.foreground,
-                    item.theme.accent,
-                    item.theme.active,
-                ];
+                let colors = item.swatches;
                 for color in colors {
                     let mut style = Style::default().fg(color);
                     if let Some(bg) = swatch_bg {

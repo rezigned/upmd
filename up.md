@@ -60,6 +60,16 @@ cargo run -- --cli DEMO.md --all --yes
 cargo run -- "$FILE"
 ```
 
+## Profiling
+
+```sh [name:profile-alloc]
+cargo instruments -t alloc --no-open --time-limit 2000 -- DEMO.md
+```
+
+```sh [name:profile-cpu]
+cargo instruments -t cpu --no-open --time-limit 2000 -- DEMO.md
+```
+
 ## Verification
 
 ```sh [name:check-config, deps:build]

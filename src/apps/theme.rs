@@ -3,8 +3,9 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Borders, Padding, Paragraph},
 };
+use std::collections::HashMap;
 use std::str::FromStr;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 use syntect::{
     easy::HighlightLines,
     highlighting::{self as syn, ThemeSet},
@@ -17,11 +18,46 @@ use crate::apps::config::{DEFAULT_SYNTAX, DEFAULT_THEME};
 include!(concat!(env!("OUT_DIR"), "/themes.rs"));
 
 pub static SYNTAX: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
-pub static THEMES: LazyLock<ThemeSet> = LazyLock::new(|| {
-    let mut set = ThemeSet::load_defaults();
-    load_default_themes(&mut set);
-    set
+
+static BUILTIN_THEMES: LazyLock<HashMap<String, Arc<syn::Theme>>> = LazyLock::new(|| {
+    ThemeSet::load_defaults()
+        .themes
+        .into_iter()
+        .map(|(name, theme)| (name, Arc::new(theme)))
+        .collect()
 });
+
+fn bundled_theme_source(name: &str) -> Option<&'static str> {
+    bundled_theme_entries()
+        .iter()
+        .find(|(entry, _)| *entry == name)
+        .map(|(_, source)| *source)
+}
+
+fn load_bundled_theme(name: &str) -> Option<syn::Theme> {
+    let source = bundled_theme_source(name)?;
+    ThemeSet::load_from_reader(&mut std::io::Cursor::new(source.as_bytes())).ok()
+}
+
+pub fn available_themes() -> Vec<String> {
+    let mut names: Vec<_> = bundled_theme_entries()
+        .iter()
+        .map(|(name, _)| name.to_string())
+        .chain(BUILTIN_THEMES.keys().cloned())
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn theme(name: &str) -> Arc<syn::Theme> {
+    load_bundled_theme(name)
+        .map(Arc::new)
+        .or_else(|| BUILTIN_THEMES.get(name).cloned())
+        .or_else(|| load_bundled_theme(DEFAULT_THEME).map(Arc::new))
+        .or_else(|| BUILTIN_THEMES.values().next().cloned())
+        .unwrap_or_default()
+}
 
 /// Brand accent for the "up" portion of the logo #00B8D4.
 pub const LOGO_ACCENT: Color = Color::Rgb(0x00, 0xB8, 0xD4);
@@ -95,6 +131,7 @@ struct MarkdownStyles {
 pub struct Theme {
     name: String,
     pub accent: Color,
+    syntect: Arc<syn::Theme>,
     pub background: Color,
     pub foreground: Color,
     pub code_background: Color,
@@ -114,6 +151,7 @@ impl Default for Theme {
     fn default() -> Self {
         Self {
             name: DEFAULT_THEME.to_owned(),
+            syntect: theme(DEFAULT_THEME),
             accent: Color::Reset,
             background: Color::Reset,
             foreground: Color::Reset,
@@ -134,7 +172,8 @@ impl Default for Theme {
 
 impl Theme {
     pub fn new(name: &str, transparent: bool) -> Self {
-        let theme = theme(name);
+        let syntect = theme(name);
+        let theme = syntect.as_ref();
         let settings = &theme.settings;
 
         let (background, foreground) = if transparent {
@@ -151,6 +190,8 @@ impl Theme {
         let info_background = calculate_info_background(Some(&code_background));
         let info_foreground = calculate_info_foreground(info_background);
         let warning = to_color(find_warning_color(theme).or_else(|| find_active_color(theme)));
+        let success = to_color(find_success_color(theme));
+        let error = to_color(find_error_color(theme));
         let fallback_markdown = Style::default().fg(foreground);
         let markdown = syntect_markdown_styles(theme).unwrap_or(MarkdownStyles {
             text: fallback_markdown,
@@ -160,6 +201,7 @@ impl Theme {
 
         Self {
             name: name.into(),
+            syntect,
             accent,
             active,
             background,
@@ -169,8 +211,8 @@ impl Theme {
             info_background,
             info_foreground,
             logo: LOGO_ACCENT,
-            success: to_color(find_success_color(theme)),
-            error: to_color(find_error_color(theme)),
+            success,
+            error,
             muted,
             warning,
             markdown,
@@ -393,7 +435,7 @@ impl Theme {
     )]
     pub fn highlight(&self, code: &str, ext: &str) -> Text<'static> {
         let syntax = find_syntax_or_default(ext, code);
-        let mut h = HighlightLines::new(syntax, theme(&self.name));
+        let mut h = HighlightLines::new(syntax, &self.syntect);
 
         let mut lines: Vec<Line<'static>> = Vec::new();
         for line in LinesWithEndings::from(code) {
@@ -429,10 +471,8 @@ fn syntect_style_to_ratatui(style: syn::Style) -> Style {
     if fg.a > 0 {
         out = out.fg(Color::Rgb(fg.r, fg.g, fg.b));
     }
-    // Strip syntax-highlighted backgrounds. The render pipeline applies
-    // its own backgrounds (code_background, info_background, etc.) so
-    // per-scope backgrounds from the syntax theme would conflict, especially
-    // in transparent mode where the terminal background must show through.
+
+    // Syntax-scope backgrounds are applied by the render pipeline instead.
     if style.font_style.contains(syn::FontStyle::BOLD) {
         out = out.add_modifier(Modifier::BOLD);
     }
@@ -445,38 +485,23 @@ fn syntect_style_to_ratatui(style: syn::Style) -> Style {
     out
 }
 
-/// Resolves ordinary text, heading markers, and heading text with one Syntect
-/// highlighter so all Markdown base styles come from the same parser pass.
+/// Resolves Markdown styles directly from the theme's scope rules.
 fn syntect_markdown_styles(theme: &syn::Theme) -> Option<MarkdownStyles> {
-    const HEADING: &str = "upmd-heading";
-    const PARAGRAPH: &str = "upmd-paragraph";
+    const HEADING: &str = "text.html.markdown markup.heading.markdown markup.heading.1.markdown entity.name.section.markdown";
+    const HEADING_MARKER: &str = "text.html.markdown markup.heading.markdown markup.heading.1.markdown punctuation.definition.heading.markdown";
 
-    let source = format!("# {HEADING}\n{PARAGRAPH}\n");
-    let syntax = find_syntax_or_default("markdown", &source);
-    let mut highlighter = HighlightLines::new(syntax, theme);
-
-    let mut heading_marker = None;
-    let mut heading = None;
-    let mut text = None;
-
-    for line in LinesWithEndings::from(&source) {
-        for (style, value) in highlighter.highlight_line(line, &SYNTAX).ok()? {
-            if value.contains('#') {
-                heading_marker = Some(syntect_style_to_ratatui(style));
-            }
-            if value.contains(HEADING) {
-                heading = Some(syntect_style_to_ratatui(style));
-            }
-            if value.contains(PARAGRAPH) {
-                text = Some(syntect_style_to_ratatui(style));
-            }
-        }
-    }
+    let highlighter = syn::Highlighter::new(theme);
+    let style = |scope: &str| {
+        let stack = ScopeStack::from_str(scope).ok()?;
+        Some(syntect_style_to_ratatui(
+            highlighter.style_for_stack(stack.as_slice()),
+        ))
+    };
 
     Some(MarkdownStyles {
-        text: text?,
-        heading_marker: heading_marker?,
-        heading: heading?,
+        text: syntect_style_to_ratatui(highlighter.get_default()),
+        heading_marker: style(HEADING_MARKER)?,
+        heading: style(HEADING)?,
     })
 }
 
@@ -497,22 +522,6 @@ pub(crate) fn find_syntax_or_default(name: &str, code: &str) -> &'static SyntaxR
                 SYNTAX.syntaxes().first().expect("No syntaxes loaded")
             })
     })
-}
-
-/// Finds the theme by name or fallback to the default theme if it can't be found.
-fn theme(name: &str) -> &syn::Theme {
-    THEMES.themes.get(name).unwrap_or_else(|| {
-        THEMES
-            .themes
-            .get(DEFAULT_THEME)
-            .unwrap_or_else(|| THEMES.themes.values().next().expect("No themes loaded"))
-    })
-}
-
-pub fn available_themes() -> Vec<String> {
-    let mut themes: Vec<String> = THEMES.themes.keys().cloned().collect();
-    themes.sort();
-    themes
 }
 
 fn to_color(color: Option<syn::Color>) -> Color {
@@ -687,127 +696,8 @@ fn calculate_info_background(base: Option<&Color>) -> Color {
 
 #[cfg(test)]
 mod tests {
-    use syntect::{
-        highlighting::{FontStyle, Style},
-        util::as_24_bit_terminal_escaped,
-    };
 
-    use super::{find_syntax_or_default, THEMES};
-    const RESET_ANSI: &str = "\u{1b}[m";
-
-    #[test]
-    fn test_colors() {
-        // Color schemes reference https://www.sublimetext.com/docs/color_schemes.html
-        let themes = [
-            "InspiredGitHub",
-            "Solarized (dark)",
-            "Solarized (light)",
-            "base16-eighties.dark",
-            "base16-mocha.dark",
-            "base16-ocean.dark",
-            "base16-ocean.light",
-        ];
-
-        let theme_name = themes[0];
-        let t = &THEMES.themes[theme_name];
-
-        println!("{}", theme_name);
-
-        let mut colors = vec![
-            (t.settings.foreground, "foreground".to_string()),
-            (t.settings.background, "background".to_string()),
-            (t.settings.caret, "caret".to_string()),
-            (t.settings.line_highlight, "line_highlight".to_string()),
-            (t.settings.misspelling, "misspelling".to_string()),
-            (t.settings.minimap_border, "minimap_border".to_string()),
-            (t.settings.accent, "accent".to_string()),
-            (
-                t.settings.bracket_contents_foreground,
-                "bracket_contents_foreground".to_string(),
-            ),
-            (
-                t.settings.brackets_foreground,
-                "brackets_foreground".to_string(),
-            ),
-            (
-                t.settings.brackets_background,
-                "brackets_background".to_string(),
-            ),
-            (t.settings.tags_foreground, "tags_foreground".to_string()),
-            (t.settings.highlight, "highlight".to_string()),
-            (t.settings.find_highlight, "find_highlight".to_string()),
-            (
-                t.settings.find_highlight_foreground,
-                "find_highlight_foreground".to_string(),
-            ),
-            (t.settings.gutter, "gutter".to_string()),
-            (
-                t.settings.gutter_foreground,
-                "gutter_foreground".to_string(),
-            ),
-            (t.settings.selection, "selection".to_string()),
-            (
-                t.settings.selection_foreground,
-                "selection_foreground".to_string(),
-            ),
-            (t.settings.selection_border, "selection_border".to_string()),
-            (
-                t.settings.inactive_selection,
-                "inactive_selection".to_string(),
-            ),
-            (
-                t.settings.inactive_selection_foreground,
-                "inactive_selection_foreground".to_string(),
-            ),
-            (t.settings.guide, "guide".to_string()),
-            (t.settings.active_guide, "active_guide".to_string()),
-            (t.settings.stack_guide, "stack_guide".to_string()),
-            (t.settings.shadow, "shadow".to_string()),
-        ];
-
-        for scope_item in &t.scopes {
-            let scope_name = scope_item.scope.selectors[0].path.scopes[0].to_string();
-            colors.push((
-                scope_item.style.foreground,
-                format!("scope_fg: {}", scope_name),
-            ));
-            colors.push((
-                scope_item.style.background,
-                format!("scope_bg: {}", scope_name),
-            ));
-        }
-
-        colors.iter().for_each(|v| {
-            let fg = t
-                .settings
-                .foreground
-                .unwrap_or(syntect::highlighting::Color::WHITE);
-            let bg = t
-                .settings
-                .background
-                .unwrap_or(syntect::highlighting::Color::BLACK);
-
-            let (foreground, background) = if v.1.contains("foreground") || v.1.contains("_fg") {
-                (v.0.unwrap_or(fg), bg)
-            } else {
-                (fg, v.0.unwrap_or(bg))
-            };
-
-            let s = as_24_bit_terminal_escaped(
-                &[(
-                    Style {
-                        foreground,
-                        background,
-                        font_style: FontStyle::empty(),
-                    },
-                    v.1.as_str(),
-                )],
-                true,
-            );
-
-            println!("{s} - {RESET_ANSI} {:?}", v.0);
-        });
-    }
+    use super::find_syntax_or_default;
 
     #[test]
     fn test_theme_loading() {
