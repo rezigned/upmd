@@ -21,8 +21,8 @@ use crate::apps::config::PREVIEW_FRAME_OVERHEAD;
 use crate::apps::theme::Theme;
 use crate::runner::CodeId;
 use upmd_parser::nodes::{
-    inline_text, Alignment, Code, DepsToken, InlineSpan, InlineStyle, ListKind, Table, TableCell,
-    TaskStatus,
+    inline_text, Alignment, Code, DepsToken, FrontmatterStyle, InlineSpan, InlineStyle, ListKind,
+    Table, TableCell, TaskStatus,
 };
 use upmd_parser::Codes;
 
@@ -132,7 +132,68 @@ impl MarkdownHtml {
     }
 }
 
-/// Code info bar: left spans + right text, right-aligned at render time.
+/// Lazily highlighted frontmatter.
+#[derive(Debug)]
+pub struct FrontmatterBlock {
+    raw: String,
+    delimiter: &'static str,
+    language: &'static str,
+    lines: Vec<String>,
+    cached: RefCell<Option<Text<'static>>>,
+}
+
+impl FrontmatterBlock {
+    fn new(style: FrontmatterStyle, raw: String) -> Self {
+        let (delimiter, language) = match style {
+            FrontmatterStyle::Yaml => ("---", "yaml"),
+            FrontmatterStyle::Toml => ("+++", "toml"),
+        };
+        let mut lines = vec![delimiter.to_string()];
+        lines.extend(raw.lines().map(String::from));
+        lines.push(delimiter.to_string());
+
+        Self {
+            raw,
+            delimiter,
+            language,
+            lines,
+            cached: RefCell::new(None),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.lines.len()
+    }
+
+    fn raw_line(&self, row_idx: usize) -> &str {
+        self.lines.get(row_idx).map_or("", String::as_str)
+    }
+
+    fn line(&self, row_idx: usize, theme: &Theme) -> Line<'static> {
+        let mut cached = self.cached.borrow_mut();
+        let text = cached.get_or_insert_with(|| {
+            let rule = Line::from(Span::styled(self.delimiter, theme.rule_style()));
+            let highlighted = theme.highlight(&self.raw, self.language);
+
+            let lines: Vec<Line<'static>> = std::iter::once(rule.clone())
+                .chain(highlighted.lines.into_iter().map(expand_tabs_in_line))
+                .chain(std::iter::once(rule))
+                .collect();
+
+            Text::from(lines)
+        });
+
+        text.lines
+            .get(row_idx)
+            .cloned()
+            .unwrap_or_else(|| Line::raw(self.raw_line(row_idx).to_owned()))
+    }
+
+    fn clear_cache(&self) {
+        *self.cached.borrow_mut() = None;
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CodeInfoLine {
     left: Vec<(String, Style)>,
@@ -204,6 +265,10 @@ pub enum LogicalLineSource {
     /// One row of a raw HTML block highlighted and cached as a complete block.
     Html {
         block: Rc<MarkdownHtml>,
+        row_idx: usize,
+    },
+    Frontmatter {
+        block: Rc<FrontmatterBlock>,
         row_idx: usize,
     },
     TableRow {
@@ -365,6 +430,14 @@ impl LogicalLine {
         }
     }
 
+    pub fn frontmatter(block: Rc<FrontmatterBlock>, row_idx: usize, is_block_start: bool) -> Self {
+        Self {
+            source: LogicalLineSource::Frontmatter { block, row_idx },
+            is_block_start,
+            ..Self::default()
+        }
+    }
+
     /// Creates a table row or border line.
     pub fn table(table: Rc<MarkdownTable>, row_idx: usize, initial: Line<'static>) -> Self {
         Self {
@@ -426,6 +499,7 @@ impl LogicalLine {
         match &self.source {
             LogicalLineSource::TableRow { table, .. } => table.clear_cache(),
             LogicalLineSource::Html { block, .. } => block.clear_cache(),
+            LogicalLineSource::Frontmatter { block, .. } => block.clear_cache(),
             _ => {
                 if let Some(text) = self.lazy_text() {
                     *text.cached.borrow_mut() = None;
@@ -511,6 +585,9 @@ impl LogicalLine {
             }
             LogicalLineSource::Output(text) => text.to_string(),
             LogicalLineSource::Html { block, row_idx } => block.raw_line(*row_idx).to_owned(),
+            LogicalLineSource::Frontmatter { block, row_idx } => {
+                block.raw_line(*row_idx).to_owned()
+            }
             LogicalLineSource::TableRow { initial, .. } => initial.to_string(),
             LogicalLineSource::Image { alt, .. } => alt.clone(),
             LogicalLineSource::ThematicBreak | LogicalLineSource::Newline => String::new(),
@@ -634,6 +711,9 @@ impl LogicalLine {
             LogicalLineSource::Html { block, row_idx } => {
                 expand_tabs_in_line(Line::raw(block.raw_line(*row_idx).to_owned()))
             }
+            LogicalLineSource::Frontmatter { block, row_idx } => {
+                expand_tabs_in_line(Line::raw(block.raw_line(*row_idx).to_owned()))
+            }
             _ if self.lazy_text().is_some() => {
                 let text = self.lazy_text().expect("checked lazy text");
                 expand_tabs_in_line(Line::raw(text.text.clone()))
@@ -685,6 +765,7 @@ impl LogicalLine {
                 line
             }
             LogicalLineSource::Html { block, row_idx } => block.line(*row_idx, ctx.theme),
+            LogicalLineSource::Frontmatter { block, row_idx } => block.line(*row_idx, ctx.theme),
             LogicalLineSource::CodeInfo(info) => {
                 let prefix_width = self.prefix_width();
                 let wrap_width = ctx
@@ -1061,6 +1142,17 @@ impl<'a> MarkdownRenderer<'a> {
                     self.push_line(
                         lines,
                         LogicalLine::html(Rc::clone(&block), row_idx, row_idx == 0),
+                        state.quote_depth,
+                    );
+                }
+                self.push_line(lines, LogicalLine::newline(None, false), state.quote_depth);
+            }
+            Node::Frontmatter { style, raw } => {
+                let block = Rc::new(FrontmatterBlock::new(*style, raw.clone()));
+                for row_idx in 0..block.len() {
+                    self.push_line(
+                        lines,
+                        LogicalLine::frontmatter(Rc::clone(&block), row_idx, row_idx == 0),
                         state.quote_depth,
                     );
                 }
@@ -1667,6 +1759,7 @@ mod tests {
             LogicalLineSource::CodeBody(_) => "CodeBody".to_string(),
             LogicalLineSource::Output(_) => "Output".to_string(),
             LogicalLineSource::Html { .. } => "Html".to_string(),
+            LogicalLineSource::Frontmatter { .. } => "Frontmatter".to_string(),
             LogicalLineSource::TableRow { .. } => "Table".to_string(),
             LogicalLineSource::Image { .. } => "Image".to_string(),
             LogicalLineSource::ThematicBreak => "ThematicBreak".to_string(),

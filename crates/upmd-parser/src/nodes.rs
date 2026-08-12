@@ -20,6 +20,17 @@ pub enum Node {
         alt: String,
         src: String,
     },
+    /// Leading YAML or TOML frontmatter.
+    Frontmatter {
+        style: FrontmatterStyle,
+        raw: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrontmatterStyle {
+    Yaml,
+    Toml,
 }
 
 /// A run of inline text with the formatting applied to it.

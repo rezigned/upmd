@@ -2,7 +2,9 @@ pub mod nodes;
 pub mod options;
 pub mod parser;
 
-pub use nodes::{Code, CodeId, Codes, Dependencies, Heading, InlineSpan, InlineStyle, Node};
+pub use nodes::{
+    Code, CodeId, Codes, Dependencies, FrontmatterStyle, Heading, InlineSpan, InlineStyle, Node,
+};
 
 /// Completeness of [`Document::nodes`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

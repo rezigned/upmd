@@ -1,11 +1,11 @@
 use pulldown_cmark::{
-    Alignment as CmarkAlignment, CodeBlockKind, Event, HeadingLevel, Options,
+    Alignment as CmarkAlignment, CodeBlockKind, Event, HeadingLevel, MetadataBlockKind, Options,
     Parser as CmarkParser, Tag, TagEnd,
 };
 
 use super::nodes::{
-    inline_text, semantic_text, Alignment, Codes, InlineSpan, InlineStyle, ListItem, ListKind,
-    Node, Table, TableCell, TaskStatus,
+    inline_text, semantic_text, Alignment, Codes, FrontmatterStyle, InlineSpan, InlineStyle,
+    ListItem, ListKind, Node, Table, TableCell, TaskStatus,
 };
 use super::options;
 
@@ -27,21 +27,24 @@ impl Cmark {
 
 impl super::Parser for Cmark {
     fn parse(&self, text: &str) -> super::Document {
-        let options =
-            Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS | Options::ENABLE_STRIKETHROUGH;
+        let options = Options::ENABLE_TABLES
+            | Options::ENABLE_TASKLISTS
+            | Options::ENABLE_STRIKETHROUGH
+            | Options::ENABLE_YAML_STYLE_METADATA_BLOCKS
+            | Options::ENABLE_PLUSES_DELIMITED_METADATA_BLOCKS;
         let parser = CmarkParser::new_ext(text, options).into_offset_iter();
-        let line_starts = line_starts(text);
-        let mut p = Parser {
+        let mut parser = Parser {
+            source: text,
             iter: parser.peekable(),
             codes: Codes::default(),
             headings: Vec::new(),
-            line_starts,
+            line_starts: line_starts(text),
         };
-        let nodes = p.parse_blocks(None);
+        let nodes = parser.parse_document();
         super::Document {
             nodes,
-            codes: p.codes,
-            headings: p.headings,
+            codes: parser.codes,
+            headings: parser.headings,
             nodes_state: super::NodesState::Full,
         }
     }
@@ -50,6 +53,7 @@ impl super::Parser for Cmark {
 // Internal recursive-descent parser
 
 struct Parser<'a> {
+    source: &'a str,
     iter: std::iter::Peekable<pulldown_cmark::OffsetIter<'a>>,
     codes: Codes,
     headings: Vec<super::Heading>,
@@ -71,6 +75,41 @@ fn byte_to_line(line_starts: &[usize], byte: usize) -> usize {
 }
 
 impl<'a> Parser<'a> {
+    fn parse_document(&mut self) -> Vec<Node> {
+        let frontmatter = match self.iter.peek() {
+            Some((Event::Start(Tag::MetadataBlock(kind)), range)) if range.start == 0 => {
+                Some(*kind)
+            }
+            _ => None,
+        }
+        .map(|kind| self.parse_frontmatter(kind));
+
+        let mut nodes = self.parse_blocks(None);
+        if let Some(frontmatter) = frontmatter {
+            nodes.insert(0, frontmatter);
+        }
+        nodes
+    }
+
+    fn parse_frontmatter(&mut self, kind: MetadataBlockKind) -> Node {
+        self.iter.next();
+        let mut payload = None;
+        for (event, range) in self.iter.by_ref() {
+            match event {
+                Event::Text(_) => payload.get_or_insert(range).end = range.end,
+                Event::End(TagEnd::MetadataBlock(end_kind)) if end_kind == kind => break,
+                _ => {}
+            }
+        }
+        let style = match kind {
+            MetadataBlockKind::YamlStyle => FrontmatterStyle::Yaml,
+            MetadataBlockKind::PlusesStyle => FrontmatterStyle::Toml,
+        };
+        // Pulldown rejects empty metadata blocks.
+        let raw = self.source[payload.expect("metadata block has content")].to_owned();
+        Node::Frontmatter { style, raw }
+    }
+
     // Root dispatch
     //
     // Blocks ::= (Paragraph | Heading | CodeBlock | Table | List | BlockQuote
@@ -755,6 +794,63 @@ mod tests {
         assert_eq!(doc.headings[1].level, 2);
         assert_eq!(doc.headings[1].text, "Run `make`");
         assert_eq!(doc.nodes_state, crate::NodesState::Full);
+    }
+
+    #[test]
+    fn test_frontmatter_recognition() {
+        for (name, input, expected) in [
+            (
+                "yaml",
+                "---\ntitle: Hi\nfoo: bar\n---\n\n# Doc\n",
+                Some((crate::FrontmatterStyle::Yaml, "title: Hi\nfoo: bar\n")),
+            ),
+            (
+                "toml",
+                "+++\ntitle = \"Hi\"\n+++\n\n# Doc\n",
+                Some((crate::FrontmatterStyle::Toml, "title = \"Hi\"\n")),
+            ),
+            (
+                "crlf",
+                "---\r\ntitle: Hi\r\n---\r\n# Doc\r\n",
+                Some((crate::FrontmatterStyle::Yaml, "title: Hi\r\n")),
+            ),
+            (
+                "indented",
+                "---\n  indented: true\n\nlast: value\n---\n# Doc\n",
+                Some((
+                    crate::FrontmatterStyle::Yaml,
+                    "  indented: true\n\nlast: value\n",
+                )),
+            ),
+            ("unclosed", "---\ntitle: x\n\n# Doc\n", None),
+        ] {
+            let doc = Cmark::new().parse(input);
+            let actual = doc.nodes.first().and_then(|node| match node {
+                Node::Frontmatter { style, raw } => Some((*style, raw.as_str())),
+                _ => None,
+            });
+            assert_eq!(actual, expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn test_frontmatter_edge_cases_stay_normal_markdown() {
+        for (name, input) in [
+            ("immediate-close", "---\n---\n# Doc\n"),
+            ("blank-first", "---\n\nfoo\n---\n"),
+        ] {
+            let doc = Cmark::new().parse(input);
+            assert!(
+                !doc.nodes
+                    .iter()
+                    .any(|n| matches!(n, Node::Frontmatter { .. })),
+                "{name}: must not be frontmatter"
+            );
+            assert!(
+                doc.nodes.iter().any(|n| matches!(n, Node::ThematicBreak)),
+                "{name}: should parse as normal Markdown"
+            );
+        }
     }
 
     #[test]

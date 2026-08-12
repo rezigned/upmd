@@ -1416,6 +1416,21 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_full_yaml_frontmatter() {
+        let preview =
+            preview_from_markdown("---\ntitle: Hello\ntags: [a, b]\n---\n# Doc\n\nBody text.\n");
+        preview.rebuild_visual_lines(60);
+        assert_snapshot!("full_yaml_frontmatter", full_preview_text(&preview));
+    }
+
+    #[test]
+    fn snapshot_full_toml_frontmatter() {
+        let preview = preview_from_markdown("+++\ntitle = \"Hello\"\nversion = 1\n+++\n# Doc\n");
+        preview.rebuild_visual_lines(60);
+        assert_snapshot!("full_toml_frontmatter", full_preview_text(&preview));
+    }
+
+    #[test]
     fn snapshot_full_mixed_runbook() {
         let preview = preview_from_markdown(
             "# Setup\n\nInstall deps.\n\n```bash\nnpm install\n```\n\n> note\n\n- a\n- b",
