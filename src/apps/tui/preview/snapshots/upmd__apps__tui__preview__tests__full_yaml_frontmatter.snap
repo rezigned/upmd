@@ -1,0 +1,12 @@
+---
+source: src/apps/tui/preview/mod.rs
+expression: full_preview_text(&preview)
+---
+---
+title: Hello
+tags: [a, b]
+---
+
+# Doc
+────────────────────────────────────────────────────────
+Body text.
