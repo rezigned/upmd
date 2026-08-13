@@ -2,13 +2,9 @@ use std::cell::RefCell;
 
 use crate::apps::tui::markdown::LogicalLine;
 
-use super::visual_lines::VisualLine;
+use super::layout_lines::LayoutLine;
 
-/// Search state for the preview pane.
-///
-/// Owns the current search term and a cache of lower-cased searchable text for
-/// each logical line so that navigating between matches does not re-allocate on
-/// every keystroke.
+/// Search term and lower-cased text cache keyed by logical-line index.
 pub struct PreviewSearch {
     term: Option<String>,
     logical_texts: RefCell<Vec<String>>,
@@ -43,13 +39,13 @@ impl PreviewSearch {
             .collect();
     }
 
-    pub fn matches(&self, visual_lines: &[VisualLine]) -> Vec<usize> {
+    pub fn matches(&self, layout_lines: &[LayoutLine]) -> Vec<usize> {
         let term_lower = match &self.term {
             Some(term) => term.to_lowercase(),
             None => return vec![],
         };
         let texts = self.logical_texts.borrow();
-        visual_lines
+        layout_lines
             .iter()
             .enumerate()
             .filter(|(_, l)| {
