@@ -1,9 +1,10 @@
-## [0.2.3] - 2026-08-11
+## [v0.2.4]
 
 ### 🚀 Features
 
 - *(runtime)* Schedule delayed actions via Cmd::after
 - *(cli)* Add --ci alias for --cli --yes
+- *(parser)* Recognize and render leading frontmatter (#24)
 
 ### 🐛 Bug Fixes
 
@@ -12,13 +13,19 @@
 ### 🚜 Refactor
 
 - *(theme)* Resolve markdown styles from scope rules directly
+- *(tui)* Simplify layout rendering (#27)
 
 ### ⚡ Performance
 
 - *(theme)* Load bundled themes lazily instead of building a ThemeSet at startup
 - *(tui)* Drop tick thread to save thread stack memory
 - *(tui)* Skip full re-render on resize
-## [0.2.2] - 2026-08-09
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* Bump version to 0.2.3 (#23)
+- *(release)* Bump version to 0.2.4
+## [v0.2.2]
 
 ### 🚀 Features
 
@@ -43,7 +50,7 @@
 ### ⚙️ Miscellaneous Tasks
 
 - *(release)* Bump version to 0.2.2
-## [0.2.1] - 2026-08-02
+## [v0.2.1]
 
 ### 🚀 Features
 
@@ -57,7 +64,7 @@
 
 - *(release)* Prepare 0.2.1 with cargo-release automation
 - *(release)* Bump version to 0.2.1
-## [0.1.1] - 2026-07-25
+## [v0.1.1]
 
 ### 🚀 Features
 
@@ -80,7 +87,7 @@
 - Change demo font to 'Ioskeley Mono Term'
 - Add dependabot
 - *(release)* Bump version to 0.1.1
-## [0.1.0] - 2026-07-14
+## [v0.1.0]
 
 ### 💼 Other
 
