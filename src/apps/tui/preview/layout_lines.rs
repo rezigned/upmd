@@ -56,13 +56,16 @@ impl LayoutLine {
     pub fn render(
         &self,
         logical_line: &LogicalLine,
-        source: &ratatui::text::Line<'static>,
+        rendered_line: &ratatui::text::Line<'static>,
         ctx: &RenderContext<'_>,
     ) -> ratatui::text::Line<'static> {
+        if logical_line.is_image() && self.wrap_idx > 0 {
+            return ratatui::text::Line::raw("");
+        }
         let mut line = if logical_line.is_unwrappable() {
-            source.clone()
+            rendered_line.clone()
         } else {
-            slice_line(source, self.char_range.clone())
+            slice_line(rendered_line, self.char_range.clone())
         };
         if logical_line.has_code_gutter() && self.wrap_idx > 0 {
             apply_gutter(

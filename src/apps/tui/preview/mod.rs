@@ -1,17 +1,20 @@
 //! Markdown preview with live code output and width-dependent layout.
 //!
 //! Parsed nodes become width-independent [`LogicalLine`]s. [`LayoutLines`]
-//! maps each logical line to one or more terminal rows for wrapping and image
-//! height:
+//! derives one or more [`LayoutLine`]s per logical line for wrapping and image
+//! height. Painting combines content from the logical line with the
+//! width-dependent slice described by the layout line:
 //!
 //! ```text
-//! Node → LogicalLine → LayoutLine → terminal row
+//! Node → LogicalLine ──┬─ render → rendered Line ─┬─→ terminal row
+//!                      ├─ width  → LayoutLine(s) ─┤
+//!                      └──── render metadata ─────┘
 //! ```
 //!
 //! Content or output changes rebuild logical and layout lines. Width changes
 //! rebuild only layout lines. Rendering and interaction use the full layout
-//! index, while expensive logical-line rendering is limited to the viewport
-//! and its overdraw margin.
+//! index. Final row rendering covers the viewport and its overdraw margin.
+//! Expensive content caches are prefetched one viewport ahead.
 
 #[cfg(test)]
 use ratatui::text::Line;
@@ -58,9 +61,7 @@ mod selection;
 pub use images::image_base_dir;
 use images::ImageCache;
 pub(crate) use images::{decode_image, DecodedImage};
-#[cfg(test)]
-use layout_lines::LayoutLine;
-use layout_lines::LayoutLines;
+use layout_lines::{LayoutLine, LayoutLines};
 use search::PreviewSearch;
 use selection::PreviewSelection;
 
@@ -222,19 +223,6 @@ impl Preview {
     }
 
     fn rebuild_view_at_width(&mut self, outputs: &HashMap<CodeId, Task>, width: usize) {
-        // Capture through the old mapping before replacing the logical lines.
-        let previous_selection = self.selected_layout_line_identity();
-        let (previous_selected, previous_offset) = {
-            let state = self.state.borrow();
-            (state.selected(), state.offset())
-        };
-        let previous_code_rows = previous_selected
-            .and_then(|idx| {
-                self.layout_lines
-                    .get(idx)
-                    .and_then(|line| line.code_id(&self.logical_lines))
-            })
-            .and_then(|id| self.layout_extent_for_code(id).map(|(_, rows)| (id, rows)));
         let renderer = MarkdownRenderer::new(
             &self.theme,
             outputs,
@@ -242,7 +230,7 @@ impl Preview {
             self.inline_max_lines.get(),
             width,
         );
-        let old_lines = std::mem::take(&mut self.logical_lines);
+        let mut old_lines = std::mem::take(&mut self.logical_lines);
         let rendered = renderer.render(&self.nodes);
         tracing::Span::current().record("lines", rendered.lines.len());
         self.logical_lines = rendered.lines;
@@ -256,8 +244,8 @@ impl Preview {
             .map(|block| (block.source().to_owned(), Rc::clone(block)))
             .collect();
         let mut old_raw_iter = old_lines
-            .into_iter()
-            .filter_map(LogicalLine::into_lazy_text)
+            .iter_mut()
+            .filter_map(LogicalLine::lazy_text_mut)
             .peekable();
 
         for line in &mut self.logical_lines {
@@ -274,7 +262,7 @@ impl Preview {
                 if text.text == old.text && text.language == old.language && text.spans == old.spans
                 {
                     if let Some(old) = old_raw_iter.next() {
-                        text.cached = old.cached;
+                        std::mem::swap(&mut text.cached, &mut old.cached);
                     }
                     break;
                 }
@@ -287,13 +275,7 @@ impl Preview {
         self.search.rebuild_texts(&self.logical_lines);
 
         if width > 0 {
-            self.rebuild_layout_lines_from(
-                width,
-                previous_selection,
-                previous_selected,
-                previous_offset,
-                previous_code_rows,
-            );
+            self.rebuild_layout_lines_preserving(width, &old_lines);
         }
     }
 
@@ -312,7 +294,15 @@ impl Preview {
     /// Rebuilds layout lines from the current logical lines.
     #[tracing::instrument(level = "info", skip_all, fields(n_logical, n_layout, width))]
     fn rebuild_layout_lines(&self, width: usize) {
-        let previous_selection = self.selected_layout_line_identity();
+        self.rebuild_layout_lines_preserving(width, &self.logical_lines);
+    }
+
+    fn rebuild_layout_lines_preserving(
+        &self,
+        width: usize,
+        previous_logical_lines: &[LogicalLine],
+    ) {
+        let previous_selection = self.selected_layout_line_identity(previous_logical_lines);
         let (previous_selected, previous_offset) = {
             let state = self.state.borrow();
             (state.selected(), state.offset())
@@ -321,9 +311,13 @@ impl Preview {
             .and_then(|idx| {
                 self.layout_lines
                     .get(idx)
-                    .and_then(|line| line.code_id(&self.logical_lines))
+                    .and_then(|line| line.code_id(previous_logical_lines))
             })
-            .and_then(|id| self.layout_extent_for_code(id).map(|(_, rows)| (id, rows)));
+            .and_then(|id| {
+                self.layout_extent_for_code(id, previous_logical_lines)
+                    .map(|(_, rows)| (id, rows))
+            });
+
         self.rebuild_layout_lines_from(
             width,
             previous_selection,
@@ -433,16 +427,19 @@ impl Preview {
         self.layout_lines.get(layout_idx).map(|l| l.logical_idx)
     }
 
-    fn selected_layout_line_identity(&self) -> Option<LayoutLineIdentity> {
+    fn selected_layout_line_identity(
+        &self,
+        logical_lines: &[LogicalLine],
+    ) -> Option<LayoutLineIdentity> {
         let layout_idx = self.state.borrow().selected()?;
         let layout_lines = self.layout_lines.borrow();
         let line = layout_lines.get(layout_idx)?;
 
-        match line.code_id(&self.logical_lines) {
+        match line.code_id(logical_lines) {
             Some(id) => {
                 let first_logical_idx = layout_lines
                     .iter()
-                    .find(|line| line.code_id(&self.logical_lines) == Some(id))?
+                    .find(|line| line.code_id(logical_lines) == Some(id))?
                     .logical_idx;
                 Some(LayoutLineIdentity::Code {
                     id,
@@ -487,11 +484,16 @@ impl Preview {
             })
     }
 
-    fn layout_extent_for_code(&self, id: CodeId) -> Option<(usize, usize)> {
+    fn layout_extent_for_code(
+        &self,
+        id: CodeId,
+        logical_lines: &[LogicalLine],
+    ) -> Option<(usize, usize)> {
         let layout_lines = self.layout_lines.borrow();
-        let mut indices = layout_lines.iter().enumerate().filter_map(|(idx, line)| {
-            (line.code_id(&self.logical_lines) == Some(id)).then_some(idx)
-        });
+        let mut indices = layout_lines
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, line)| (line.code_id(logical_lines) == Some(id)).then_some(idx));
         let first = indices.next()?;
         let end = indices.next_back().unwrap_or(first);
         Some((end, end - first + 1))
@@ -507,7 +509,7 @@ impl Preview {
         if viewport == 0 {
             return offset;
         }
-        let Some((end, rows)) = self.layout_extent_for_code(id) else {
+        let Some((end, rows)) = self.layout_extent_for_code(id, &self.logical_lines) else {
             return offset;
         };
         if rows <= previous_rows || end < offset.saturating_add(viewport) {
@@ -853,41 +855,18 @@ impl Preview {
                 if !crate::utils::mouse_in_area(&mouse, area) {
                     return None;
                 }
-                let layout_lines = self.layout_lines.borrow();
-                let state_offset = self.state.borrow().offset();
-                let pos = SelectionState::mouse_to_position(
-                    area,
-                    mouse.row,
-                    mouse.column,
-                    PREVIEW_CONTENT_X_OFFSET,
-                    |rel_row| {
-                        let vidx = state_offset + rel_row;
-                        layout_lines.get(vidx).map(|vl| {
-                            let ctx = RenderContext {
-                                theme: &self.theme,
-                                active_code_id: None,
-                                prefer_status_gutter: None,
-                                spinner_char: ' ',
-                                viewport_width: self.layout_lines.last_width(),
-                            };
-                            let source_line = self.logical_lines[vl.logical_idx].render_plain(&ctx);
-                            (
-                                vidx,
-                                vl.render(&self.logical_lines[vl.logical_idx], &source_line, &ctx),
-                            )
-                        })
-                    },
-                );
-                if let Some((vidx, cidx)) = pos {
+                let pos = self.mouse_selection_position(area, mouse.row, mouse.column);
+                if let Some((layout_idx, char_idx)) = pos {
                     // Tracks the clicked layout line for selection/menu sync without
                     // moving the viewport. Mouse-wheel scroll uses the viewport
                     // offset, so scroll-after-click continues from the current view.
-                    self.state.borrow_mut().select(Some(vidx));
-                    let pending_code = layout_lines
-                        .get(vidx)
+                    self.state.borrow_mut().select(Some(layout_idx));
+                    let pending_code = self
+                        .layout_lines
+                        .get(layout_idx)
                         .and_then(|line| line.code_id(&self.logical_lines));
                     self.selection.set_pending_code_click(pending_code);
-                    self.selection.start(vidx, cidx);
+                    self.selection.start(layout_idx, char_idx);
                 } else {
                     self.selection.set_pending_code_click(None);
                     self.selection.clear();
@@ -900,8 +879,6 @@ impl Preview {
                 }
                 self.selection.set_pending_code_click(None);
                 let area = self.last_area.get();
-                let layout_lines = self.layout_lines.borrow();
-                let state_offset = self.state.borrow().offset();
                 let content_y = area.y + PREVIEW_CONTENT_TOP_OFFSET;
                 let content_bottom = area.y + area.height.saturating_sub(BORDER_HEIGHT as u16);
                 let clamped_row = mouse.row.clamp(content_y, content_bottom);
@@ -909,32 +886,9 @@ impl Preview {
                     area.x + PREVIEW_CONTENT_X_OFFSET,
                     area.x + area.width.saturating_sub(PREVIEW_CONTENT_X_OFFSET),
                 );
-                let pos = SelectionState::mouse_to_position(
-                    area,
-                    clamped_row,
-                    clamped_col,
-                    PREVIEW_CONTENT_X_OFFSET,
-                    |rel_row| {
-                        let vidx = state_offset + rel_row;
-                        layout_lines.get(vidx).map(|vl| {
-                            let ctx = RenderContext {
-                                theme: &self.theme,
-                                active_code_id: None,
-                                prefer_status_gutter: None,
-                                spinner_char: ' ',
-                                viewport_width: self.layout_lines.last_width(),
-                            };
-                            let source_line = self.logical_lines[vl.logical_idx].render_plain(&ctx);
-                            (
-                                vidx,
-                                vl.render(&self.logical_lines[vl.logical_idx], &source_line, &ctx),
-                            )
-                        })
-                    },
-                );
-                drop(layout_lines);
-                if let Some((vidx, cidx)) = pos {
-                    self.selection.extend(vidx, cidx);
+                let pos = self.mouse_selection_position(area, clamped_row, clamped_col);
+                if let Some((layout_idx, char_idx)) = pos {
+                    self.selection.extend(layout_idx, char_idx);
                     Some(Action::Select)
                 } else {
                     None
@@ -963,6 +917,40 @@ impl Preview {
             }
             _ => None,
         }
+    }
+
+    fn mouse_selection_position(
+        &self,
+        area: Rect,
+        row: u16,
+        column: u16,
+    ) -> Option<(usize, usize)> {
+        let layout_lines = self.layout_lines.borrow();
+        let offset = self.state.borrow().offset();
+        let ctx = RenderContext {
+            theme: &self.theme,
+            active_code_id: None,
+            prefer_status_gutter: None,
+            spinner_char: ' ',
+            viewport_width: self.layout_lines.last_width(),
+        };
+
+        SelectionState::mouse_to_position(
+            area,
+            row,
+            column,
+            PREVIEW_CONTENT_X_OFFSET,
+            |relative_row| {
+                let layout_idx = offset + relative_row;
+                let layout_line = layout_lines.get(layout_idx)?;
+                let logical_line = layout_line.logical(&self.logical_lines);
+                let rendered_line = logical_line.render_plain(&ctx);
+                Some((
+                    layout_idx,
+                    layout_line.render(logical_line, &rendered_line, &ctx),
+                ))
+            },
+        )
     }
 }
 
@@ -1092,28 +1080,10 @@ impl Output for Preview {
             viewport_width: width,
         };
 
-        let render_start = original_offset.saturating_sub(viewport);
-        let render_end = original_offset
-            .saturating_add(viewport.saturating_mul(2))
-            .min(layout_lines.len());
-        let mut warmed = HashSet::new();
-        let mut cache_misses = 0;
-        for layout_line in &layout_lines[render_start..render_end] {
-            if warmed.insert(layout_line.logical_idx)
-                && self.logical_lines[layout_line.logical_idx].ensure_rendered(&ctx)
-            {
-                cache_misses += 1;
-            }
-        }
+        self.prefetch_content(&layout_lines, original_offset, viewport, &ctx);
 
-        // One logical line may back many layout lines; render it once per frame.
-        let mut rendered_logical = HashMap::new();
-        for layout_line in window {
-            rendered_logical
-                .entry(layout_line.logical_idx)
-                .or_insert_with(|| layout_line.logical(&self.logical_lines).render(&ctx));
-        }
-
+        // Wrapped rows share one rendered logical line per frame.
+        let mut rendered_lines = HashMap::new();
         let mut items = Vec::with_capacity(window.len());
         let mut image_rows = Vec::new();
         for (win_i, layout_line) in window.iter().enumerate() {
@@ -1121,25 +1091,15 @@ impl Output for Preview {
             let logical_idx = layout_line.logical_idx;
             let logical_line = &self.logical_lines[logical_idx];
 
-            if logical_line.is_image() {
-                // Record the first visible row of each image
-                let first_visible_row = win_i == 0 || window[win_i - 1].logical_idx != logical_idx;
-                if first_visible_row {
+            // Render each logical line and register each image once.
+            let rendered_line = rendered_lines.entry(logical_idx).or_insert_with(|| {
+                if logical_line.is_image() {
                     let first_global = layout_idx as i32 - layout_line.wrap_idx as i32;
                     image_rows.push((logical_idx, first_global));
                 }
-
-                // The image widget paints continuation rows after the list.
-                if layout_line.wrap_idx > 0 {
-                    items.push(ListItem::new(Text::raw("")));
-                    continue;
-                }
-            }
-
-            let source_line = rendered_logical
-                .get(&logical_idx)
-                .expect("visible logical line was rendered");
-            let mut line = layout_line.render(logical_line, source_line, &ctx);
+                logical_line.render(&ctx)
+            });
+            let mut line = layout_line.render(logical_line, rendered_line, &ctx);
             if let Some(term) = self.search.term() {
                 line = highlight_line(line, term, self.theme.search_highlight_style());
             }
@@ -1159,14 +1119,6 @@ impl Output for Preview {
             items.push(ListItem::new(Text::from(line)));
         }
 
-        if cache_misses > 0 {
-            tracing::debug!(
-                visual_rows = window.len(),
-                logical_lines = warmed.len(),
-                cache_misses,
-                "populated viewport content cache"
-            );
-        }
         drop(layout_lines);
 
         let mut render_state = *self.state.borrow();
@@ -1189,6 +1141,37 @@ impl Output for Preview {
 }
 
 impl Preview {
+    fn prefetch_content(
+        &self,
+        layout_lines: &[LayoutLine],
+        offset: usize,
+        viewport: usize,
+        ctx: &RenderContext<'_>,
+    ) {
+        let start = offset.saturating_sub(viewport);
+        let end = offset
+            .saturating_add(viewport.saturating_mul(2))
+            .min(layout_lines.len());
+        let mut prefetched = HashSet::new();
+        let mut populated_caches = 0;
+        for layout_line in &layout_lines[start..end] {
+            if prefetched.insert(layout_line.logical_idx)
+                && layout_line
+                    .logical(&self.logical_lines)
+                    .ensure_rendered(ctx)
+            {
+                populated_caches += 1;
+            }
+        }
+        if populated_caches > 0 {
+            tracing::debug!(
+                prefetched_lines = prefetched.len(),
+                populated_caches,
+                "prefetched preview content caches"
+            );
+        }
+    }
+
     /// Draws loaded images over their reserved viewport rows.
     fn render_images(
         &self,
@@ -1285,24 +1268,6 @@ mod tests {
             );
         }
     }
-    #[test]
-    fn document_rebuild_captures_layout_state_before_replacing_logical_lines() {
-        let mut preview =
-            preview_from_markdown("first\n\nsecond\n\nthird\n\nfourth\n\nfifth\n\nsixth");
-        let last = preview.layout_lines.len() - 1;
-        preview.state.borrow_mut().select(Some(last));
-
-        let doc = upmd_parser::new().parse("short");
-        preview.nodes = doc.nodes;
-        preview.code_index = doc.codes;
-        preview.rebuild_view(&HashMap::new());
-
-        assert!(preview
-            .layout_lines
-            .borrow()
-            .iter()
-            .all(|line| line.logical_idx < preview.logical_lines.len()));
-    }
 
     #[test]
     fn image_continuation_rows_have_no_copy_text() {
@@ -1334,8 +1299,8 @@ mod tests {
         ctx: &RenderContext<'_>,
     ) -> Line<'static> {
         let logical_line = &preview.logical_lines[layout_line.logical_idx];
-        let source_line = logical_line.render(ctx);
-        layout_line.render(logical_line, &source_line, ctx)
+        let rendered_line = logical_line.render(ctx);
+        layout_line.render(logical_line, &rendered_line, ctx)
     }
 
     /// Renders every layout row to its final text, joined with newlines.

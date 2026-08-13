@@ -457,10 +457,6 @@ impl LogicalLine {
         }
     }
 
-    pub fn into_lazy_text(mut self) -> Option<LazyText> {
-        self.source.lazy_text_mut().map(std::mem::take)
-    }
-
     pub fn lazy_text_mut(&mut self) -> Option<&mut LazyText> {
         self.source.lazy_text_mut()
     }
