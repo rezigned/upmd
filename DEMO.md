@@ -27,7 +27,7 @@ and ~~*struck italic*~~.
 
 A standalone image renders in the preview pane:
 
-![the upmd logo](.github/pages/upmd-logo.png)
+![the upmd logo](.github/pages/upmd.png)
 
 ### A heading with **bold**, *italic*, and `code`
 

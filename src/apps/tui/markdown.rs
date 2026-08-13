@@ -1,14 +1,9 @@
-//! Produces styled [`LogicalLine`]s from parsed markdown [`Node`]s.
+//! Converts parsed markdown [`Node`]s into renderable [`LogicalLine`]s.
 //!
-//! [`MarkdownRenderer::render`] walks the AST and builds a vector of `LogicalLine`s,
-//! one per semantic markdown element (headings, paragraphs, code body lines,
-//! table rows, etc.). Tables expand into multiple `LogicalLine`s (one per row).
-//!
-//! [`LogicalLine::render`] lazily renders a `LogicalLine` into a ratatui
-//! [`Line`] at draw time.  It applies syntax highlighting (with a per-line cache
-//! in [`LazyText::cached`]), theme colours, active-code gutters, spinners,
-//! and search highlights.  The resulting `Line` is then consumed by the preview
-//! pane which may soft-wrap it across multiple terminal rows.
+//! [`MarkdownRenderer::render`] expands the AST into semantic lines such as
+//! paragraphs, headings, code rows, and table rows. [`LogicalLine::render`]
+//! applies dynamic styling and caches expensive highlighting. The preview owns
+//! width-dependent wrapping.
 
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
@@ -248,9 +243,9 @@ impl MarkdownTable {
     }
 }
 
-/// Element-specific content for one logical preview line.
+/// Content specific to one logical line.
 ///
-/// Cross-cutting navigation and display metadata remains on [`LogicalLine`].
+/// Shared navigation and display metadata lives on [`LogicalLine`].
 #[derive(Debug, Clone, Default)]
 pub enum LogicalLineSource {
     Text(LazyText),
@@ -311,15 +306,10 @@ impl LogicalLineSource {
     }
 }
 
-/// A single *logical* line in the preview: one semantic markdown element.
+/// Renderable content and metadata for one semantic preview line.
 ///
-/// `LogicalLine`s are produced once by [`MarkdownRenderer::render`] and cached in
-/// [`Preview::logical_lines`](crate::apps::tui::preview::Preview::logical_lines).
-/// They are **not** directly drawn; instead [`LogicalLine::render`]
-/// lazily renders them into a [`Line`] each frame, and
-/// [`Preview::rebuild_visual_lines`](crate::apps::tui::preview::Preview::rebuild_visual_lines)
-/// optionally soft-wraps that `Line` into one or more
-/// [`VisualLine`](crate::apps::tui::preview::VisualLine)s.
+/// A logical line is width-independent; preview layout maps it to one or more
+/// terminal rows.
 #[derive(Debug, Clone, Default)]
 pub struct LogicalLine {
     pub source: LogicalLineSource,
@@ -465,10 +455,6 @@ impl LogicalLine {
             source: LogicalLineSource::ThematicBreak,
             ..Self::default()
         }
-    }
-
-    pub fn into_lazy_text(mut self) -> Option<LazyText> {
-        self.source.lazy_text_mut().map(std::mem::take)
     }
 
     pub fn lazy_text_mut(&mut self) -> Option<&mut LazyText> {

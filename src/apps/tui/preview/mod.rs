@@ -1,36 +1,26 @@
-//! Preview pane that renders markdown with soft-wrap, selection, and live code output.
+//! Markdown preview with live code output and width-dependent layout.
 //!
-//! # Two-tier line model
-//!
-//! The preview separates *content* from *viewport layout* using two line types:
-//!
-//! 1. **Logical lines**: [`LogicalLine`](crate::apps::tui::markdown::LogicalLine)s stored in
-//!    [`Preview::logical_lines`].  Each represents one semantic markdown element
-//!    (heading, paragraph, code body line, table row, etc.).  They are produced once
-//!    by [`MarkdownRenderer`](crate::apps::tui::markdown::MarkdownRenderer) and only
-//!    rebuilt when the markdown source changes.
-//!
-//! 2. **Viewport lines**: [`VisualLine`]s stored in [`VisualLines`].
-//!    Each represents **one terminal row** using a logical-line index and source
-//!    character range. A single `LogicalLine` may expand into multiple
-//!    `VisualLine`s when it needs soft-wrapping. PTY output, tables, and dividers
-//!    are never wrapped.
-//!
-//! # Render pipeline
+//! Parsed nodes become width-independent [`LogicalLine`]s. [`LayoutLines`]
+//! derives one or more [`LayoutLine`]s per logical line for wrapping and image
+//! height. Painting combines content from the logical line with the
+//! width-dependent slice described by the layout line:
 //!
 //! ```text
-//! Markdown Nodes  →  MarkdownRenderer  →  [LogicalLine]  →  VisualLines  →  [VisualLine]  →  Preview::render
-//!                       (parse)             (content)         rebuild       (row ranges)     (slice + paint)
+//! Node → LogicalLine ──┬─ render → rendered Line ─┬─→ terminal row
+//!                      ├─ width  → LayoutLine(s) ─┤
+//!                      └──── render metadata ─────┘
 //! ```
 //!
-//! `render()` only paints the visible window plus a small overdraw margin.
-//! Syntax caches are populated for the viewport and one viewport in each
-//! direction.  Scrolling highlights new logical lines once; wrapping, search,
-//! selection, and copying continue to use the complete plain layout index.
+//! Content or output changes rebuild logical and layout lines. Width changes
+//! rebuild only layout lines. Rendering and interaction use the full layout
+//! index. Final row rendering covers the viewport and its overdraw margin.
+//! Expensive content caches are prefetched one viewport ahead.
 
+#[cfg(test)]
+use ratatui::text::Line;
 use ratatui::{
     layout::Rect,
-    text::{Line, Text},
+    text::Text,
     widgets::{Borders, List, ListItem, ListState, Padding},
     Frame,
 };
@@ -49,11 +39,9 @@ use keymap::{DerivedConfig, KeyMap};
 use upmd_parser::nodes::Node;
 use upmd_parser::Codes;
 
-use super::markdown::{
-    apply_gutter, highlight_line, LogicalLine, MarkdownHtml, MarkdownRenderer, RenderContext,
-};
+use super::markdown::{highlight_line, LogicalLine, MarkdownHtml, MarkdownRenderer, RenderContext};
 use super::selection::SelectionState;
-use super::wrap::{slice_line, CopyLine};
+use super::wrap::CopyLine;
 use crate::apps::task::Task;
 use crate::apps::tui::widgets::Spinner;
 
@@ -66,22 +54,20 @@ use upmd_runtime::{
 };
 
 mod images;
+mod layout_lines;
 mod search;
 mod selection;
-mod visual_lines;
 
 pub use images::image_base_dir;
 use images::ImageCache;
 pub(crate) use images::{decode_image, DecodedImage};
+use layout_lines::{LayoutLine, LayoutLines};
 use search::PreviewSearch;
 use selection::PreviewSelection;
-pub use visual_lines::{VisualLine, VisualLines};
 
-/// Identifies a visual line by its logical position within its parent
-/// (code block or document), allowing navigation to survive layout shifts
-/// caused by inline deps/output growing or shrinking.
+/// Identifies a layout line across layout rebuilds.
 #[derive(Clone, Copy)]
-enum VisualLineIdentity {
+enum LayoutLineIdentity {
     Code {
         id: CodeId,
         line_idx: usize,
@@ -93,17 +79,13 @@ enum VisualLineIdentity {
     },
 }
 
-/// The markdown preview pane.
-///
-/// Owns the two-tier line model (see module-level docs) and handles all
-/// preview-specific interactions: scrolling, block navigation, search
-/// highlighting, text selection, and copy-to-clipboard.
+/// Markdown preview state, rendering, and interaction.
 pub struct Preview {
     nodes: Vec<Node>,
-    /// Logical lines produced by [`MarkdownRenderer`].
+    /// Width-independent rendered content.
     logical_lines: Vec<LogicalLine>,
-    /// Viewport lines produced by [`VisualLines::rebuild`].
-    visual_lines: VisualLines,
+    /// One entry per terminal row.
+    layout_lines: LayoutLines,
     state: RefCell<ListState>,
     theme: Theme,
     keymap: DerivedConfig<Action>,
@@ -113,7 +95,7 @@ pub struct Preview {
     inline_max_lines: Cell<usize>,
     last_area: Cell<Rect>,
     selection: PreviewSelection,
-    /// If set, jump to this code block on the next visual-lines rebuild.
+    /// If set, jump to this code block on the next layout rebuild.
     target_block: Cell<Option<CodeId>>,
     /// Transient: prefer this block's task status over active gutter.
     prefer_status_gutter: Cell<Option<CodeId>>,
@@ -170,7 +152,7 @@ impl Preview {
         let mut preview = Self {
             nodes,
             logical_lines: vec![],
-            visual_lines: VisualLines::new(),
+            layout_lines: LayoutLines::new(),
             state: RefCell::new(ListState::default()),
             theme: theme.clone(),
             keymap,
@@ -189,7 +171,7 @@ impl Preview {
             image_base_dir,
         };
         preview.rebuild_view(outputs);
-        if !preview.visual_lines.is_empty() {
+        if !preview.layout_lines.is_empty() {
             preview.state.borrow_mut().select(Some(0));
         }
         preview
@@ -201,17 +183,17 @@ impl Preview {
 
     /// Requests loading of images in the viewport and a small overdraw margin.
     fn request_visible_images(&self) {
-        let viewport = self.visual_lines.last_height();
+        let viewport = self.layout_lines.last_height();
         let offset = self.state.borrow().offset();
         let overdraw = viewport / OVERDRAW_FRACTION;
         let start = offset.saturating_sub(overdraw);
         let end = offset
             .saturating_add(viewport)
             .saturating_add(overdraw)
-            .min(self.visual_lines.len());
-        let visual_lines = self.visual_lines.borrow();
+            .min(self.layout_lines.len());
+        let layout_lines = self.layout_lines.borrow();
         let mut images = self.images.borrow_mut();
-        for src in visual_lines[start..end]
+        for src in layout_lines[start..end]
             .iter()
             .filter(|line| line.wrap_idx == 0)
             .filter_map(|line| self.logical_lines[line.logical_idx].image_src())
@@ -225,19 +207,19 @@ impl Preview {
     }
 
     pub(crate) fn complete_image(&self, decoded: DecodedImage) {
-        let width = self.image_width(self.visual_lines.last_width());
+        let width = self.image_width(self.layout_lines.last_width());
         if self.images.borrow_mut().complete(decoded, width) {
-            self.rebuild_visual_lines(self.visual_lines.last_width());
+            self.rebuild_layout_lines(self.layout_lines.last_width());
         }
     }
 
-    /// Rebuilds the logical lines from markdown nodes and then the visual lines.
+    /// Rebuilds logical content, then its width-dependent layout.
     ///
     /// Called when the markdown source changes (new document, code output update)
     /// or when the theme / inline cap changes.
     #[tracing::instrument(level = "info", skip_all, fields(lines))]
     pub fn rebuild_view(&mut self, outputs: &HashMap<CodeId, Task>) {
-        self.rebuild_view_at_width(outputs, self.visual_lines.last_width());
+        self.rebuild_view_at_width(outputs, self.layout_lines.last_width());
     }
 
     fn rebuild_view_at_width(&mut self, outputs: &HashMap<CodeId, Task>, width: usize) {
@@ -248,7 +230,7 @@ impl Preview {
             self.inline_max_lines.get(),
             width,
         );
-        let old_lines = std::mem::take(&mut self.logical_lines);
+        let mut old_lines = std::mem::take(&mut self.logical_lines);
         let rendered = renderer.render(&self.nodes);
         tracing::Span::current().record("lines", rendered.lines.len());
         self.logical_lines = rendered.lines;
@@ -262,8 +244,8 @@ impl Preview {
             .map(|block| (block.source().to_owned(), Rc::clone(block)))
             .collect();
         let mut old_raw_iter = old_lines
-            .into_iter()
-            .filter_map(LogicalLine::into_lazy_text)
+            .iter_mut()
+            .filter_map(LogicalLine::lazy_text_mut)
             .peekable();
 
         for line in &mut self.logical_lines {
@@ -280,7 +262,7 @@ impl Preview {
                 if text.text == old.text && text.language == old.language && text.spans == old.spans
                 {
                     if let Some(old) = old_raw_iter.next() {
-                        text.cached = old.cached;
+                        std::mem::swap(&mut text.cached, &mut old.cached);
                     }
                     break;
                 }
@@ -293,7 +275,7 @@ impl Preview {
         self.search.rebuild_texts(&self.logical_lines);
 
         if width > 0 {
-            self.rebuild_visual_lines(width);
+            self.rebuild_layout_lines_preserving(width, &old_lines);
         }
     }
 
@@ -305,32 +287,64 @@ impl Preview {
         if inline_max_changed {
             self.rebuild_view_at_width(outputs, width);
         } else {
-            self.rebuild_visual_lines(width);
+            self.rebuild_layout_lines(width);
         }
     }
 
-    /// Rebuilds all viewport [`VisualLine`]s from the current logical lines.
-    #[tracing::instrument(level = "info", skip_all, fields(n_logical, n_visual, width))]
-    fn rebuild_visual_lines(&self, width: usize) {
-        if width == 0 {
-            return;
-        }
-        let span = tracing::Span::current();
-        let n_logical = self.logical_lines.len();
-        let previous_selection = self.selected_visual_line_identity();
+    /// Rebuilds layout lines from the current logical lines.
+    #[tracing::instrument(level = "info", skip_all, fields(n_logical, n_layout, width))]
+    fn rebuild_layout_lines(&self, width: usize) {
+        self.rebuild_layout_lines_preserving(width, &self.logical_lines);
+    }
+
+    fn rebuild_layout_lines_preserving(
+        &self,
+        width: usize,
+        previous_logical_lines: &[LogicalLine],
+    ) {
+        let previous_selection = self.selected_layout_line_identity(previous_logical_lines);
         let (previous_selected, previous_offset) = {
             let state = self.state.borrow();
             (state.selected(), state.offset())
         };
         let previous_code_rows = previous_selected
-            .and_then(|idx| self.visual_lines.get(idx).and_then(|line| line.code_id))
-            .and_then(|id| self.visual_extent_for_code(id).map(|(_, rows)| (id, rows)));
-        let selected = self.visual_lines.rebuild(
+            .and_then(|idx| {
+                self.layout_lines
+                    .get(idx)
+                    .and_then(|line| line.code_id(previous_logical_lines))
+            })
+            .and_then(|id| {
+                self.layout_extent_for_code(id, previous_logical_lines)
+                    .map(|(_, rows)| (id, rows))
+            });
+
+        self.rebuild_layout_lines_from(
+            width,
+            previous_selection,
+            previous_selected,
+            previous_offset,
+            previous_code_rows,
+        );
+    }
+
+    fn rebuild_layout_lines_from(
+        &self,
+        width: usize,
+        previous_selection: Option<LayoutLineIdentity>,
+        previous_selected: Option<usize>,
+        previous_offset: usize,
+        previous_code_rows: Option<(CodeId, usize)>,
+    ) {
+        if width == 0 {
+            return;
+        }
+        let span = tracing::Span::current();
+        let n_logical = self.logical_lines.len();
+        let selected = self.layout_lines.rebuild(
             &self.logical_lines,
             width,
             &self.theme,
             &self.target_block,
-            |idx| self.is_code_start_at(idx),
             |line| {
                 if let Some(src) = line.image_src() {
                     self.images.borrow().rows(src, &self.image_base_dir)
@@ -344,7 +358,7 @@ impl Preview {
             let mut state = self.state.borrow_mut();
             state.select(Some(idx));
             *state.offset_mut() = idx;
-        } else if let Some(idx) = previous_selection.and_then(|id| self.visual_idx_for_identity(id))
+        } else if let Some(idx) = previous_selection.and_then(|id| self.layout_idx_for_identity(id))
         {
             // Passive rebuild → preserve viewport row, tail-follow if
             // selected block's inline output grew past bottom.
@@ -357,9 +371,9 @@ impl Preview {
             });
             if let Some((code_id, previous_rows)) = previous_code_rows {
                 if self
-                    .visual_lines
+                    .layout_lines
                     .get(idx)
-                    .is_some_and(|line| line.code_id == Some(code_id))
+                    .is_some_and(|line| line.code_id(&self.logical_lines) == Some(code_id))
                 {
                     offset =
                         self.offset_following_grown_code_bottom(offset, code_id, previous_rows);
@@ -370,15 +384,14 @@ impl Preview {
             *state.offset_mut() = offset;
         }
         span.record("n_logical", n_logical);
-        span.record("n_visual", self.visual_lines.len());
+        span.record("n_layout", self.layout_lines.len());
         span.record("width", width);
-        self.clamp_state_to_visual_lines();
+        self.clamp_state_to_layout_lines();
     }
 
-    /// Keeps ListState and text selection valid after visual lines are rebuilt
-    /// or shrink.
-    fn clamp_state_to_visual_lines(&self) {
-        let len = self.visual_lines.len();
+    /// Keeps list and selection state valid after layout changes.
+    fn clamp_state_to_layout_lines(&self) {
+        let len = self.layout_lines.len();
         let mut state = self.state.borrow_mut();
 
         if len == 0 {
@@ -395,7 +408,7 @@ impl Preview {
         let offset = state.offset();
         *state.offset_mut() = offset.min(max_idx);
 
-        // Selection stores visual-line indices; clamp or clear if the range
+        // Selection stores layout-line indices; clamp or clear if the range
         // changed underneath it.
         self.selection.clamp_or_clear(len);
     }
@@ -410,70 +423,77 @@ impl Preview {
     }
 
     pub fn selected_logical_line(&self) -> Option<usize> {
-        let visual_idx = self.state.borrow().selected()?;
-        self.visual_lines.get(visual_idx).map(|l| l.logical_idx)
+        let layout_idx = self.state.borrow().selected()?;
+        self.layout_lines.get(layout_idx).map(|l| l.logical_idx)
     }
 
-    fn selected_visual_line_identity(&self) -> Option<VisualLineIdentity> {
-        let visual_idx = self.state.borrow().selected()?;
-        let visual_lines = self.visual_lines.borrow();
-        let line = visual_lines.get(visual_idx)?;
+    fn selected_layout_line_identity(
+        &self,
+        logical_lines: &[LogicalLine],
+    ) -> Option<LayoutLineIdentity> {
+        let layout_idx = self.state.borrow().selected()?;
+        let layout_lines = self.layout_lines.borrow();
+        let line = layout_lines.get(layout_idx)?;
 
-        match line.code_id {
+        match line.code_id(logical_lines) {
             Some(id) => {
-                let first_logical_idx = visual_lines
+                let first_logical_idx = layout_lines
                     .iter()
-                    .find(|line| line.code_id == Some(id))?
+                    .find(|line| line.code_id(logical_lines) == Some(id))?
                     .logical_idx;
-                Some(VisualLineIdentity::Code {
+                Some(LayoutLineIdentity::Code {
                     id,
                     line_idx: line.logical_idx.saturating_sub(first_logical_idx),
                     wrap_idx: line.wrap_idx,
                 })
             }
-            None => Some(VisualLineIdentity::Document {
+            None => Some(LayoutLineIdentity::Document {
                 logical_idx: line.logical_idx,
                 wrap_idx: line.wrap_idx,
             }),
         }
     }
 
-    fn visual_idx_for_identity(&self, identity: VisualLineIdentity) -> Option<usize> {
-        let visual_lines = self.visual_lines.borrow();
+    fn layout_idx_for_identity(&self, identity: LayoutLineIdentity) -> Option<usize> {
+        let layout_lines = self.layout_lines.borrow();
         let (logical_idx, wrap_idx) = match identity {
-            VisualLineIdentity::Code {
+            LayoutLineIdentity::Code {
                 id,
                 line_idx,
                 wrap_idx,
             } => {
-                let first_logical_idx = visual_lines
+                let first_logical_idx = layout_lines
                     .iter()
-                    .find(|line| line.code_id == Some(id))?
+                    .find(|line| line.code_id(&self.logical_lines) == Some(id))?
                     .logical_idx;
                 (first_logical_idx + line_idx, wrap_idx)
             }
-            VisualLineIdentity::Document {
+            LayoutLineIdentity::Document {
                 logical_idx,
                 wrap_idx,
             } => (logical_idx, wrap_idx),
         };
 
-        visual_lines
+        layout_lines
             .iter()
             .position(|line| line.logical_idx == logical_idx && line.wrap_idx == wrap_idx)
             .or_else(|| {
-                visual_lines
+                layout_lines
                     .iter()
                     .position(|line| line.logical_idx == logical_idx)
             })
     }
 
-    fn visual_extent_for_code(&self, id: CodeId) -> Option<(usize, usize)> {
-        let visual_lines = self.visual_lines.borrow();
-        let mut indices = visual_lines
+    fn layout_extent_for_code(
+        &self,
+        id: CodeId,
+        logical_lines: &[LogicalLine],
+    ) -> Option<(usize, usize)> {
+        let layout_lines = self.layout_lines.borrow();
+        let mut indices = layout_lines
             .iter()
             .enumerate()
-            .filter_map(|(idx, line)| (line.code_id == Some(id)).then_some(idx));
+            .filter_map(|(idx, line)| (line.code_id(logical_lines) == Some(id)).then_some(idx));
         let first = indices.next()?;
         let end = indices.next_back().unwrap_or(first);
         Some((end, end - first + 1))
@@ -485,11 +505,11 @@ impl Preview {
         id: CodeId,
         previous_rows: usize,
     ) -> usize {
-        let viewport = self.visual_lines.last_height();
+        let viewport = self.layout_lines.last_height();
         if viewport == 0 {
             return offset;
         }
-        let Some((end, rows)) = self.visual_extent_for_code(id) else {
+        let Some((end, rows)) = self.layout_extent_for_code(id, &self.logical_lines) else {
             return offset;
         };
         if rows <= previous_rows || end < offset.saturating_add(viewport) {
@@ -501,7 +521,7 @@ impl Preview {
     /// Reserves rows below a code block for an alternate-screen PTY and
     /// minimally scrolls the preview when the remaining viewport is too small.
     pub fn fit_inline_pty_rows(&self, id: CodeId, viewport: usize) -> Option<usize> {
-        let (start, end) = self.source_visual_extent(id)?;
+        let (start, end) = self.source_layout_extent(id)?;
         let source_rows = end.saturating_sub(start).saturating_add(1);
         let offset = self.state.borrow().offset();
         let (rows, new_offset) = inline_pty_rows(viewport, end, source_rows, offset);
@@ -512,11 +532,11 @@ impl Preview {
         Some(rows)
     }
 
-    fn source_visual_extent(&self, id: CodeId) -> Option<(usize, usize)> {
-        let visual_lines = self.visual_lines.borrow();
-        let mut indices = visual_lines.iter().enumerate().filter_map(|(idx, line)| {
-            let logical_line = self.logical_lines.get(line.logical_idx)?;
-            (line.code_id == Some(id)
+    fn source_layout_extent(&self, id: CodeId) -> Option<(usize, usize)> {
+        let layout_lines = self.layout_lines.borrow();
+        let mut indices = layout_lines.iter().enumerate().filter_map(|(idx, line)| {
+            let logical_line = line.logical(&self.logical_lines);
+            (logical_line.code_id == Some(id)
                 && (logical_line.is_code_info() || logical_line.is_code_body()))
             .then_some(idx)
         });
@@ -529,8 +549,8 @@ impl Preview {
         self.inline_max_lines.get()
     }
 
-    fn visual_idx_of_logical(&self, logical_idx: usize) -> Option<usize> {
-        self.visual_lines.visual_idx_of_logical(logical_idx)
+    fn layout_idx_of_logical(&self, logical_idx: usize) -> Option<usize> {
+        self.layout_lines.layout_idx_of_logical(logical_idx)
     }
 
     fn set_inline_max_lines(&self, height: usize) -> bool {
@@ -553,11 +573,11 @@ impl Preview {
         if term.is_empty() {
             return vec![];
         }
-        self.search.matches(&self.visual_lines.borrow())
+        self.search.matches(&self.layout_lines.borrow())
     }
 
     pub fn select_search_match(&mut self, idx: usize) -> Option<CodeId> {
-        let max = self.visual_lines.len().saturating_sub(1);
+        let max = self.layout_lines.len().saturating_sub(1);
         self.select_and_scroll_smooth(idx.min(max));
         self.selected_code_id()
     }
@@ -568,8 +588,10 @@ impl Preview {
     }
 
     pub fn selected_code_id(&self) -> Option<CodeId> {
-        let sel = self.state.borrow().selected()?;
-        self.visual_lines.get(sel)?.code_id
+        let selected = self.state.borrow().selected()?;
+        self.layout_lines
+            .get(selected)?
+            .code_id(&self.logical_lines)
     }
 
     /// Returns the 0-based row within the preview content area, or `None` if
@@ -584,7 +606,7 @@ impl Preview {
         Some(mouse.row.saturating_sub(content_y) as usize)
     }
 
-    /// Returns the code block owning the visual row under a mouse event.
+    /// Returns the code block owning the layout row under a mouse event.
     ///
     /// Hit-tests by viewport row only. This treats code info, code body, and
     pub fn code_id_at_mouse(&self, mouse: &crossterm::event::MouseEvent) -> Option<CodeId> {
@@ -592,8 +614,10 @@ impl Preview {
             return None;
         }
         let rel_row = self.mouse_content_rel_row(mouse)?;
-        let visual_idx = self.state.borrow().offset() + rel_row;
-        self.visual_lines.get(visual_idx)?.code_id
+        let layout_idx = self.state.borrow().offset() + rel_row;
+        self.layout_lines
+            .get(layout_idx)?
+            .code_id(&self.logical_lines)
     }
 
     /// Looks up the raw `Code` node by ID from the flat Vec index.
@@ -608,10 +632,8 @@ impl Preview {
 
     /// Converts a mouse click on the selected code block into PTY-relative
     /// SGR coordinates `(col, row)`, 1-based.
-    ///
-    /// Returns `None` when the click falls outside the code block's visual
-    /// extent (before its first visual line or after its last) or when the
-    /// block is not visible.
+    /// Returns `None` when the click falls outside the code block's layout
+    /// extent or when the block is not visible.
     pub fn mouse_to_pty_coords(
         &self,
         id: CodeId,
@@ -622,19 +644,17 @@ impl Preview {
         let area = self.last_area.get();
         let rel_row = self.mouse_content_rel_row(mouse)?;
         let state_offset = self.state.borrow().offset();
-        let visual_idx = state_offset + rel_row;
+        let layout_idx = state_offset + rel_row;
 
-        let block_first = self
-            .visual_lines
-            .find_code_start(id, |i| self.is_code_start_at(i))?;
+        let block_first = self.layout_lines.find_code_start(id, &self.logical_lines)?;
 
-        // The clicked visual line must belong to the selected code block.
-        match self.visual_lines.get(visual_idx) {
-            Some(vl) if vl.code_id == Some(id) => {}
+        // The clicked layout line must belong to the selected code block.
+        match self.layout_lines.get(layout_idx) {
+            Some(line) if line.code_id(&self.logical_lines) == Some(id) => {}
             _ => return None,
         }
 
-        let pty_row = visual_idx - block_first + 1;
+        let pty_row = layout_idx - block_first + 1;
         if pty_row > pty_rows as usize {
             return None;
         }
@@ -655,104 +675,59 @@ impl Preview {
         self.code_prefix_overhead.get(&id).copied().unwrap_or(0)
     }
 
-    /// Returns the currently selected visual line index, or `0` if none.
+    /// Returns the selected layout-line index, or `0`.
     fn selected_idx(&self) -> usize {
         self.state.borrow().selected().unwrap_or(0)
     }
 
-    /// Returns `true` when the logical line at `logical_idx` is a code-start.
-    fn is_code_start_at(&self, logical_idx: usize) -> bool {
-        self.logical_lines
-            .get(logical_idx)
-            .is_some_and(|ll| ll.is_code_start)
-    }
-
-    /// Builds the syntax-free layout row represented by `visual_line`.
-    fn plain_visual_line(&self, visual_line: &VisualLine) -> Line<'static> {
+    /// Builds a [`CopyLine`] from a layout line.
+    fn copy_line_at(&self, line_idx: usize) -> Option<CopyLine> {
+        let line = self.layout_lines.get(line_idx)?;
         let ctx = RenderContext {
             theme: &self.theme,
             active_code_id: None,
             prefer_status_gutter: None,
             spinner_char: ' ',
-            viewport_width: self.visual_lines.last_width(),
+            viewport_width: self.layout_lines.last_width(),
         };
-        let logical_line = &self.logical_lines[visual_line.logical_idx];
-        if logical_line.is_image() && visual_line.wrap_idx > 0 {
-            return Line::raw("");
-        }
-        let source_line = logical_line.render_plain(&ctx);
-        if logical_line.is_unwrappable() {
-            source_line
-        } else {
-            slice_line(&source_line, visual_line.char_range.clone())
-        }
-    }
-
-    /// Builds a [`CopyLine`] from the visual line at `line_idx`.
-    fn copy_line_at(&self, line_idx: usize) -> Option<CopyLine> {
-        let vl = self.visual_lines.get(line_idx)?;
-        let line = self.plain_visual_line(&vl);
-        let mut text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-        let has_code_gutter = self.logical_lines[vl.logical_idx].has_code_gutter();
+        let rendered = line.render_plain(&self.logical_lines[line.logical_idx], &ctx);
+        let mut text: String = rendered
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        let has_code_gutter = self.logical_lines[line.logical_idx].has_code_gutter();
         let display_prefix_len = match (has_code_gutter, text.strip_prefix("▎ ")) {
             (true, Some(stripped)) => {
                 text = stripped.to_string();
                 CODE_GUTTER_WIDTH
             }
-            (true, None) if vl.wrap_idx > 0 => CODE_GUTTER_WIDTH,
+            (true, None) if line.wrap_idx > 0 => CODE_GUTTER_WIDTH,
             _ => 0,
         };
         Some(CopyLine {
             text,
-            is_continuation: vl.char_range.start > 0,
+            is_continuation: line.char_range.start > 0,
             display_prefix_len,
         })
     }
 
-    fn render_visual_line_from(
-        &self,
-        visual_line: &VisualLine,
-        source_line: &Line<'static>,
-        ctx: &RenderContext<'_>,
-    ) -> Line<'static> {
-        let logical_line = &self.logical_lines[visual_line.logical_idx];
-        let mut line = if logical_line.is_unwrappable() {
-            source_line.clone()
-        } else {
-            slice_line(source_line, visual_line.char_range.clone())
-        };
-
-        if logical_line.has_code_gutter() && visual_line.wrap_idx > 0 {
-            let is_active = ctx.active_code_id == visual_line.code_id;
-            apply_gutter(
-                &mut line,
-                logical_line.is_unwrappable(),
-                is_active,
-                ctx.theme,
-                logical_line.gutter_fg,
-                ctx.prefer_status_gutter == visual_line.code_id,
-                logical_line.gutter_fg == Some(ctx.theme.warning),
-            );
-        }
-        line
-    }
-
     pub fn page_down(&mut self) {
-        let lh = self.visual_lines.last_height();
+        let lh = self.layout_lines.last_height();
         let current = self.selected_idx();
-        let next = (current + lh).min(self.visual_lines.len().saturating_sub(1));
+        let next = (current + lh).min(self.layout_lines.len().saturating_sub(1));
         self.select_and_scroll_smooth(next);
     }
 
     pub fn page_up(&mut self) {
-        let lh = self.visual_lines.last_height();
+        let lh = self.layout_lines.last_height();
         let current = self.selected_idx();
         let next = current.saturating_sub(lh);
         self.select_and_scroll_smooth(next);
     }
 
     pub fn scroll_down(&mut self) {
-        let len = self.visual_lines.len();
+        let len = self.layout_lines.len();
         if len == 0 {
             let mut state = self.state.borrow_mut();
             state.select(None);
@@ -767,7 +742,7 @@ impl Preview {
 
     pub fn scroll_up(&mut self) {
         let mut state = self.state.borrow_mut();
-        if self.visual_lines.is_empty() {
+        if self.layout_lines.is_empty() {
             state.select(None);
             *state.offset_mut() = 0;
             return;
@@ -786,10 +761,7 @@ impl Preview {
     /// Selects a code block by ID, snapping it to the viewport top unless
     /// enough of the block is already visible to make the selection clear.
     pub fn select_code(&mut self, id: CodeId) {
-        let Some(idx) = self
-            .visual_lines
-            .find_code_start(id, |idx| self.is_code_start_at(idx))
-        else {
+        let Some(idx) = self.layout_lines.find_code_start(id, &self.logical_lines) else {
             self.target_block.set(Some(id));
             return;
         };
@@ -806,10 +778,7 @@ impl Preview {
     /// Selects an already-visible code block without moving the viewport.
     pub fn select_code_in_place(&mut self, id: CodeId) {
         self.target_block.set(None);
-        if let Some(idx) = self
-            .visual_lines
-            .find_code_start(id, |idx| self.is_code_start_at(idx))
-        {
+        if let Some(idx) = self.layout_lines.find_code_start(id, &self.logical_lines) {
             self.state.borrow_mut().select(Some(idx));
         }
     }
@@ -820,15 +789,15 @@ impl Preview {
         for (logical_idx, line) in self.logical_lines.iter().enumerate() {
             if line.heading_level().is_some() {
                 if count == heading_idx {
-                    if let Some(visual_idx) = self.visual_idx_of_logical(logical_idx) {
+                    if let Some(layout_idx) = self.layout_idx_of_logical(logical_idx) {
                         let (offset, height) = {
                             let state = self.state.borrow();
-                            (state.offset(), self.visual_lines.last_height())
+                            (state.offset(), self.layout_lines.last_height())
                         };
-                        if visual_idx >= offset && visual_idx < offset + height {
-                            self.state.borrow_mut().select(Some(visual_idx));
+                        if layout_idx >= offset && layout_idx < offset + height {
+                            self.state.borrow_mut().select(Some(layout_idx));
                         } else {
-                            self.select_and_scroll_smooth(visual_idx);
+                            self.select_and_scroll_smooth(layout_idx);
                         }
                     }
                     return;
@@ -841,7 +810,7 @@ impl Preview {
     fn has_code_navigation_context(&self, idx: usize) -> bool {
         let state = self.state.borrow();
         let offset = state.offset();
-        let height = self.visual_lines.last_height();
+        let height = self.layout_lines.last_height();
         let required_rows = CODE_NAVIGATION_CONTEXT_ROWS.min(height);
 
         height > 0
@@ -886,39 +855,18 @@ impl Preview {
                 if !crate::utils::mouse_in_area(&mouse, area) {
                     return None;
                 }
-                let visual_lines = self.visual_lines.borrow();
-                let state_offset = self.state.borrow().offset();
-                let pos = SelectionState::mouse_to_position(
-                    area,
-                    mouse.row,
-                    mouse.column,
-                    PREVIEW_CONTENT_X_OFFSET,
-                    |rel_row| {
-                        let vidx = state_offset + rel_row;
-                        visual_lines.get(vidx).map(|vl| {
-                            let ctx = RenderContext {
-                                theme: &self.theme,
-                                active_code_id: None,
-                                prefer_status_gutter: None,
-                                spinner_char: ' ',
-                                viewport_width: self.visual_lines.last_width(),
-                            };
-                            let source_line = self.logical_lines[vl.logical_idx].render_plain(&ctx);
-                            (vidx, self.render_visual_line_from(vl, &source_line, &ctx))
-                        })
-                    },
-                );
-                drop(visual_lines);
-                if let Some((vidx, cidx)) = pos {
-                    // Tracks the clicked visual line for selection/menu sync without
+                let pos = self.mouse_selection_position(area, mouse.row, mouse.column);
+                if let Some((layout_idx, char_idx)) = pos {
+                    // Tracks the clicked layout line for selection/menu sync without
                     // moving the viewport. Mouse-wheel scroll uses the viewport
                     // offset, so scroll-after-click continues from the current view.
-                    self.state.borrow_mut().select(Some(vidx));
-                    let visual_lines = self.visual_lines.borrow();
-                    self.selection
-                        .set_pending_code_click(visual_lines.get(vidx).and_then(|vl| vl.code_id));
-                    drop(visual_lines);
-                    self.selection.start(vidx, cidx);
+                    self.state.borrow_mut().select(Some(layout_idx));
+                    let pending_code = self
+                        .layout_lines
+                        .get(layout_idx)
+                        .and_then(|line| line.code_id(&self.logical_lines));
+                    self.selection.set_pending_code_click(pending_code);
+                    self.selection.start(layout_idx, char_idx);
                 } else {
                     self.selection.set_pending_code_click(None);
                     self.selection.clear();
@@ -931,8 +879,6 @@ impl Preview {
                 }
                 self.selection.set_pending_code_click(None);
                 let area = self.last_area.get();
-                let visual_lines = self.visual_lines.borrow();
-                let state_offset = self.state.borrow().offset();
                 let content_y = area.y + PREVIEW_CONTENT_TOP_OFFSET;
                 let content_bottom = area.y + area.height.saturating_sub(BORDER_HEIGHT as u16);
                 let clamped_row = mouse.row.clamp(content_y, content_bottom);
@@ -940,29 +886,9 @@ impl Preview {
                     area.x + PREVIEW_CONTENT_X_OFFSET,
                     area.x + area.width.saturating_sub(PREVIEW_CONTENT_X_OFFSET),
                 );
-                let pos = SelectionState::mouse_to_position(
-                    area,
-                    clamped_row,
-                    clamped_col,
-                    PREVIEW_CONTENT_X_OFFSET,
-                    |rel_row| {
-                        let vidx = state_offset + rel_row;
-                        visual_lines.get(vidx).map(|vl| {
-                            let ctx = RenderContext {
-                                theme: &self.theme,
-                                active_code_id: None,
-                                prefer_status_gutter: None,
-                                spinner_char: ' ',
-                                viewport_width: self.visual_lines.last_width(),
-                            };
-                            let source_line = self.logical_lines[vl.logical_idx].render_plain(&ctx);
-                            (vidx, self.render_visual_line_from(vl, &source_line, &ctx))
-                        })
-                    },
-                );
-                drop(visual_lines);
-                if let Some((vidx, cidx)) = pos {
-                    self.selection.extend(vidx, cidx);
+                let pos = self.mouse_selection_position(area, clamped_row, clamped_col);
+                if let Some((layout_idx, char_idx)) = pos {
+                    self.selection.extend(layout_idx, char_idx);
                     Some(Action::Select)
                 } else {
                     None
@@ -991,6 +917,40 @@ impl Preview {
             }
             _ => None,
         }
+    }
+
+    fn mouse_selection_position(
+        &self,
+        area: Rect,
+        row: u16,
+        column: u16,
+    ) -> Option<(usize, usize)> {
+        let layout_lines = self.layout_lines.borrow();
+        let offset = self.state.borrow().offset();
+        let ctx = RenderContext {
+            theme: &self.theme,
+            active_code_id: None,
+            prefer_status_gutter: None,
+            spinner_char: ' ',
+            viewport_width: self.layout_lines.last_width(),
+        };
+
+        SelectionState::mouse_to_position(
+            area,
+            row,
+            column,
+            PREVIEW_CONTENT_X_OFFSET,
+            |relative_row| {
+                let layout_idx = offset + relative_row;
+                let layout_line = layout_lines.get(layout_idx)?;
+                let logical_line = layout_line.logical(&self.logical_lines);
+                let rendered_line = logical_line.render_plain(&ctx);
+                Some((
+                    layout_idx,
+                    layout_line.render(logical_line, &rendered_line, &ctx),
+                ))
+            },
+        )
     }
 }
 
@@ -1071,19 +1031,19 @@ impl Output for Preview {
     fn render(&self, frame: &mut Frame, area: Rect) {
         let height = area.height as usize;
         let width = area.width as usize;
-        self.visual_lines
+        self.layout_lines
             .set_last_height(height.saturating_sub(BORDER_HEIGHT));
         self.last_area.set(area);
 
         self.request_visible_images();
 
-        if self.visual_lines.last_width() != width && width > 0 {
+        if self.layout_lines.last_width() != width && width > 0 {
             self.images.borrow_mut().set_width(self.image_width(width));
-            self.rebuild_visual_lines(width);
+            self.rebuild_layout_lines(width);
         }
 
-        let visual_lines = self.visual_lines.borrow();
-        if visual_lines.is_empty() {
+        let layout_lines = self.layout_lines.borrow();
+        if layout_lines.is_empty() {
             return;
         }
 
@@ -1095,11 +1055,13 @@ impl Output for Preview {
         drop(state);
 
         let win_start = original_offset.saturating_sub(overdraw);
-        let win_end = (original_offset + viewport + overdraw).min(visual_lines.len());
-        let window = &visual_lines[win_start..win_end];
+        let win_end = (original_offset + viewport + overdraw).min(layout_lines.len());
+        let window = &layout_lines[win_start..win_end];
 
         let selected_idx = original_selected.unwrap_or(0);
-        let active_code_id = visual_lines.get(selected_idx).and_then(|l| l.code_id);
+        let active_code_id = layout_lines
+            .get(selected_idx)
+            .and_then(|line| line.code_id(&self.logical_lines));
         // Status gutter persists while selected; consumed on navigate-away.
         let prefer_status_gutter = match self.prefer_status_gutter.get() {
             Some(id) if active_code_id == Some(id) => Some(id),
@@ -1118,60 +1080,33 @@ impl Output for Preview {
             viewport_width: width,
         };
 
-        let render_start = original_offset.saturating_sub(viewport);
-        let render_end = original_offset
-            .saturating_add(viewport.saturating_mul(2))
-            .min(visual_lines.len());
-        let mut warmed = HashSet::new();
-        let mut cache_misses = 0;
-        for visual_line in &visual_lines[render_start..render_end] {
-            if warmed.insert(visual_line.logical_idx)
-                && self.logical_lines[visual_line.logical_idx].ensure_rendered(&ctx)
-            {
-                cache_misses += 1;
-            }
-        }
+        self.prefetch_content(&layout_lines, original_offset, viewport, &ctx);
 
-        let mut rendered_logical = HashMap::new();
-        for visual_line in window {
-            rendered_logical
-                .entry(visual_line.logical_idx)
-                .or_insert_with(|| self.logical_lines[visual_line.logical_idx].render(&ctx));
-        }
-
+        // Wrapped rows share one rendered logical line per frame.
+        let mut rendered_lines = HashMap::new();
         let mut items = Vec::with_capacity(window.len());
         let mut image_rows = Vec::new();
-        for (win_i, visual_line) in window.iter().enumerate() {
-            let visual_idx = win_start + win_i;
-            let logical_idx = visual_line.logical_idx;
+        for (win_i, layout_line) in window.iter().enumerate() {
+            let layout_idx = win_start + win_i;
+            let logical_idx = layout_line.logical_idx;
             let logical_line = &self.logical_lines[logical_idx];
 
-            if logical_line.is_image() {
-                // Record the first visible row of each image
-                let first_visible_row = win_i == 0 || window[win_i - 1].logical_idx != logical_idx;
-                if first_visible_row {
-                    let first_global = visual_idx as i32 - visual_line.wrap_idx as i32;
+            // Render each logical line and register each image once.
+            let rendered_line = rendered_lines.entry(logical_idx).or_insert_with(|| {
+                if logical_line.is_image() {
+                    let first_global = layout_idx as i32 - layout_line.wrap_idx as i32;
                     image_rows.push((logical_idx, first_global));
                 }
-
-                // The image widget paints continuation rows after the list.
-                if visual_line.wrap_idx > 0 {
-                    items.push(ListItem::new(Text::raw("")));
-                    continue;
-                }
-            }
-
-            let source_line = rendered_logical
-                .get(&logical_idx)
-                .expect("visible logical line was rendered");
-            let mut line = self.render_visual_line_from(visual_line, source_line, &ctx);
+                logical_line.render(&ctx)
+            });
+            let mut line = layout_line.render(logical_line, rendered_line, &ctx);
             if let Some(term) = self.search.term() {
                 line = highlight_line(line, term, self.theme.search_highlight_style());
             }
 
             if let Some((sel_start, sel_end)) = self
                 .selection
-                .range_for_line(visual_idx, line.to_string().chars().count())
+                .range_for_line(layout_idx, line.to_string().chars().count())
             {
                 line = SelectionState::apply_range(
                     line,
@@ -1184,15 +1119,7 @@ impl Output for Preview {
             items.push(ListItem::new(Text::from(line)));
         }
 
-        if cache_misses > 0 {
-            tracing::debug!(
-                visual_rows = window.len(),
-                logical_lines = warmed.len(),
-                cache_misses,
-                "populated viewport content cache"
-            );
-        }
-        drop(visual_lines);
+        drop(layout_lines);
 
         let mut render_state = *self.state.borrow();
         *render_state.offset_mut() = original_offset.saturating_sub(win_start);
@@ -1214,6 +1141,37 @@ impl Output for Preview {
 }
 
 impl Preview {
+    fn prefetch_content(
+        &self,
+        layout_lines: &[LayoutLine],
+        offset: usize,
+        viewport: usize,
+        ctx: &RenderContext<'_>,
+    ) {
+        let start = offset.saturating_sub(viewport);
+        let end = offset
+            .saturating_add(viewport.saturating_mul(2))
+            .min(layout_lines.len());
+        let mut prefetched = HashSet::new();
+        let mut populated_caches = 0;
+        for layout_line in &layout_lines[start..end] {
+            if prefetched.insert(layout_line.logical_idx)
+                && layout_line
+                    .logical(&self.logical_lines)
+                    .ensure_rendered(ctx)
+            {
+                populated_caches += 1;
+            }
+        }
+        if populated_caches > 0 {
+            tracing::debug!(
+                prefetched_lines = prefetched.len(),
+                populated_caches,
+                "prefetched preview content caches"
+            );
+        }
+    }
+
     /// Draws loaded images over their reserved viewport rows.
     fn render_images(
         &self,
@@ -1314,39 +1272,51 @@ mod tests {
     #[test]
     fn image_continuation_rows_have_no_copy_text() {
         let preview = preview_from_markdown("![alt](image.png)");
-        let row = VisualLine {
-            code_id: None,
+        let row = LayoutLine {
             logical_idx: 0,
             wrap_idx: 1,
             char_range: 0..0,
         };
 
-        assert!(preview.plain_visual_line(&row).to_string().is_empty());
+        assert!(row
+            .render_plain(
+                &preview.logical_lines[0],
+                &RenderContext {
+                    theme: &preview.theme,
+                    active_code_id: None,
+                    prefer_status_gutter: None,
+                    spinner_char: ' ',
+                    viewport_width: 80,
+                }
+            )
+            .to_string()
+            .is_empty());
     }
 
-    fn render_visual_line(
+    fn render_layout_line(
         preview: &Preview,
-        visual_line: &VisualLine,
+        layout_line: &LayoutLine,
         ctx: &RenderContext<'_>,
     ) -> Line<'static> {
-        let source_line = preview.logical_lines[visual_line.logical_idx].render(ctx);
-        preview.render_visual_line_from(visual_line, &source_line, ctx)
+        let logical_line = &preview.logical_lines[layout_line.logical_idx];
+        let rendered_line = logical_line.render(ctx);
+        layout_line.render(logical_line, &rendered_line, ctx)
     }
 
-    /// Renders every visual row to its final text, joined with newlines.
+    /// Renders every layout row to its final text, joined with newlines.
     fn full_preview_text(preview: &Preview) -> String {
         let ctx = RenderContext {
             theme: &preview.theme,
             active_code_id: None,
             prefer_status_gutter: None,
             spinner_char: ' ',
-            viewport_width: preview.visual_lines.last_width(),
+            viewport_width: preview.layout_lines.last_width(),
         };
         preview
-            .visual_lines
+            .layout_lines
             .borrow()
             .iter()
-            .map(|vl| render_visual_line(preview, vl, &ctx).to_string())
+            .map(|vl| render_layout_line(preview, vl, &ctx).to_string())
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -1354,49 +1324,49 @@ mod tests {
     #[test]
     fn snapshot_full_heading() {
         let preview = preview_from_markdown("# Title\n\n## Subtitle");
-        preview.rebuild_visual_lines(60);
+        preview.rebuild_layout_lines(60);
         assert_snapshot!("full_heading", full_preview_text(&preview));
     }
 
     #[test]
     fn snapshot_full_paragraph_wrap() {
         let preview = preview_from_markdown("A short paragraph.\n\nA much longer paragraph that will wrap when the available width is narrower than its content.");
-        preview.rebuild_visual_lines(30);
+        preview.rebuild_layout_lines(30);
         assert_snapshot!("full_paragraph_wrap", full_preview_text(&preview));
     }
 
     #[test]
     fn snapshot_full_fenced_code() {
         let preview = preview_from_markdown("```bash\necho hello\n```");
-        preview.rebuild_visual_lines(60);
+        preview.rebuild_layout_lines(60);
         assert_snapshot!("full_fenced_code", full_preview_text(&preview));
     }
 
     #[test]
     fn snapshot_full_code_wrap() {
         let preview = preview_from_markdown("```rust\nfn very_long_function_name_that_exceeds_narrow_width() -> VeryLongReturnType {}\n```");
-        preview.rebuild_visual_lines(30);
+        preview.rebuild_layout_lines(30);
         assert_snapshot!("full_code_wrap", full_preview_text(&preview));
     }
 
     #[test]
     fn snapshot_full_bullet_list() {
         let preview = preview_from_markdown("- item one\n- item two\n- item three");
-        preview.rebuild_visual_lines(60);
+        preview.rebuild_layout_lines(60);
         assert_snapshot!("full_bullet_list", full_preview_text(&preview));
     }
 
     #[test]
     fn snapshot_full_task_list() {
         let preview = preview_from_markdown("- [ ] unchecked\n- [x] checked\n- [ ] pending");
-        preview.rebuild_visual_lines(60);
+        preview.rebuild_layout_lines(60);
         assert_snapshot!("full_task_list", full_preview_text(&preview));
     }
 
     #[test]
     fn snapshot_full_blockquote() {
         let preview = preview_from_markdown("> quoted paragraph\n> ```bash\n> echo hi\n> ```");
-        preview.rebuild_visual_lines(60);
+        preview.rebuild_layout_lines(60);
         assert_snapshot!("full_blockquote", full_preview_text(&preview));
     }
 
@@ -1404,14 +1374,14 @@ mod tests {
     fn snapshot_full_table() {
         let preview =
             preview_from_markdown("| Name | Age |\n|------|-----|\n| Alice | 30 |\n| Bob | 25 |");
-        preview.rebuild_visual_lines(60);
+        preview.rebuild_layout_lines(60);
         assert_snapshot!("full_table", full_preview_text(&preview));
     }
 
     #[test]
     fn snapshot_full_thematic_break() {
         let preview = preview_from_markdown("above\n\n-----\n\nbelow");
-        preview.rebuild_visual_lines(60);
+        preview.rebuild_layout_lines(60);
         assert_snapshot!("full_thematic_break", full_preview_text(&preview));
     }
 
@@ -1419,14 +1389,14 @@ mod tests {
     fn snapshot_full_yaml_frontmatter() {
         let preview =
             preview_from_markdown("---\ntitle: Hello\ntags: [a, b]\n---\n# Doc\n\nBody text.\n");
-        preview.rebuild_visual_lines(60);
+        preview.rebuild_layout_lines(60);
         assert_snapshot!("full_yaml_frontmatter", full_preview_text(&preview));
     }
 
     #[test]
     fn snapshot_full_toml_frontmatter() {
         let preview = preview_from_markdown("+++\ntitle = \"Hello\"\nversion = 1\n+++\n# Doc\n");
-        preview.rebuild_visual_lines(60);
+        preview.rebuild_layout_lines(60);
         assert_snapshot!("full_toml_frontmatter", full_preview_text(&preview));
     }
 
@@ -1435,7 +1405,7 @@ mod tests {
         let preview = preview_from_markdown(
             "# Setup\n\nInstall deps.\n\n```bash\nnpm install\n```\n\n> note\n\n- a\n- b",
         );
-        preview.rebuild_visual_lines(40);
+        preview.rebuild_layout_lines(40);
         assert_snapshot!("full_mixed_runbook", full_preview_text(&preview));
     }
 
@@ -1449,7 +1419,7 @@ mod tests {
              - **bold item**\n\
              - *italic item*",
         );
-        preview.rebuild_visual_lines(60);
+        preview.rebuild_layout_lines(60);
         assert_snapshot!("full_inline_styles", full_preview_text(&preview));
     }
 
@@ -1458,19 +1428,19 @@ mod tests {
         let preview = preview_from_markdown(
             "start **[abcdefghijklmnopqrstuvwxyz](https://example.com)** end",
         );
-        preview.rebuild_visual_lines(12);
+        preview.rebuild_layout_lines(12);
         let ctx = RenderContext {
             theme: &preview.theme,
             active_code_id: None,
             prefer_status_gutter: None,
             spinner_char: ' ',
-            viewport_width: preview.visual_lines.last_width(),
+            viewport_width: preview.layout_lines.last_width(),
         };
         let rows: Vec<_> = preview
-            .visual_lines
+            .layout_lines
             .borrow()
             .iter()
-            .map(|visual_line| render_visual_line(&preview, visual_line, &ctx))
+            .map(|layout_line| render_layout_line(&preview, layout_line, &ctx))
             .collect();
         assert_snapshot!(
             "wrapped_inline_styles_nested_modifiers",
@@ -1481,17 +1451,17 @@ mod tests {
     #[test]
     fn test_rebuild_clamps_selection_when_lines_shrink() {
         let mut preview = preview_from_markdown("This is a very long paragraph that should wrap into several rows at narrow widths but fit in fewer rows at wider widths.");
-        preview.rebuild_visual_lines(20);
-        let last_idx = preview.visual_lines.borrow().len().saturating_sub(1);
+        preview.rebuild_layout_lines(20);
+        let last_idx = preview.layout_lines.borrow().len().saturating_sub(1);
         {
             let mut state = preview.state.borrow_mut();
             state.select(Some(last_idx));
             *state.offset_mut() = last_idx;
         }
         preview.select_code(2);
-        preview.rebuild_visual_lines(120);
+        preview.rebuild_layout_lines(120);
 
-        let len = preview.visual_lines.borrow().len();
+        let len = preview.layout_lines.borrow().len();
         let state = preview.state.borrow();
         assert!(state.selected().is_some_and(|idx| idx < len));
         assert!(state.offset() < len);
@@ -1504,15 +1474,15 @@ mod tests {
         );
 
         preview.select_code(2);
-        preview.rebuild_visual_lines(80);
+        preview.rebuild_layout_lines(80);
 
         let state = preview.state.borrow();
         assert!(state.offset() > 0);
         assert_eq!(
             preview
-                .visual_lines
+                .layout_lines
                 .get(state.offset())
-                .and_then(|line| line.code_id),
+                .and_then(|line| line.code_id(&preview.logical_lines)),
             Some(2)
         );
     }
@@ -1520,18 +1490,18 @@ mod tests {
     #[test]
     fn test_cached_code_line_updates_active_gutter() {
         let preview = preview_from_markdown("```bash\necho hello\n```");
-        preview.rebuild_visual_lines(80);
-        let visual_lines = preview.visual_lines.borrow();
-        let code_body_line = visual_lines
+        preview.rebuild_layout_lines(80);
+        let layout_lines = preview.layout_lines.borrow();
+        let code_body_line = layout_lines
             .iter()
             .find(|line| {
                 line.wrap_idx == 0
-                    && line.code_id == Some(1)
-                    && preview.logical_lines[line.logical_idx].is_code_body()
+                    && line.code_id(&preview.logical_lines) == Some(1)
+                    && line.logical(&preview.logical_lines).is_code_body()
             })
-            .expect("expected a code body visual line")
+            .expect("expected a code body layout line")
             .clone();
-        drop(visual_lines);
+        drop(layout_lines);
 
         let ctx = RenderContext {
             theme: &preview.theme,
@@ -1540,7 +1510,7 @@ mod tests {
             spinner_char: ' ',
             viewport_width: 80,
         };
-        let rendered = render_visual_line(&preview, &code_body_line, &ctx);
+        let rendered = render_layout_line(&preview, &code_body_line, &ctx);
 
         assert_eq!(
             rendered.spans.first().and_then(|s| s.style.fg),
@@ -1567,22 +1537,22 @@ mod tests {
             keymap,
             std::path::PathBuf::from("."),
         );
-        preview.rebuild_visual_lines(80);
+        preview.rebuild_layout_lines(80);
         let code_info = preview
             .logical_lines
             .iter()
             .find(|line| line.is_code_info())
             .expect("expected a code info logical line");
         let code_body = preview
-            .visual_lines
+            .layout_lines
             .borrow()
             .iter()
             .find(|line| {
                 line.wrap_idx == 0
-                    && line.code_id == Some(1)
-                    && preview.logical_lines[line.logical_idx].is_code_body()
+                    && line.code_id(&preview.logical_lines) == Some(1)
+                    && line.logical(&preview.logical_lines).is_code_body()
             })
-            .expect("expected a code body visual line")
+            .expect("expected a code body layout line")
             .clone();
 
         let active_ctx = RenderContext {
@@ -1593,7 +1563,7 @@ mod tests {
             viewport_width: 80,
         };
         let active_info = code_info.render(&active_ctx);
-        let active_body = render_visual_line(&preview, &code_body, &active_ctx);
+        let active_body = render_layout_line(&preview, &code_body, &active_ctx);
 
         assert_eq!(
             active_info.spans.first().and_then(|span| span.style.fg),
@@ -1612,7 +1582,7 @@ mod tests {
             viewport_width: 80,
         };
         let status_info = code_info.render(&status_ctx);
-        let status_body = render_visual_line(&preview, &code_body, &status_ctx);
+        let status_body = render_layout_line(&preview, &code_body, &status_ctx);
 
         assert_eq!(
             status_info.spans.first().and_then(|span| span.style.fg),
@@ -1655,19 +1625,20 @@ mod tests {
     fn test_plain_text_stays_inactive_when_no_code_selected() {
         let preview =
             preview_from_markdown("# Review Findings\n\nCode review of `upmd`, `upmd-parser`.\n");
-        preview.rebuild_visual_lines(80);
-        let visual_lines = preview.visual_lines.borrow();
-        let paragraph_line = visual_lines
+        preview.rebuild_layout_lines(80);
+        let layout_lines = preview.layout_lines.borrow();
+        let paragraph_line = layout_lines
             .iter()
             .find(|line| {
-                line.code_id.is_none()
-                    && preview.logical_lines[line.logical_idx]
+                line.code_id(&preview.logical_lines).is_none()
+                    && line
+                        .logical(&preview.logical_lines)
                         .text_content()
                         .starts_with("Code review")
             })
-            .expect("expected a paragraph visual line")
+            .expect("expected a paragraph layout line")
             .clone();
-        drop(visual_lines);
+        drop(layout_lines);
 
         let ctx = RenderContext {
             theme: &preview.theme,
@@ -1676,7 +1647,7 @@ mod tests {
             spinner_char: ' ',
             viewport_width: 80,
         };
-        let rendered = render_visual_line(&preview, &paragraph_line, &ctx);
+        let rendered = render_layout_line(&preview, &paragraph_line, &ctx);
 
         assert_ne!(
             rendered.spans.first().and_then(|span| span.style.fg),
@@ -1687,17 +1658,28 @@ mod tests {
     #[test]
     fn test_copy_code_line_excludes_gutter() {
         let preview = preview_from_markdown("```bash\necho hello\n```");
-        preview.rebuild_visual_lines(80);
+        preview.rebuild_layout_lines(80);
         let code_body_idx = preview
-            .visual_lines
+            .layout_lines
             .borrow()
             .iter()
             .position(|line| {
-                line.code_id == Some(1) && preview.logical_lines[line.logical_idx].is_code_body()
+                line.code_id(&preview.logical_lines) == Some(1)
+                    && line.logical(&preview.logical_lines).is_code_body()
             })
-            .expect("expected a code body visual line");
-        let display_len = preview
-            .plain_visual_line(&preview.visual_lines.borrow()[code_body_idx])
+            .expect("expected a code body layout line");
+        let line = &preview.layout_lines.borrow()[code_body_idx];
+        let display_len = line
+            .render_plain(
+                &preview.logical_lines[line.logical_idx],
+                &RenderContext {
+                    theme: &preview.theme,
+                    active_code_id: None,
+                    prefer_status_gutter: None,
+                    spinner_char: ' ',
+                    viewport_width: 80,
+                },
+            )
             .to_string()
             .chars()
             .count();
@@ -1716,16 +1698,16 @@ mod tests {
     #[test]
     fn test_mouse_to_pty_coords_handles_scroll_above_block_start() {
         let preview = preview_from_markdown("# Intro\n\n```bash\necho first\necho second\n```\n");
-        preview.rebuild_visual_lines(80);
+        preview.rebuild_layout_lines(80);
         preview.last_area.set(Rect::new(0, 0, 80, 20));
 
         // Collect visual indices belonging to code block 1.
         let block_vlines: Vec<usize> = preview
-            .visual_lines
+            .layout_lines
             .borrow()
             .iter()
             .enumerate()
-            .filter(|(_, vl)| vl.code_id == Some(1))
+            .filter(|(_, line)| line.code_id(&preview.logical_lines) == Some(1))
             .map(|(idx, _)| idx)
             .collect();
         let block_first = *block_vlines.first().expect("block 1 should exist");
@@ -1761,16 +1743,16 @@ mod tests {
         let preview = preview_from_markdown(
             "# Intro\n\n```bash\necho first\n```\n\n## Details\n\n```bash\necho second\n```\n",
         );
-        preview.rebuild_visual_lines(80);
+        preview.rebuild_layout_lines(80);
         preview.last_area.set(Rect::new(0, 0, 80, 20));
 
         // Find a visual index whose code_id is NOT block 1.
         let outside_vl = preview
-            .visual_lines
+            .layout_lines
             .borrow()
             .iter()
             .enumerate()
-            .find(|(_, vl)| vl.code_id != Some(1))
+            .find(|(_, line)| line.code_id(&preview.logical_lines) != Some(1))
             .map(|(idx, _)| idx)
             .expect("should have a non-block-1 visual line");
 
@@ -1800,23 +1782,24 @@ mod tests {
         }
     }
 
-    fn code_body_visual_idx(preview: &Preview) -> usize {
+    fn code_body_layout_idx(preview: &Preview) -> usize {
         preview
-            .visual_lines
+            .layout_lines
             .borrow()
             .iter()
             .position(|line| {
-                line.code_id == Some(1) && preview.logical_lines[line.logical_idx].is_code_body()
+                line.code_id(&preview.logical_lines) == Some(1)
+                    && line.logical(&preview.logical_lines).is_code_body()
             })
-            .expect("expected a code body visual line")
+            .expect("expected a code body layout line")
     }
 
     #[test]
     fn test_click_code_line_selects_code_block_on_release() {
         let preview = preview_from_markdown("```bash\necho hello\n```");
-        preview.rebuild_visual_lines(80);
+        preview.rebuild_layout_lines(80);
         preview.last_area.set(Rect::new(0, 0, 80, 10));
-        let row = code_body_visual_idx(&preview) as u16 + PREVIEW_CONTENT_TOP_OFFSET;
+        let row = code_body_layout_idx(&preview) as u16 + PREVIEW_CONTENT_TOP_OFFSET;
         let column = PREVIEW_CONTENT_X_OFFSET + 1;
 
         assert_eq!(
@@ -1840,9 +1823,9 @@ mod tests {
     #[test]
     fn test_drag_code_line_keeps_text_selection() {
         let preview = preview_from_markdown("```bash\necho hello\n```");
-        preview.rebuild_visual_lines(80);
+        preview.rebuild_layout_lines(80);
         preview.last_area.set(Rect::new(0, 0, 80, 10));
-        let row = code_body_visual_idx(&preview) as u16 + PREVIEW_CONTENT_TOP_OFFSET;
+        let row = code_body_layout_idx(&preview) as u16 + PREVIEW_CONTENT_TOP_OFFSET;
         let column = PREVIEW_CONTENT_X_OFFSET + 1;
 
         assert_eq!(
