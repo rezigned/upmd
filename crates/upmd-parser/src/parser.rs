@@ -5,59 +5,74 @@ use pulldown_cmark::{
 
 use super::nodes::{
     inline_text, semantic_text, Alignment, Codes, FrontmatterStyle, InlineSpan, InlineStyle,
-    ListItem, ListKind, Node, Table, TableCell, TaskStatus,
+    ListItem, ListKind, Node, NodeKind, SourceText, Table, TableCell, TaskStatus,
 };
 use super::options;
 
-pub struct Cmark;
+/// Markdown parser producing a complete [`super::Document`].
+pub struct Parser {
+    options: Options,
+}
 
-impl Default for Cmark {
+impl Default for Parser {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Cmark {
+impl Parser {
     pub fn new() -> Self {
-        Self {}
-    }
-}
-
-// Public API
-
-impl super::Parser for Cmark {
-    fn parse(&self, text: &str) -> super::Document {
-        let options = Options::ENABLE_TABLES
-            | Options::ENABLE_TASKLISTS
-            | Options::ENABLE_STRIKETHROUGH
-            | Options::ENABLE_YAML_STYLE_METADATA_BLOCKS
-            | Options::ENABLE_PLUSES_DELIMITED_METADATA_BLOCKS;
-        let parser = CmarkParser::new_ext(text, options).into_offset_iter();
-        let mut parser = Parser {
-            source: text,
-            iter: parser.peekable(),
-            codes: Codes::default(),
-            headings: Vec::new(),
-            line_starts: line_starts(text),
-        };
-        let nodes = parser.parse_document();
-        super::Document {
-            nodes,
-            codes: parser.codes,
-            headings: parser.headings,
-            nodes_state: super::NodesState::Full,
+        Self {
+            options: Options::ENABLE_TABLES
+                | Options::ENABLE_TASKLISTS
+                | Options::ENABLE_STRIKETHROUGH
+                | Options::ENABLE_YAML_STYLE_METADATA_BLOCKS
+                | Options::ENABLE_PLUSES_DELIMITED_METADATA_BLOCKS,
         }
     }
+
+    pub fn parse(&self, source: impl Into<String>) -> super::Document {
+        ParseState::parse(source.into(), self.options)
+    }
 }
 
-// Internal recursive-descent parser
-
-struct Parser<'a> {
+// Internal recursive-descent parser state for one document.
+struct ParseState<'a> {
     source: &'a str,
     iter: std::iter::Peekable<pulldown_cmark::OffsetIter<'a>>,
     codes: Codes,
     headings: Vec<super::Heading>,
     line_starts: Vec<usize>,
+}
+
+impl<'a> ParseState<'a> {
+    fn new(source: &'a str, options: Options) -> Self {
+        Self {
+            source,
+            iter: CmarkParser::new_ext(source, options)
+                .into_offset_iter()
+                .peekable(),
+            codes: Codes::default(),
+            headings: Vec::new(),
+            line_starts: line_starts(source),
+        }
+    }
+}
+
+impl ParseState<'_> {
+    fn parse(source: String, options: Options) -> super::Document {
+        let (nodes, codes, headings) = {
+            let mut state = ParseState::new(&source, options);
+            (state.parse_nodes(), state.codes, state.headings)
+        };
+        super::Document {
+            source,
+            nodes,
+            codes,
+            headings,
+            nodes_state: super::NodesState::Full,
+        }
+    }
 }
 
 fn line_starts(input: &str) -> Vec<usize> {
@@ -74,15 +89,15 @@ fn byte_to_line(line_starts: &[usize], byte: usize) -> usize {
     .max(1)
 }
 
-impl<'a> Parser<'a> {
-    fn parse_document(&mut self) -> Vec<Node> {
+impl<'a> ParseState<'a> {
+    fn parse_nodes(&mut self) -> Vec<Node> {
         let frontmatter = match self.iter.peek() {
             Some((Event::Start(Tag::MetadataBlock(kind)), range)) if range.start == 0 => {
-                Some(*kind)
+                Some((*kind, range.clone()))
             }
             _ => None,
         }
-        .map(|kind| self.parse_frontmatter(kind));
+        .map(|(kind, range)| Node::new(self.parse_frontmatter(kind), range));
 
         let mut nodes = self.parse_blocks(None);
         if let Some(frontmatter) = frontmatter {
@@ -91,7 +106,7 @@ impl<'a> Parser<'a> {
         nodes
     }
 
-    fn parse_frontmatter(&mut self, kind: MetadataBlockKind) -> Node {
+    fn parse_frontmatter(&mut self, kind: MetadataBlockKind) -> NodeKind {
         self.iter.next();
         let mut payload = None;
         for (event, range) in self.iter.by_ref() {
@@ -105,9 +120,8 @@ impl<'a> Parser<'a> {
             MetadataBlockKind::YamlStyle => FrontmatterStyle::Yaml,
             MetadataBlockKind::PlusesStyle => FrontmatterStyle::Toml,
         };
-        // Pulldown rejects empty metadata blocks.
-        let raw = self.source[payload.expect("metadata block has content")].to_owned();
-        Node::Frontmatter { style, raw }
+        let raw = SourceText::Source(payload.expect("metadata block has content"));
+        NodeKind::Frontmatter { style, raw }
     }
 
     // Root dispatch
@@ -123,43 +137,31 @@ impl<'a> Parser<'a> {
                     break;
                 }
             }
-            match event {
-                Event::End(_) => {}
-                Event::Start(Tag::Paragraph) => {
-                    nodes.push(self.parse_paragraph());
-                }
+            let kind = match event {
+                Event::End(_) => None,
+                Event::Start(Tag::Paragraph) => Some(self.parse_paragraph()),
                 Event::Start(Tag::Heading { level, .. }) => {
-                    nodes.push(self.parse_heading(level, range));
+                    Some(self.parse_heading(level, range.clone()))
                 }
-                Event::Start(Tag::List(start)) => {
-                    nodes.push(Node::List(self.parse_list(1, start)));
-                }
-                Event::Start(Tag::BlockQuote(_)) => {
-                    nodes.push(Node::BlockQuote(
-                        self.parse_blocks(Some(TagEnd::BlockQuote(None))),
-                    ));
-                }
-                Event::Start(Tag::CodeBlock(kind)) => {
-                    if let Some(node) = self.parse_code_block(kind) {
-                        nodes.push(node);
-                    }
-                }
-                Event::Start(Tag::HtmlBlock) => {
-                    nodes.push(self.parse_html_block());
-                }
-                Event::Start(Tag::Table(alignments)) => {
-                    nodes.push(self.parse_table(&alignments));
-                }
-                Event::Rule => {
-                    nodes.push(Node::ThematicBreak);
-                }
-                Event::Text(t) => {
-                    nodes.push(Node::Text(vec![text_span(t.into_string(), &[])]));
-                }
-                Event::Code(t) => {
-                    nodes.push(Node::Text(vec![code_span(&t, &[])]));
-                }
-                _ => {}
+                Event::Start(Tag::List(start)) => Some(NodeKind::List(self.parse_list(1, start))),
+                Event::Start(Tag::BlockQuote(_)) => Some(NodeKind::BlockQuote(
+                    self.parse_blocks(Some(TagEnd::BlockQuote(None))),
+                )),
+                Event::Start(Tag::CodeBlock(kind)) => self.parse_code_block(kind),
+                Event::Start(Tag::HtmlBlock) => Some(self.parse_html_block()),
+                Event::Start(Tag::Table(alignments)) => Some(self.parse_table(&alignments)),
+                Event::Rule => Some(NodeKind::ThematicBreak),
+                Event::Text(text) => Some(NodeKind::Text(vec![text_span(
+                    self.source,
+                    range.clone(),
+                    &text,
+                    &[],
+                )])),
+                Event::Code(code) => Some(NodeKind::Text(vec![code_span(&code, &[])])),
+                _ => None,
+            };
+            if let Some(kind) = kind {
+                nodes.push(Node::new(kind, range));
             }
         }
         nodes
@@ -167,17 +169,18 @@ impl<'a> Parser<'a> {
 
     // Paragraph
 
-    fn parse_paragraph(&mut self) -> Node {
+    fn parse_paragraph(&mut self) -> NodeKind {
         if matches!(self.iter.peek(), Some((Event::Start(Tag::Image { .. }), _))) {
             return self.parse_block_image();
         }
 
-        Node::Paragraph(trim_spans(self.parse_inline_content(TagEnd::Paragraph)))
+        let spans = self.parse_inline_content(TagEnd::Paragraph);
+        NodeKind::Paragraph(trim_spans(spans, self.source))
     }
 
     /// Parses a paragraph whose first event is an image.
     #[inline]
-    fn parse_block_image(&mut self) -> Node {
+    fn parse_block_image(&mut self) -> NodeKind {
         let Some((Event::Start(Tag::Image { dest_url, .. }), _)) = self.iter.next() else {
             unreachable!("peeked image event must still be present");
         };
@@ -188,19 +191,23 @@ impl<'a> Parser<'a> {
 
         if matches!(self.iter.peek(), Some((Event::End(TagEnd::Paragraph), _))) {
             self.iter.next();
-            return Node::Image {
-                alt: inline_text(&spans),
+            return NodeKind::Image {
+                alt: inline_text(&spans, self.source),
                 src,
             };
         }
 
         self.parse_inline_until(TagEnd::Paragraph, &mut stack, &mut spans);
-        Node::Paragraph(trim_spans(spans))
+        NodeKind::Paragraph(trim_spans(spans, self.source))
     }
 
     // Heading
 
-    fn parse_heading(&mut self, level: HeadingLevel, source_range: std::ops::Range<usize>) -> Node {
+    fn parse_heading(
+        &mut self,
+        level: HeadingLevel,
+        source_range: std::ops::Range<usize>,
+    ) -> NodeKind {
         let heading_level = match level {
             HeadingLevel::H1 => 1,
             HeadingLevel::H2 => 2,
@@ -210,9 +217,9 @@ impl<'a> Parser<'a> {
             HeadingLevel::H6 => 6,
         };
         let spans = self.parse_inline_content(TagEnd::Heading(level));
-        let text = semantic_text(&spans);
+        let text = semantic_text(&spans, self.source);
         let text = text.trim().to_string();
-        let spans = trim_spans(spans);
+        let spans = trim_spans(spans, self.source);
         self.headings.push(super::Heading {
             level: heading_level,
             text: text.clone(),
@@ -220,7 +227,7 @@ impl<'a> Parser<'a> {
             start_line: byte_to_line(&self.line_starts, source_range.start),
             end_line: byte_to_line(&self.line_starts, source_range.end.max(1) - 1),
         });
-        Node::Heading {
+        NodeKind::Heading {
             level: heading_level,
             text: spans,
         }
@@ -228,7 +235,7 @@ impl<'a> Parser<'a> {
 
     // Code block
 
-    fn parse_code_block(&mut self, kind: CodeBlockKind<'a>) -> Option<Node> {
+    fn parse_code_block(&mut self, kind: CodeBlockKind<'a>) -> Option<NodeKind> {
         let opts = match &kind {
             CodeBlockKind::Fenced(info) => info.to_string(),
             CodeBlockKind::Indented => String::new(),
@@ -249,28 +256,23 @@ impl<'a> Parser<'a> {
         }
         let options = options::parse(&opts);
         let code_id = self.codes.push(content, options);
-        Some(Node::Code(code_id))
+        Some(NodeKind::Code(code_id))
     }
 
     // HTML block
 
-    fn parse_html_block(&mut self) -> Node {
-        let mut content = String::new();
-        loop {
-            match self.iter.next() {
-                Some((Event::End(TagEnd::HtmlBlock), _)) => break,
-                Some((Event::Html(html), _)) => content.push_str(&html),
-                Some((Event::Text(text), _)) => content.push_str(&text),
-                None => break,
-                _ => {}
+    fn parse_html_block(&mut self) -> NodeKind {
+        for (event, _) in self.iter.by_ref() {
+            if matches!(event, Event::End(TagEnd::HtmlBlock)) {
+                break;
             }
         }
-        Node::HtmlBlock(content)
+        NodeKind::HtmlBlock
     }
 
     // Table
 
-    fn parse_table(&mut self, alignments: &[CmarkAlignment]) -> Node {
+    fn parse_table(&mut self, alignments: &[CmarkAlignment]) -> NodeKind {
         let mapped: Vec<Alignment> = alignments.iter().map(Self::map_alignment).collect();
         let mut headers = Vec::new();
         let mut rows = Vec::new();
@@ -281,7 +283,10 @@ impl<'a> Parser<'a> {
                 Some((Event::End(TagEnd::Table), _)) => break,
                 Some((Event::Start(Tag::TableCell), _)) => {
                     let cell = TableCell {
-                        spans: trim_spans(self.parse_inline_content(TagEnd::TableCell)),
+                        spans: trim_spans(
+                            self.parse_inline_content(TagEnd::TableCell),
+                            self.source,
+                        ),
                     };
                     if in_header {
                         headers.push(cell);
@@ -298,7 +303,7 @@ impl<'a> Parser<'a> {
                 _ => {}
             }
         }
-        Node::Table(Table {
+        NodeKind::Table(Table {
             headers,
             rows,
             alignments: mapped,
@@ -341,7 +346,9 @@ impl<'a> Parser<'a> {
         let mut task_kind: Option<ListKind> = None;
 
         while let Some((event, range)) = self.iter.next() {
-            let Some(event) = self.consume_inline_event(event, &mut stack, &mut spans) else {
+            let Some(event) =
+                self.consume_inline_event(event, range.clone(), &mut stack, &mut spans)
+            else {
                 continue;
             };
 
@@ -355,26 +362,28 @@ impl<'a> Parser<'a> {
                     }));
                 }
                 Event::Start(Tag::CodeBlock(kind)) => {
-                    if let Some(node) = self.parse_code_block(kind) {
-                        children.push(node);
+                    if let Some(kind) = self.parse_code_block(kind) {
+                        children.push(Node::new(kind, range));
                     }
                 }
                 Event::Start(Tag::HtmlBlock) => {
-                    children.push(self.parse_html_block());
+                    children.push(Node::new(self.parse_html_block(), range));
                 }
                 Event::Start(Tag::List(start)) => {
-                    children.push(Node::List(self.parse_list(depth + 1, start)));
+                    let kind = NodeKind::List(self.parse_list(depth + 1, start));
+                    children.push(Node::new(kind, range));
                 }
                 Event::Start(Tag::BlockQuote(_)) => {
-                    children.push(Node::BlockQuote(
-                        self.parse_blocks(Some(TagEnd::BlockQuote(None))),
-                    ));
+                    let kind =
+                        NodeKind::BlockQuote(self.parse_blocks(Some(TagEnd::BlockQuote(None))));
+                    children.push(Node::new(kind, range));
                 }
                 Event::Start(Tag::Table(alignments)) => {
-                    children.push(self.parse_table(&alignments));
+                    children.push(Node::new(self.parse_table(&alignments), range));
                 }
                 Event::Start(Tag::Heading { level, .. }) => {
-                    children.push(self.parse_heading(level, range));
+                    let kind = self.parse_heading(level, range.clone());
+                    children.push(Node::new(kind, range));
                 }
                 Event::Start(Tag::Paragraph) => {}
                 _ => {}
@@ -392,7 +401,7 @@ impl<'a> Parser<'a> {
         ListItem {
             depth,
             kind,
-            text: trim_spans(spans),
+            text: trim_spans(spans, self.source),
             children,
         }
     }
@@ -414,13 +423,18 @@ impl<'a> Parser<'a> {
     fn consume_inline_event(
         &mut self,
         event: Event<'a>,
+        range: std::ops::Range<usize>,
         stack: &mut Vec<InlineStyle>,
         out: &mut Vec<InlineSpan>,
     ) -> Option<Event<'a>> {
         match event {
-            Event::Text(text) => out.push(text_span(text.into_string(), stack)),
+            Event::Text(text) => out.push(text_span(self.source, range, &text, stack)),
             Event::Code(code) => out.push(code_span(&code, stack)),
-            Event::InlineHtml(tag) => out.push(html_span(&tag, stack)),
+            Event::InlineHtml(tag) => {
+                let mut style = stack.clone();
+                style.push(InlineStyle::HtmlTag);
+                out.push(text_span(self.source, range, &tag, &style));
+            }
             Event::SoftBreak | Event::HardBreak => out.push(break_span(stack)),
             Event::Start(Tag::Emphasis) => {
                 self.parse_styled_until(InlineStyle::Italic, TagEnd::Emphasis, stack, out);
@@ -478,11 +492,11 @@ impl<'a> Parser<'a> {
         stack: &mut Vec<InlineStyle>,
         out: &mut Vec<InlineSpan>,
     ) {
-        while let Some((event, _)) = self.iter.next() {
+        while let Some((event, range)) = self.iter.next() {
             if matches!(&event, Event::End(tag) if tag == &stop) {
                 break;
             }
-            let _ = self.consume_inline_event(event, stack, out);
+            let _ = self.consume_inline_event(event, range, stack, out);
         }
     }
 
@@ -500,12 +514,14 @@ impl<'a> Parser<'a> {
         });
         self.parse_inline_until(TagEnd::Image, stack, out);
         stack.pop();
-        let alt = inline_text(&out[start..]);
+        let alt = inline_text(&out[start..], self.source);
 
         // Empty alt (`![](path)`) yields no spans, so emit one to keep the image.
         if out.len() == start {
             out.push(text_span(
-                String::new(),
+                self.source,
+                0..0,
+                "",
                 &[InlineStyle::Image {
                     alt: String::new(),
                     src: dest_url.to_string(),
@@ -525,7 +541,17 @@ impl<'a> Parser<'a> {
 }
 
 /// Builds a plain inline span carrying the active style stack.
-fn text_span(text: String, stack: &[InlineStyle]) -> InlineSpan {
+fn text_span(
+    source: &str,
+    range: std::ops::Range<usize>,
+    text: &str,
+    stack: &[InlineStyle],
+) -> InlineSpan {
+    let text = if source.get(range.clone()) == Some(text) {
+        SourceText::Source(range)
+    } else {
+        SourceText::from(text)
+    };
     InlineSpan {
         text,
         style: stack.to_vec(),
@@ -537,17 +563,7 @@ fn code_span(code: &str, stack: &[InlineStyle]) -> InlineSpan {
     let mut style = stack.to_vec();
     style.push(InlineStyle::InlineCode);
     InlineSpan {
-        text: format!("`{}`", code),
-        style,
-    }
-}
-
-/// Builds a span for an inline HTML tag, preserving its source text.
-fn html_span(html: &str, stack: &[InlineStyle]) -> InlineSpan {
-    let mut style = stack.to_vec();
-    style.push(InlineStyle::HtmlTag);
-    InlineSpan {
-        text: html.to_string(),
+        text: format!("`{}`", code).into(),
         style,
     }
 }
@@ -565,26 +581,42 @@ const TRIM_CHARS: [char; 3] = [' ', '\t', '\n'];
 
 /// Removes leading/trailing whitespace from the first/last span and drops any
 /// spans that become empty as a result.
-fn trim_spans(mut spans: Vec<InlineSpan>) -> Vec<InlineSpan> {
+fn trim_spans(mut spans: Vec<InlineSpan>, source: &str) -> Vec<InlineSpan> {
     let start = spans
         .iter()
-        .position(|s| !s.text.trim_start_matches(TRIM_CHARS).is_empty())
+        .position(|span| !span.text(source).trim_start_matches(TRIM_CHARS).is_empty())
         .unwrap_or(spans.len());
     let end = spans
         .iter()
-        .rposition(|s| !s.text.trim_end_matches(TRIM_CHARS).is_empty())
-        .map_or(start, |i| i + 1);
-
+        .rposition(|span| !span.text(source).trim_end_matches(TRIM_CHARS).is_empty())
+        .map_or(start, |index| index + 1);
     spans.drain(end..);
     spans.drain(..start);
 
-    if let Some(s) = spans.first_mut() {
-        s.text = s.text.trim_start_matches(TRIM_CHARS).to_string();
+    if let Some(first) = spans.first_mut() {
+        trim_span_start(first, source);
     }
-    if let Some(s) = spans.last_mut() {
-        s.text = s.text.trim_end_matches(TRIM_CHARS).to_string();
+    if let Some(last) = spans.last_mut() {
+        trim_span_end(last, source);
     }
     spans
+}
+
+fn trim_span_start(span: &mut InlineSpan, source: &str) {
+    let trim_bytes =
+        span.text(source).len() - span.text(source).trim_start_matches(TRIM_CHARS).len();
+    match &mut span.text {
+        SourceText::Source(range) => range.start += trim_bytes,
+        SourceText::Owned(text) => *text = text[trim_bytes..].into(),
+    }
+}
+
+fn trim_span_end(span: &mut InlineSpan, source: &str) {
+    let keep_bytes = span.text(source).trim_end_matches(TRIM_CHARS).len();
+    match &mut span.text {
+        SourceText::Source(range) => range.end = range.start + keep_bytes,
+        SourceText::Owned(text) => *text = text[..keep_bytes].into(),
+    }
 }
 
 // Tests
@@ -592,11 +624,11 @@ fn trim_spans(mut spans: Vec<InlineSpan>) -> Vec<InlineSpan> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Code, Parser as _};
+    use crate::Code;
 
     fn code_from_node<'a>(doc: &'a crate::Document, node: &'a Node) -> &'a Code {
-        match node {
-            Node::Code(id) => doc.codes.by_id(*id).unwrap(),
+        match &node.kind {
+            NodeKind::Code(id) => doc.codes.by_id(*id).unwrap(),
             _ => panic!("Expected Code"),
         }
     }
@@ -643,7 +675,7 @@ mod tests {
                 ],
             ),
         ] {
-            let doc = Cmark::new().parse(input);
+            let doc = Parser::new().parse(input);
             let nodes = &doc.nodes;
             assert_eq!(nodes.len(), expected_node_count, "input: {input:?}");
             for &(node_idx, lang, content, name) in &expected_checks {
@@ -658,23 +690,25 @@ mod tests {
     #[test]
     fn test_parse_code_block_whitespace_and_recovery() {
         // Leading indentation preserved.
-        let doc = Cmark::new().parse("```python\n    def foo():\n        pass\n```\n");
+        let doc = Parser::new().parse("```python\n    def foo():\n        pass\n```\n");
         let c = doc.codes.first().unwrap();
         assert_eq!(c.content, "    def foo():\n        pass");
 
         // Leading blank lines preserved.
-        let doc = Cmark::new().parse("```bash\n\necho hello\n```\n");
+        let doc = Parser::new().parse("```bash\n\necho hello\n```\n");
         let c = doc.codes.first().unwrap();
         assert_eq!(c.content, "\necho hello");
 
         // Whitespace-only blocks are empty (no Code node).
         let text = "```bash\n   \n```\n";
-        let nodes = Cmark::new().parse(text).nodes;
-        assert!(!nodes.iter().any(|n| matches!(n, Node::Code(_))));
+        let nodes = Parser::new().parse(text).nodes;
+        assert!(!nodes
+            .iter()
+            .any(|node| matches!(node.kind, NodeKind::Code(_))));
 
         // Bad attrs recover valid metadata.
         let text = "```bash [name:foo bad, bin:zsh]\necho hi\n```\n";
-        let doc = Cmark::new().parse(text);
+        let doc = Parser::new().parse(text);
         let code = doc.codes.first().unwrap();
         assert_eq!(code.language, "bash");
         assert_eq!(code.name, "foo");
@@ -714,13 +748,13 @@ mod tests {
                 vec![(0, "[-] In progress task", ListKind::Bullet)],
             ),
         ] {
-            let nodes = Cmark::new().parse(input).nodes;
+            let nodes = Parser::new().parse(input).nodes;
             assert_eq!(nodes.len(), 1, "input: {input:?}");
-            match &nodes[0] {
-                Node::List(items) => {
+            match &nodes[0].kind {
+                NodeKind::List(items) => {
                     for &(idx, expected_text, ref expected_kind) in &expected_checks {
                         assert_eq!(
-                            inline_text(&items[idx].text),
+                            inline_text(&items[idx].text, input),
                             expected_text,
                             "item {idx}, input: {input:?}"
                         );
@@ -751,12 +785,15 @@ mod tests {
                 &[Alignment::None, Alignment::None],
             ),
         ] {
-            let nodes = Cmark::new().parse(input).nodes;
+            let nodes = Parser::new().parse(input).nodes;
             assert_eq!(nodes.len(), 1, "input: {input:?}");
-            match &nodes[0] {
-                Node::Table(t) => {
+            match &nodes[0].kind {
+                NodeKind::Table(t) => {
                     assert_eq!(
-                        t.headers.iter().map(TableCell::text).collect::<Vec<_>>(),
+                        t.headers
+                            .iter()
+                            .map(|cell| cell.text(input))
+                            .collect::<Vec<_>>(),
                         expected_headers,
                         "input: {input:?}"
                     );
@@ -774,19 +811,19 @@ mod tests {
             ("### My Heading", 3u8, "My Heading"),
             ("# Title\n\n## Run `make`\n", 1, "Title"),
         ] {
-            let doc = Cmark::new().parse(input);
+            let doc = Parser::new().parse(input);
             let node = &doc.nodes[0];
-            match node {
-                Node::Heading { level, text } => {
+            match &node.kind {
+                NodeKind::Heading { level, text } => {
                     assert_eq!(*level, expected_level);
-                    assert_eq!(inline_text(text), expected_text);
+                    assert_eq!(inline_text(text, input), expected_text);
                 }
                 _ => panic!("Expected Heading"),
             }
         }
 
         // headings collection
-        let doc = Cmark::new().parse("# Title\n\n## Run `make`\n");
+        let doc = Parser::new().parse("# Title\n\n## Run `make`\n");
         assert_eq!(doc.headings.len(), 2);
         assert_eq!(doc.headings[0].level, 1);
         assert_eq!(doc.headings[0].text, "Title");
@@ -824,9 +861,9 @@ mod tests {
             ),
             ("unclosed", "---\ntitle: x\n\n# Doc\n", None),
         ] {
-            let doc = Cmark::new().parse(input);
-            let actual = doc.nodes.first().and_then(|node| match node {
-                Node::Frontmatter { style, raw } => Some((*style, raw.as_str())),
+            let doc = Parser::new().parse(input);
+            let actual = doc.nodes.first().and_then(|node| match &node.kind {
+                NodeKind::Frontmatter { style, raw } => Some((*style, raw.resolve(&doc.source))),
                 _ => None,
             });
             assert_eq!(actual, expected, "{name}");
@@ -839,15 +876,17 @@ mod tests {
             ("immediate-close", "---\n---\n# Doc\n"),
             ("blank-first", "---\n\nfoo\n---\n"),
         ] {
-            let doc = Cmark::new().parse(input);
+            let doc = Parser::new().parse(input);
             assert!(
                 !doc.nodes
                     .iter()
-                    .any(|n| matches!(n, Node::Frontmatter { .. })),
+                    .any(|node| matches!(node.kind, NodeKind::Frontmatter { .. })),
                 "{name}: must not be frontmatter"
             );
             assert!(
-                doc.nodes.iter().any(|n| matches!(n, Node::ThematicBreak)),
+                doc.nodes
+                    .iter()
+                    .any(|node| matches!(node.kind, NodeKind::ThematicBreak)),
                 "{name}: should parse as normal Markdown"
             );
         }
@@ -856,41 +895,43 @@ mod tests {
     #[test]
     fn test_parse_blockquote_and_thematic_break() {
         let text = "> This is a blockquote\n> with multiple lines\n";
-        let nodes = Cmark::new().parse(text).nodes;
+        let nodes = Parser::new().parse(text).nodes;
         assert_eq!(nodes.len(), 1);
-        match &nodes[0] {
-            Node::BlockQuote(children) => {
+        match &nodes[0].kind {
+            NodeKind::BlockQuote(children) => {
                 assert_eq!(children.len(), 1);
-                match &children[0] {
-                    Node::Paragraph(s) => assert!(inline_text(s).contains("blockquote")),
+                match &children[0].kind {
+                    NodeKind::Paragraph(spans) => {
+                        assert!(inline_text(spans, text).contains("blockquote"))
+                    }
                     _ => panic!("Expected Paragraph in BlockQuote"),
                 }
             }
             _ => panic!("Expected BlockQuote"),
         }
 
-        assert!(Cmark::new()
-            .parse("Some text\n\n---\n\nMore text\n")
+        assert!(Parser::new()
+            .parse("Some text\n\n---\n\nMore text\n".to_owned())
             .nodes
             .iter()
-            .any(|n| matches!(n, Node::ThematicBreak)));
+            .any(|node| matches!(node.kind, NodeKind::ThematicBreak)));
     }
 
     #[test]
     fn test_parse_code_block_in_list() {
         let text = "- item 1\n  ```sh\n  echo hi\n  ```\n- item 2\n";
-        let doc = Cmark::new().parse(text);
+        let doc = Parser::new().parse(text);
         let nodes = &doc.nodes;
         assert_eq!(nodes.len(), 1);
-        let items = match &nodes[0] {
-            Node::List(items) => items,
+        let items = match &nodes[0].kind {
+            NodeKind::List(items) => items,
             _ => panic!("expected list"),
         };
         assert_eq!(items.len(), 2);
-        assert_eq!(inline_text(&items[0].text), "item 1");
-        assert_eq!(inline_text(&items[1].text), "item 2");
+        assert_eq!(inline_text(&items[0].text, text), "item 1");
+        assert_eq!(inline_text(&items[1].text, text), "item 2");
         assert_eq!(items[0].children.len(), 1);
-        assert!(matches!(&items[0].children[0], Node::Code(code_id)
+        assert!(matches!(&items[0].children[0].kind, NodeKind::Code(code_id)
             if doc.codes.iter().any(|c| c.id == *code_id && c.content.trim() == "echo hi")));
     }
 
@@ -936,13 +977,17 @@ mod tests {
         ];
 
         for (markdown, expected_text, expected_styles) in cases {
-            let nodes = Cmark::new().parse(markdown).nodes;
-            let spans = match &nodes[0] {
-                Node::Paragraph(spans) => spans,
+            let nodes = Parser::new().parse(markdown).nodes;
+            let spans = match &nodes[0].kind {
+                NodeKind::Paragraph(spans) => spans,
                 other => panic!("Expected Paragraph for {markdown:?}, got {other:?}"),
             };
 
-            assert_eq!(inline_text(spans), expected_text, "input: {markdown:?}");
+            assert_eq!(
+                inline_text(spans, markdown),
+                expected_text,
+                "input: {markdown:?}"
+            );
             assert_eq!(spans.len(), 1, "input: {markdown:?}");
             assert_eq!(spans[0].style, expected_styles, "input: {markdown:?}");
         }
@@ -955,9 +1000,9 @@ mod tests {
             ("![alt](./img/a.png)", "alt", "./img/a.png"),
             ("![](/abs/path.png)", "", "/abs/path.png"),
         ] {
-            let nodes = Cmark::new().parse(markdown).nodes;
-            match &nodes[0] {
-                Node::Image { alt, src } => {
+            let nodes = Parser::new().parse(markdown).nodes;
+            match &nodes[0].kind {
+                NodeKind::Image { alt, src } => {
                     assert_eq!(alt, expected_alt, "input: {markdown:?}");
                     assert_eq!(src, expected_src, "input: {markdown:?}");
                 }
@@ -968,9 +1013,9 @@ mod tests {
 
     #[test]
     fn test_paragraph_with_mixed_text_and_image_stays_paragraph() {
-        let nodes = Cmark::new().parse("text ![alt](image.png)").nodes;
-        match &nodes[0] {
-            Node::Paragraph(spans) => {
+        let nodes = Parser::new().parse("text ![alt](image.png)").nodes;
+        match &nodes[0].kind {
+            NodeKind::Paragraph(spans) => {
                 assert!(spans.iter().any(|s| s.style.contains(&InlineStyle::Image {
                     alt: "alt".into(),
                     src: "image.png".into(),
@@ -987,7 +1032,10 @@ mod tests {
             "![](image.png)![](image.png)",
         ] {
             assert!(
-                matches!(Cmark::new().parse(markdown).nodes[0], Node::Paragraph(_)),
+                matches!(
+                    Parser::new().parse(markdown.to_owned()).nodes[0].kind,
+                    NodeKind::Paragraph(_)
+                ),
                 "input: {markdown:?}"
             );
         }
@@ -1010,14 +1058,14 @@ mod tests {
 
         for (markdown, expected_text, expected_styles) in cases {
             let input = format!("| Value |\n|---|\n| {markdown} |");
-            let nodes = Cmark::new().parse(&input).nodes;
-            let table = match &nodes[0] {
-                Node::Table(table) => table,
+            let nodes = Parser::new().parse(&input).nodes;
+            let table = match &nodes[0].kind {
+                NodeKind::Table(table) => table,
                 other => panic!("Expected Table for {markdown:?}, got {other:?}"),
             };
             let cell = &table.rows[0][0];
 
-            assert_eq!(cell.text(), expected_text, "input: {markdown:?}");
+            assert_eq!(cell.text(&input), expected_text, "input: {markdown:?}");
             assert_eq!(cell.spans.len(), 1, "input: {markdown:?}");
             assert_eq!(cell.spans[0].style, expected_styles, "input: {markdown:?}");
         }
@@ -1033,18 +1081,18 @@ mod tests {
             ("**bold** <b>tag</b> <br/>", "bold <b>tag</b> <br/>"),
             ("# Title <b>with tag</b>\n", "Title <b>with tag</b>"),
         ] {
-            let doc = Cmark::new().parse(input);
-            let text = match &doc.nodes[0] {
-                Node::HtmlBlock(content) => content.clone(),
-                Node::Paragraph(spans) => inline_text(spans),
-                Node::Heading { text, .. } => inline_text(text),
+            let doc = Parser::new().parse(input);
+            let text = match &doc.nodes[0].kind {
+                NodeKind::HtmlBlock => doc.source[doc.nodes[0].range.clone()].to_owned(),
+                NodeKind::Paragraph(spans) => inline_text(spans, input),
+                NodeKind::Heading { text, .. } => inline_text(text, input),
                 other => panic!("Expected {input:?} to start with a text node, got {other:?}"),
             };
             assert_eq!(text, expected, "input: {input:?}");
         }
 
         // Semantic heading labels exclude HTML tags.
-        let doc = Cmark::new().parse("# Title <b>with tag</b>\n");
+        let doc = Parser::new().parse("# Title <b>with tag</b>\n");
         assert_eq!(doc.headings[0].text, "Title with tag");
     }
 
@@ -1080,18 +1128,33 @@ mod tests {
 
         for (markdown, expected_text, expected_styles) in cases {
             let input = format!("- {markdown}");
-            let nodes = Cmark::new().parse(&input).nodes;
-            let items = match &nodes[0] {
-                Node::List(items) => items,
+            let nodes = Parser::new().parse(&input).nodes;
+            let items = match &nodes[0].kind {
+                NodeKind::List(items) => items,
                 other => panic!("Expected List for {markdown:?}, got {other:?}"),
             };
 
-            assert_eq!(inline_text(&items[0].text), expected_text);
+            assert_eq!(inline_text(&items[0].text, &input), expected_text);
             assert_eq!(items[0].text.len(), 1, "input: {markdown:?}");
+
             assert_eq!(
                 items[0].text[0].style, expected_styles,
                 "input: {markdown:?}"
             );
         }
+    }
+    #[test]
+    fn nodes_and_inline_text_reference_the_document_source() {
+        let markdown = "plain **bold**";
+        let doc = Parser::new().parse(markdown);
+        let node = &doc.nodes[0];
+        assert_eq!(&doc.source[node.range.clone()], markdown);
+        let NodeKind::Paragraph(spans) = &node.kind else {
+            panic!("expected paragraph");
+        };
+        assert!(spans
+            .iter()
+            .all(|span| matches!(span.text, SourceText::Source(_))));
+        assert_eq!(inline_text(spans, &doc.source), "plain bold");
     }
 }

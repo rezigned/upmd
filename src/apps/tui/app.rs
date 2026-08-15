@@ -24,7 +24,7 @@ use ratatui::{
     Frame,
 };
 use std::{cell::RefCell, collections::HashMap, path::PathBuf, process::ExitCode, time::Duration};
-use upmd_parser::{CodeId, Parser};
+use upmd_parser::CodeId;
 use upmd_runtime::Effect;
 use upmd_runtime::{
     runtimes::tui::{Input, Output},
@@ -599,7 +599,7 @@ pub enum Msg {
 }
 
 impl crate::RunApp for App {
-    fn from_input(input: &str, config: AppConfig) -> std::result::Result<Self, String> {
+    fn from_input(input: String, config: AppConfig) -> std::result::Result<Self, String> {
         let doc = tracing::info_span!("parse").in_scope(|| upmd_parser::new().parse(input));
         tracing::info_span!("build").in_scope(|| Self::new(doc, config))
     }
@@ -1190,6 +1190,9 @@ impl App {
                 }
                 self.notify_copy_result(copied);
             }
+            Some(content::Outcome::ModeToggled) => {
+                self.content.rebuild(self.tasks.buffers());
+            }
             None => {}
         }
 
@@ -1333,7 +1336,7 @@ impl App {
         self.config.block = None;
         match crate::reader::read_from_path(&path) {
             Ok(input) => {
-                let doc = upmd_parser::new().parse(&input);
+                let doc = upmd_parser::new().parse(input);
                 match self.load_document(doc) {
                     Ok(()) => {
                         self.config.file = Some(path.display().to_string());

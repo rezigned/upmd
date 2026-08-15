@@ -431,7 +431,6 @@ mod tests {
 
     use insta::assert_snapshot;
     use keymap::DerivedConfig;
-    use upmd_parser::Parser;
     use upmd_runtime::Component;
 
     use super::*;

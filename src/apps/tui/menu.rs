@@ -565,7 +565,6 @@ fn truncate_to_width(text: &str, max_width: usize) -> String {
 mod tests {
     use super::*;
     use upmd_parser as parser;
-    use upmd_parser::Parser;
 
     #[test]
     fn test_extract_code_ids_finds_nested_in_blockquote() {

@@ -37,6 +37,7 @@ pub enum Outcome {
     PreviewInteracted {
         copied: Option<bool>,
     },
+    ModeToggled,
 }
 
 impl Content {
@@ -47,22 +48,14 @@ impl Content {
         outputs: &HashMap<CodeId, Task>,
         config: &Config,
     ) -> Self {
-        let Document {
-            nodes,
-            codes,
-            headings,
-            ..
-        } = document;
-
         let mut menu = menu::Menu::new(
-            &codes,
-            &headings,
+            &document.codes,
+            &document.headings,
             theme.clone(),
             config.keymap.menu::<Navigation>(),
         );
         let mut preview = preview::Preview::new(
-            nodes,
-            codes,
+            document,
             theme.clone(),
             outputs,
             config.tui.inline_max_lines(),
@@ -296,12 +289,11 @@ impl Component for Content {
                 };
                 Effect::from_parts(command, outcome)
             }
+            Action::Preview(preview::Action::ToggleToc) => {
+                self.toggle_toc();
+                None
+            }
             Action::Preview(action) => {
-                if action == preview::Action::ToggleToc {
-                    self.toggle_toc();
-                    return None;
-                }
-
                 let previous = self.selected_code_id();
                 let command = self
                     .preview
@@ -311,6 +303,7 @@ impl Component for Content {
                 self.sync_from_preview();
                 let copied = self.preview.take_copy_result();
                 let outcome = match action {
+                    preview::Action::ToggleMode => Outcome::ModeToggled,
                     preview::Action::SelectCodeBlock(id) => Outcome::CodeClicked {
                         previous,
                         selected: id,

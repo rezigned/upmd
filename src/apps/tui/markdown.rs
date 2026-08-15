@@ -1,9 +1,12 @@
-//! Converts parsed markdown [`Node`]s into renderable [`LogicalLine`]s.
+//! Converts parsed markdown [`upmd_parser::nodes::Node`]s into renderable [`LogicalLine`]s.
 //!
 //! [`MarkdownRenderer::render`] expands the AST into semantic lines such as
 //! paragraphs, headings, code rows, and table rows. [`LogicalLine::render`]
 //! applies dynamic styling and caches expensive highlighting. The preview owns
 //! width-dependent wrapping.
+
+mod markup;
+mod visual;
 
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
@@ -16,13 +19,23 @@ use crate::apps::config::PREVIEW_FRAME_OVERHEAD;
 use crate::apps::theme::Theme;
 use crate::runner::CodeId;
 use upmd_parser::nodes::{
-    inline_text, Alignment, Code, DepsToken, FrontmatterStyle, InlineSpan, InlineStyle, ListKind,
-    Table, TableCell, TaskStatus,
+    inline_text, Alignment, Code, DepsToken, FrontmatterStyle, InlineSpan, InlineStyle, Table,
+    TableCell,
 };
 use upmd_parser::Codes;
 
 use crate::apps::task::Task;
 use crate::apps::tui::wrap::slice_line;
+
+/// How the preview renders the parsed markdown AST.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RenderMode {
+    /// Semantic terminal UI: task glyphs, styled links, decoded images.
+    #[default]
+    Visual,
+    /// Original Markdown source with interactive code blocks retained.
+    Markup,
+}
 
 /// Render-time context passed to [`LogicalLine::render`].
 pub struct RenderContext<'a> {
@@ -55,14 +68,19 @@ impl LazyText {
         }
     }
 
-    fn from_spans(spans: Vec<InlineSpan>) -> Self {
-        let text = inline_text(&spans);
-        Self {
-            text,
-            language: "markdown".into(),
-            spans,
-            cached: std::cell::RefCell::new(None),
-        }
+    fn markdown(text: impl Into<String>) -> Self {
+        Self::new(text, "markdown")
+    }
+
+    fn from_spans(spans: Vec<InlineSpan>, source: &str) -> Self {
+        let text = inline_text(&spans, source);
+        let spans = spans
+            .into_iter()
+            .map(|span| span.into_owned(source))
+            .collect();
+        let mut text = Self::markdown(text);
+        text.spans = spans;
+        text
     }
 }
 
@@ -228,7 +246,7 @@ impl MarkdownTable {
         {
             *cache = Some(TableRenderCache {
                 viewport_width,
-                lines: render_table(&self.source, theme, viewport_width),
+                lines: render_table(&self.source, "", theme, viewport_width),
             });
         }
         cache
@@ -326,6 +344,8 @@ pub struct LogicalLine {
     /// Optional foreground color override for the gutter indicator (used by
     /// output lines to reflect task status).
     pub gutter_fg: Option<Color>,
+    /// AST node index used to preserve the viewport across render modes.
+    pub node_idx: Option<usize>,
 }
 
 impl LogicalLine {
@@ -340,9 +360,9 @@ impl LogicalLine {
     }
 
     /// Creates a text line from inline markdown spans.
-    pub fn text_lazy_spans(spans: Vec<InlineSpan>, is_block_start: bool) -> Self {
+    pub fn text_lazy_spans(spans: Vec<InlineSpan>, source: &str, is_block_start: bool) -> Self {
         Self {
-            source: LogicalLineSource::Text(LazyText::from_spans(spans)),
+            source: LogicalLineSource::Text(LazyText::from_spans(spans, source)),
             is_block_start,
             ..Self::default()
         }
@@ -351,11 +371,12 @@ impl LogicalLine {
     /// Creates a list item from inline markdown spans with a styled prefix.
     pub fn list_item_spans(
         spans: Vec<InlineSpan>,
+        source: &str,
         prefix: Span<'static>,
         is_block_start: bool,
     ) -> Self {
         Self {
-            source: LogicalLineSource::ListItem(LazyText::from_spans(spans)),
+            source: LogicalLineSource::ListItem(LazyText::from_spans(spans, source)),
             is_block_start,
             prefixes: vec![prefix],
             ..Self::default()
@@ -363,13 +384,22 @@ impl LogicalLine {
     }
 
     /// Creates a heading line from inline markdown spans.
-    pub fn heading_lazy_spans(spans: Vec<InlineSpan>, level: u8) -> Self {
+    pub fn heading_lazy_spans(spans: Vec<InlineSpan>, source: &str, level: u8) -> Self {
         Self {
             source: LogicalLineSource::Heading {
                 level,
-                text: LazyText::from_spans(spans),
+                text: LazyText::from_spans(spans, source),
             },
             is_block_start: true,
+            ..Self::default()
+        }
+    }
+
+    /// Creates a markup-mode text line, syntax-highlighted as markdown source.
+    pub fn markup_text(text: impl Into<String>, is_block_start: bool) -> Self {
+        Self {
+            source: LogicalLineSource::Text(LazyText::markdown(text)),
+            is_block_start,
             ..Self::default()
         }
     }
@@ -733,6 +763,7 @@ impl LogicalLine {
                         }
                         _ => render_inline_spans(
                             &text.spans,
+                            "",
                             ctx.theme.markdown_text_style(),
                             ctx.theme,
                         ),
@@ -866,7 +897,12 @@ pub fn gutter_style(
 ///
 /// Column widths are capped so the total table width does not exceed
 /// `viewport_width`.  Content is truncated with "…" when necessary.
-fn render_table(table: &Table, theme: &Theme, viewport_width: usize) -> Vec<Line<'static>> {
+fn render_table(
+    table: &Table,
+    source: &str,
+    theme: &Theme,
+    viewport_width: usize,
+) -> Vec<Line<'static>> {
     let content_fg = theme.foreground;
     let line_fg = theme.info_background;
     if table.headers.is_empty() {
@@ -880,12 +916,12 @@ fn render_table(table: &Table, theme: &Theme, viewport_width: usize) -> Vec<Line
 
     let natural_widths: Vec<usize> = (0..n)
         .map(|i| {
-            let header_w = table.headers[i].char_len();
+            let header_w = table.headers[i].char_len(source);
             let cell_w = table
                 .rows
                 .iter()
                 .filter_map(|r| r.get(i))
-                .map(TableCell::char_len)
+                .map(|cell| cell.char_len(source))
                 .max()
                 .unwrap_or(0);
             header_w.max(cell_w)
@@ -947,6 +983,7 @@ fn render_table(table: &Table, theme: &Theme, viewport_width: usize) -> Vec<Line
             spans.push(Span::styled(" ", base_style));
             spans.extend(render_table_cell(
                 cell,
+                source,
                 col_widths[i],
                 align,
                 base_style,
@@ -976,6 +1013,7 @@ fn render_table(table: &Table, theme: &Theme, viewport_width: usize) -> Vec<Line
 
 fn render_table_cell(
     cell: &TableCell,
+    source: &str,
     width: usize,
     alignment: Alignment,
     base_style: Style,
@@ -985,8 +1023,8 @@ fn render_table_cell(
         return Vec::new();
     }
 
-    let visible = cell.char_len();
-    let mut line = render_inline_spans(&cell.spans, base_style, theme);
+    let visible = cell.char_len(source);
+    let mut line = render_inline_spans(&cell.spans, source, base_style, theme);
     let content_width = visible.min(width);
     if visible > width {
         if width == 1 {
@@ -1043,6 +1081,23 @@ struct RenderState {
     quote_depth: usize,
     /// Extra display width before code content, keyed by code block.
     code_prefix_overhead: HashMap<CodeId, usize>,
+    /// Traversal index allocated to the next AST node.
+    next_node_idx: usize,
+    /// Index of the node currently being rendered.
+    node_idx: usize,
+}
+
+impl RenderState {
+    fn begin_node(&mut self) -> usize {
+        let parent = self.node_idx;
+        self.next_node_idx += 1;
+        self.node_idx = self.next_node_idx;
+        parent
+    }
+
+    fn end_node(&mut self, parent: usize) {
+        self.node_idx = parent;
+    }
 }
 
 pub struct RenderedMarkdown {
@@ -1053,14 +1108,17 @@ pub struct RenderedMarkdown {
 /// From AST nodes to ratatui `Text` lines.
 pub struct MarkdownRenderer<'a> {
     theme: &'a Theme,
+    source: &'a str,
     outputs: &'a HashMap<u32, Task>,
     codes: &'a Codes,
     inline_max_lines: usize,
     viewport_width: usize,
+    mode: RenderMode,
 }
 
 impl<'a> MarkdownRenderer<'a> {
     pub fn new(
+        source: &'a str,
         theme: &'a Theme,
         outputs: &'a HashMap<u32, Task>,
         codes: &'a Codes,
@@ -1069,23 +1127,71 @@ impl<'a> MarkdownRenderer<'a> {
     ) -> Self {
         Self {
             theme,
+            source,
             outputs,
             codes,
             inline_max_lines,
             viewport_width,
+            mode: RenderMode::Visual,
         }
+    }
+
+    pub fn mode(mut self, mode: RenderMode) -> Self {
+        self.mode = mode;
+        self
     }
 
     pub fn render(&self, nodes: &[upmd_parser::nodes::Node]) -> RenderedMarkdown {
         let mut lines = Vec::new();
         let mut state = RenderState::default();
-        for node in nodes {
-            self.render_node(node, &mut lines, &mut state);
+        match self.mode {
+            RenderMode::Visual => self.render_visual(nodes, &mut lines, &mut state),
+            RenderMode::Markup => self.render_markup(nodes, &mut lines, &mut state),
         }
         RenderedMarkdown {
             lines,
             code_prefix_overhead: state.code_prefix_overhead,
         }
+    }
+
+    fn render_code(&self, code_id: CodeId, lines: &mut Vec<LogicalLine>, state: &mut RenderState) {
+        let code = self
+            .codes
+            .by_id(code_id)
+            .expect("CodeId must resolve to a Code in Document.codes");
+        let is_start = match state.snap.take_target() {
+            Some(idx) => {
+                if let Some(line) = lines.get_mut(idx) {
+                    line.code_id = Some(code.id);
+                    line.is_code_start = true;
+                    line.is_block_start = true;
+                    true
+                } else {
+                    false
+                }
+            }
+            None => false,
+        };
+        let quote_overhead = Self::quote_prefix_width(state.quote_depth);
+        if quote_overhead > 0 {
+            state.code_prefix_overhead.insert(code.id, quote_overhead);
+        }
+        let is_running = self.outputs.get(&code.id).is_some_and(|t| t.running());
+        let gutter_fg = self.outputs.get(&code.id).and_then(|buffer| {
+            use crate::apps::task::TaskStatus;
+            match buffer.status() {
+                TaskStatus::Running => Some(self.theme.warning),
+                TaskStatus::Success => Some(self.theme.success),
+                TaskStatus::Error => Some(self.theme.error),
+                TaskStatus::Idle => None,
+            }
+        });
+        let mut info = self.render_code_info(code, !is_start);
+        info.gutter_fg = gutter_fg;
+        self.push_line(lines, info, state);
+        self.render_code_body(code, lines, state, gutter_fg, is_running);
+        self.render_code_output(code, lines, state, gutter_fg, is_running);
+        self.push_line(lines, LogicalLine::newline(Some(code.id), false), state);
     }
 
     fn quote_prefix_span(&self) -> Span<'static> {
@@ -1104,245 +1210,24 @@ impl<'a> MarkdownRenderer<'a> {
         depth * 2
     }
 
-    fn push_line(&self, lines: &mut Vec<LogicalLine>, mut line: LogicalLine, quote_depth: usize) {
+    fn push_line(&self, lines: &mut Vec<LogicalLine>, mut line: LogicalLine, state: &RenderState) {
         // Quote prefixes are outer chrome. Insert before any existing list/task
         // prefix so rendering preserves markdown order: "> • item", not
         // "• > item".
-        for _ in 0..quote_depth {
+        for _ in 0..state.quote_depth {
             line.prefixes.insert(0, self.quote_prefix_span());
         }
+        self.push_unquoted_line(lines, line, state);
+    }
+
+    fn push_unquoted_line(
+        &self,
+        lines: &mut Vec<LogicalLine>,
+        mut line: LogicalLine,
+        state: &RenderState,
+    ) {
+        line.node_idx = Some(state.node_idx);
         lines.push(line);
-    }
-
-    fn render_node(
-        &self,
-        node: &upmd_parser::nodes::Node,
-        lines: &mut Vec<LogicalLine>,
-        state: &mut RenderState,
-    ) {
-        use upmd_parser::nodes::Node;
-        match node {
-            Node::HtmlBlock(html) => {
-                let block = Rc::new(MarkdownHtml::new(html.clone()));
-                for row_idx in 0..block.len() {
-                    self.push_line(
-                        lines,
-                        LogicalLine::html(Rc::clone(&block), row_idx, row_idx == 0),
-                        state.quote_depth,
-                    );
-                }
-                self.push_line(lines, LogicalLine::newline(None, false), state.quote_depth);
-            }
-            Node::Frontmatter { style, raw } => {
-                let block = Rc::new(FrontmatterBlock::new(*style, raw.clone()));
-                for row_idx in 0..block.len() {
-                    self.push_line(
-                        lines,
-                        LogicalLine::frontmatter(Rc::clone(&block), row_idx, row_idx == 0),
-                        state.quote_depth,
-                    );
-                }
-                self.push_line(lines, LogicalLine::newline(None, false), state.quote_depth);
-            }
-            Node::Text(t) => {
-                self.render_highlighted_lines(t, lines, true, state.quote_depth);
-            }
-            Node::Paragraph(t) => {
-                if let Some(idx) = self.render_highlighted_lines(t, lines, true, state.quote_depth)
-                {
-                    state.snap.description_line = Some(idx);
-                }
-            }
-            Node::BlockQuote(children) => {
-                // Blockquotes are visual nesting, but title/description snap
-                // context is scoped: a quoted paragraph should not become the
-                // snap target for a following non-quoted code block, and an
-                // outer paragraph should not snap to quoted code.
-                let parent_snap = std::mem::take(&mut state.snap);
-                state.quote_depth += 1;
-                for child in children {
-                    self.render_node(child, lines, state);
-                }
-                state.quote_depth = state.quote_depth.saturating_sub(1);
-                state.snap = parent_snap;
-            }
-            Node::Heading { text: t, level } => {
-                let line_idx = lines.len();
-                let prefix = "#".repeat(*level as usize);
-                let mut content = t.clone();
-                if let Some(first) = content.first_mut() {
-                    first.text = first.text.trim_start_matches('#').trim_start().to_string();
-                }
-                content.insert(
-                    0,
-                    InlineSpan {
-                        text: format!("{prefix} "),
-                        style: Vec::new(),
-                    },
-                );
-                self.push_line(
-                    lines,
-                    LogicalLine::heading_lazy_spans(content, *level),
-                    state.quote_depth,
-                );
-                if *level <= 2 {
-                    self.push_line(lines, LogicalLine::heading_rule(), state.quote_depth);
-                }
-                state.snap.title_line = Some(line_idx);
-            }
-            Node::List(items) => self.render_list(items, lines, state),
-            Node::Code(code_id) => {
-                let code = self
-                    .codes
-                    .by_id(*code_id)
-                    .expect("CodeId must resolve to a Code in Document.codes");
-                let is_start = match state.snap.take_target() {
-                    Some(idx) => {
-                        if let Some(line) = lines.get_mut(idx) {
-                            line.code_id = Some(code.id);
-                            line.is_code_start = true;
-                            line.is_block_start = true;
-                            true
-                        } else {
-                            false
-                        }
-                    }
-                    None => false,
-                };
-                let quote_overhead = Self::quote_prefix_width(state.quote_depth);
-                if quote_overhead > 0 {
-                    state.code_prefix_overhead.insert(code.id, quote_overhead);
-                }
-                // Compute block-wide gutter color from task status.
-                let is_running = self.outputs.get(&code.id).is_some_and(|t| t.running());
-                let gutter_fg = self.outputs.get(&code.id).and_then(|buffer| {
-                    use crate::apps::task::TaskStatus;
-                    match buffer.status() {
-                        TaskStatus::Running => Some(self.theme.warning),
-                        TaskStatus::Success => Some(self.theme.success),
-                        TaskStatus::Error => Some(self.theme.error),
-                        TaskStatus::Idle => None,
-                    }
-                });
-                let mut info = self.render_code_info(code, !is_start);
-                info.gutter_fg = gutter_fg;
-                self.push_line(lines, info, state.quote_depth);
-                self.render_code_body(code, lines, state.quote_depth, gutter_fg, is_running);
-                self.render_code_output(code, lines, state.quote_depth, gutter_fg, is_running);
-                self.push_line(
-                    lines,
-                    LogicalLine::newline(Some(code.id), false),
-                    state.quote_depth,
-                );
-            }
-            Node::Table(table) => {
-                let table_width = self
-                    .viewport_width
-                    .saturating_sub(PREVIEW_FRAME_OVERHEAD)
-                    .saturating_sub(Self::quote_prefix_width(state.quote_depth))
-                    .max(1);
-                let rendered = render_table(table, self.theme, table_width);
-                let row_count = rendered.len();
-                let table = Rc::new(MarkdownTable::new(table.clone(), table_width, rendered));
-                for row_idx in 0..row_count {
-                    let initial = table.line(row_idx, self.theme, table_width);
-                    self.push_line(
-                        lines,
-                        LogicalLine::table(Rc::clone(&table), row_idx, initial),
-                        state.quote_depth,
-                    );
-                }
-                self.push_line(lines, LogicalLine::newline(None, false), state.quote_depth);
-            }
-            Node::ThematicBreak => {
-                self.push_line(lines, LogicalLine::thematic_break(), state.quote_depth);
-                self.push_line(lines, LogicalLine::newline(None, false), state.quote_depth);
-            }
-            Node::Image { alt, src } => {
-                let line = LogicalLine {
-                    source: LogicalLineSource::Image {
-                        alt: alt.clone(),
-                        src: src.clone(),
-                    },
-                    is_block_start: true,
-                    ..LogicalLine::default()
-                };
-                self.push_line(lines, line, state.quote_depth);
-                self.push_line(lines, LogicalLine::newline(None, false), state.quote_depth);
-            }
-        }
-    }
-
-    fn render_highlighted_lines(
-        &self,
-        spans: &[InlineSpan],
-        lines: &mut Vec<LogicalLine>,
-        block_start: bool,
-        quote_depth: usize,
-    ) -> Option<usize> {
-        let start_idx = lines.len();
-        let mut first = block_start;
-        let mut emitted = false;
-        for line in split_span_lines(spans) {
-            self.push_line(
-                lines,
-                LogicalLine::text_lazy_spans(line, first),
-                quote_depth,
-            );
-            first = false;
-            emitted = true;
-        }
-        self.push_line(lines, LogicalLine::newline(None, false), quote_depth);
-        if emitted {
-            Some(start_idx)
-        } else {
-            None
-        }
-    }
-
-    fn render_list(
-        &self,
-        items: &[upmd_parser::nodes::ListItem],
-        lines: &mut Vec<LogicalLine>,
-        state: &mut RenderState,
-    ) {
-        for (i, item) in items.iter().enumerate() {
-            let indent = " ".repeat(item.depth.saturating_sub(1) * 4);
-
-            let (marker, color) = match &item.kind {
-                ListKind::Bullet => ("• ".to_string(), self.theme.foreground),
-                ListKind::Ordered(n) => (format!("{}. ", n), self.theme.foreground),
-                ListKind::Task(status) => match status {
-                    TaskStatus::Checked => ("󰱒  ".to_string(), self.theme.success),
-                    TaskStatus::InProgress => ("󰡖  ".to_string(), self.theme.muted),
-                    TaskStatus::Unchecked => ("󰄱  ".to_string(), self.theme.muted),
-                },
-            };
-
-            let continuation = format!("{}{}", indent, " ".repeat(marker.chars().count()));
-
-            for (line_idx, line) in split_span_lines(&item.text).into_iter().enumerate() {
-                let prefix = if line_idx == 0 {
-                    Span::styled(format!("{}{}", indent, marker), Style::default().fg(color))
-                } else {
-                    Span::raw(continuation.clone())
-                };
-                self.push_line(
-                    lines,
-                    LogicalLine::list_item_spans(line, prefix, i == 0 && line_idx == 0),
-                    state.quote_depth,
-                );
-            }
-            // Render nested children (code blocks, sub-lists, etc.) in the same
-            // quote scope so blockquote chrome applies consistently.
-            for child in &item.children {
-                self.render_node(child, lines, state);
-            }
-        }
-        // Skip trailing newline for nested lists to avoid blank lines between siblings.
-        if items.first().is_some_and(|i| i.depth == 1) {
-            self.push_line(lines, LogicalLine::newline(None, false), state.quote_depth);
-        }
     }
 
     fn render_code_info(&self, code: &Code, is_start: bool) -> LogicalLine {
@@ -1395,7 +1280,7 @@ impl<'a> MarkdownRenderer<'a> {
         &self,
         code: &Code,
         lines: &mut Vec<LogicalLine>,
-        quote_depth: usize,
+        state: &mut RenderState,
         gutter_fg: Option<Color>,
         is_running: bool,
     ) {
@@ -1403,7 +1288,7 @@ impl<'a> MarkdownRenderer<'a> {
             let mut line = LogicalLine::code_body(body_line.to_string(), &code.language, code.id);
             line.gutter_fg = gutter_fg;
             line.is_running = is_running;
-            self.push_line(lines, line, quote_depth);
+            self.push_line(lines, line, state);
         }
     }
 
@@ -1411,7 +1296,7 @@ impl<'a> MarkdownRenderer<'a> {
         &self,
         code: &Code,
         lines: &mut Vec<LogicalLine>,
-        quote_depth: usize,
+        state: &mut RenderState,
         gutter_fg: Option<Color>,
         is_running: bool,
     ) {
@@ -1461,7 +1346,7 @@ impl<'a> MarkdownRenderer<'a> {
             let mut line = LogicalLine::output(line, code.id);
             line.gutter_fg = gutter_fg;
             line.is_running = is_running;
-            self.push_line(lines, line, quote_depth);
+            self.push_line(lines, line, state);
         }
     }
 }
@@ -1582,18 +1467,32 @@ fn expand_tabs_in_line(mut line: Line<'static>) -> Line<'static> {
 
 /// Splits inline spans on `\n` into one group of spans per line, mirroring
 /// `str::lines()` (trailing empty segments are dropped).
-fn split_span_lines(spans: &[InlineSpan]) -> Vec<Vec<InlineSpan>> {
+pub(super) fn owned_table(table: &Table, source: &str) -> Table {
+    let mut table = table.clone();
+    for cell in table
+        .headers
+        .iter_mut()
+        .chain(table.rows.iter_mut().flatten())
+    {
+        for span in &mut cell.spans {
+            span.text = span.text.clone().into_owned(source);
+        }
+    }
+    table
+}
+
+fn split_span_lines(spans: &[InlineSpan], source: &str) -> Vec<Vec<InlineSpan>> {
     let mut lines = Vec::new();
     let mut current = Vec::new();
     for span in spans {
-        let mut text = span.text.as_str();
+        let mut text = span.text(source);
         loop {
             match text.find('\n') {
                 Some(idx) => {
                     let (head, tail) = text.split_at(idx);
                     if !head.is_empty() {
                         current.push(InlineSpan {
-                            text: head.to_string(),
+                            text: head.into(),
                             style: span.style.clone(),
                         });
                     }
@@ -1603,7 +1502,7 @@ fn split_span_lines(spans: &[InlineSpan]) -> Vec<Vec<InlineSpan>> {
                 None => {
                     if !text.is_empty() {
                         current.push(InlineSpan {
-                            text: text.to_string(),
+                            text: text.into(),
                             style: span.style.clone(),
                         });
                     }
@@ -1619,10 +1518,15 @@ fn split_span_lines(spans: &[InlineSpan]) -> Vec<Vec<InlineSpan>> {
 }
 
 /// Renders parsed inline Markdown spans directly from their semantic styles.
-fn render_inline_spans(spans: &[InlineSpan], base_style: Style, theme: &Theme) -> Line<'static> {
+fn render_inline_spans(
+    spans: &[InlineSpan],
+    source: &str,
+    base_style: Style,
+    theme: &Theme,
+) -> Line<'static> {
     let rendered = spans
         .iter()
-        .flat_map(|span| render_inline_span(span, base_style, theme))
+        .flat_map(|span| render_inline_span(span, source, base_style, theme))
         .collect::<Vec<_>>();
     Line::from(rendered).style(base_style)
 }
@@ -1634,37 +1538,42 @@ fn render_heading_spans(spans: &[InlineSpan], theme: &Theme) -> Line<'static> {
         .iter()
         .enumerate()
         .flat_map(|(index, span)| {
-            let base_style = if index == 0 && span.text.starts_with('#') {
+            let base_style = if index == 0 && span.text("").starts_with('#') {
                 theme.markdown_heading_marker_style()
             } else {
                 heading_style
             };
-            render_inline_span(span, base_style, theme)
+            render_inline_span(span, "", base_style, theme)
         })
         .collect::<Vec<_>>();
     Line::from(rendered).style(heading_style)
 }
 
-fn render_inline_span(span: &InlineSpan, base_style: Style, theme: &Theme) -> Vec<Span<'static>> {
+fn render_inline_span(
+    span: &InlineSpan,
+    source: &str,
+    base_style: Style,
+    theme: &Theme,
+) -> Vec<Span<'static>> {
     if span.style.iter().any(|s| matches!(s, InlineStyle::HtmlTag)) {
-        return render_html_tag(span, base_style, theme);
+        return render_html_tag(span.text(source), base_style, theme);
     }
     let style = span.style.iter().fold(base_style, |style, inline| {
         style.patch(inline_style(theme, inline))
     });
-    vec![Span::styled(span.text.clone(), style)]
+    vec![Span::styled(span.text(source).to_owned(), style)]
 }
 
 /// Highlights an inline HTML tag with the HTML syntax.
-fn render_html_tag(span: &InlineSpan, base_style: Style, theme: &Theme) -> Vec<Span<'static>> {
-    let rendered = theme.highlight(&span.text, "html");
+fn render_html_tag(text: &str, base_style: Style, theme: &Theme) -> Vec<Span<'static>> {
+    let rendered = theme.highlight(text, "html");
     let mut spans: Vec<Span<'static>> = rendered
         .lines
         .into_iter()
         .flat_map(|line| line.spans)
         .collect();
     if spans.is_empty() {
-        spans.push(Span::styled(span.text.clone(), base_style));
+        spans.push(Span::styled(text.to_owned(), base_style));
     }
     spans
 }
@@ -1687,11 +1596,9 @@ fn inline_style(theme: &Theme, style: &InlineStyle) -> Style {
 mod tests {
     use super::*;
     use crate::apps::task::Task;
-    use crate::apps::tui::testutil::ansi_line;
     use insta::assert_snapshot;
     use ratatui::style::Color;
     use std::collections::HashMap;
-    use upmd_parser::Parser;
 
     fn test_theme() -> Theme {
         Theme::new("base16-ocean.dark", false)
@@ -1707,16 +1614,6 @@ mod tests {
         }
     }
 
-    fn render_markdown(markdown: &str) -> RenderedMarkdown {
-        let doc = upmd_parser::new().parse(markdown);
-        let nodes = &doc.nodes;
-        let codes = &doc.codes;
-        let theme = test_theme();
-        let outputs = HashMap::new();
-        let renderer = MarkdownRenderer::new(&theme, &outputs, codes, 10, 80);
-        renderer.render(nodes)
-    }
-
     fn render_markdown_with_outputs(
         markdown: &str,
         outputs: &HashMap<CodeId, Task>,
@@ -1726,14 +1623,10 @@ mod tests {
         let codes = &doc.codes;
         let theme = test_theme();
         let rendered = {
-            let renderer = MarkdownRenderer::new(&theme, outputs, codes, 10, 80);
+            let renderer = MarkdownRenderer::new(&doc.source, &theme, outputs, codes, 10, 80);
             renderer.render(nodes)
         };
         (theme, rendered)
-    }
-
-    fn render_nodes(markdown: &str) -> Vec<LogicalLine> {
-        render_markdown(markdown).lines
     }
 
     fn source_label(line: &LogicalLine) -> String {
@@ -1770,112 +1663,6 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
-    }
-
-    fn code_start_lines(lines: &[LogicalLine]) -> Vec<(usize, String, Option<CodeId>, String)> {
-        lines
-            .iter()
-            .enumerate()
-            .filter(|(_, line)| line.is_code_start)
-            .map(|(idx, line)| (idx, source_label(line), line.code_id, line.text_content()))
-            .collect()
-    }
-
-    #[test]
-    fn test_snap_heading_to_code_start() {
-        let lines = render_nodes("# Title\n\n```bash\necho hi\n```");
-        let starts = code_start_lines(&lines);
-
-        assert_eq!(starts.len(), 1);
-        assert_eq!(starts[0].0, 0);
-        assert_eq!(starts[0].1, "Heading(1)");
-        assert_eq!(starts[0].3, "# Title");
-    }
-
-    #[test]
-    fn test_snap_paragraph_fallback_to_code_start() {
-        let lines = render_nodes("Intro paragraph.\n\n```bash\necho hi\n```");
-        let starts = code_start_lines(&lines);
-
-        assert_eq!(starts.len(), 1);
-        assert_eq!(starts[0].0, 0);
-        assert_eq!(starts[0].1, "Text");
-        assert_eq!(starts[0].3, "Intro paragraph.");
-    }
-
-    #[test]
-    fn test_adjacent_code_blocks_do_not_reuse_snap_context() {
-        let lines = render_nodes("# Title\n\n```bash\necho one\n```\n\n```bash\necho two\n```");
-        let starts = code_start_lines(&lines);
-
-        assert_eq!(starts.len(), 2);
-        assert_eq!(starts[0].1, "Heading(1)");
-        assert_eq!(starts[0].3, "# Title");
-        assert_eq!(starts[1].1, "CodeInfo");
-        assert_ne!(starts[0].2, starts[1].2);
-    }
-
-    #[test]
-    fn test_blockquote_snap_context_does_not_leak_outward() {
-        let lines = render_nodes("> quoted note\n\n```bash\necho hi\n```");
-        let starts = code_start_lines(&lines);
-
-        assert_eq!(starts.len(), 1);
-        assert_eq!(starts[0].1, "CodeInfo");
-        assert_eq!(lines[0].text_content(), "quoted note");
-        assert!(lines[0].code_id.is_none());
-    }
-
-    #[test]
-    fn test_blockquote_snap_context_does_not_leak_inward() {
-        let lines = render_nodes("Intro paragraph.\n\n> ```bash\n> echo hi\n> ```");
-        let starts = code_start_lines(&lines);
-
-        assert_eq!(starts.len(), 1);
-        assert_eq!(starts[0].1, "CodeInfo");
-        assert_eq!(lines[0].text_content(), "Intro paragraph.");
-        assert!(lines[0].code_id.is_none());
-    }
-
-    #[test]
-    fn test_code_prefix_overhead_tracks_blockquote_depth() {
-        for (name, markdown, expected) in [
-            ("flat", "```bash\necho hi\n```", 0),
-            ("single blockquote", "> ```bash\n> echo hi\n> ```", 2),
-            ("nested blockquote", "> > ```bash\n> > echo hi\n> > ```", 4),
-        ] {
-            let rendered = render_markdown(markdown);
-            let code_id = rendered
-                .lines
-                .iter()
-                .find(|line| line.is_code_body())
-                .and_then(|line| line.code_id)
-                .unwrap_or_else(|| panic!("expected code body for {name}"));
-
-            assert_eq!(
-                rendered
-                    .code_prefix_overhead
-                    .get(&code_id)
-                    .copied()
-                    .unwrap_or(0),
-                expected,
-                "{name} code prefix overhead should match its quote depth"
-            );
-        }
-    }
-
-    #[test]
-    fn test_blockquote_list_item_renders_quote_and_list_prefixes() {
-        let theme = test_theme();
-        let ctx = test_ctx(&theme, 80);
-        let lines = render_nodes("> - quoted item");
-        let list_item = lines
-            .iter()
-            .find(|line| matches!(line.source, LogicalLineSource::ListItem(_)))
-            .expect("expected a list item inside the blockquote");
-
-        assert_eq!(list_item.prefix_width(), 4);
-        assert_eq!(list_item.render(&ctx).to_string(), "> • quoted item");
     }
 
     #[test]
@@ -1942,345 +1729,6 @@ mod tests {
     }
 
     #[test]
-    fn test_render_headings() {
-        let lines = render_nodes("# Hello\n\n## World\n\n### Rust");
-        assert_snapshot!("headings", logical_line_summary(&lines));
-    }
-
-    #[test]
-    fn test_render_paragraph() {
-        let lines = render_nodes("This is a paragraph.\n\nWith a blank line.");
-        assert_snapshot!("paragraph", logical_line_summary(&lines));
-    }
-
-    #[test]
-    fn test_render_fenced_code_block() {
-        let lines = render_nodes("```bash\necho hello\n```");
-        assert_snapshot!("fenced_code", logical_line_summary(&lines));
-    }
-
-    #[test]
-    fn test_render_code_with_language_attr() {
-        let lines = render_nodes("```python [os:linux]\nprint('hi')\n```");
-        assert_snapshot!("code_with_attr", logical_line_summary(&lines));
-    }
-
-    #[test]
-    fn test_render_bullet_list() {
-        let lines = render_nodes("- item one\n- item two\n- item three");
-        assert_snapshot!("bullet_list", logical_line_summary(&lines));
-    }
-
-    #[test]
-    fn test_render_ordered_list() {
-        let lines = render_nodes("1. first\n2. second\n3. third");
-        assert_snapshot!("ordered_list", logical_line_summary(&lines));
-    }
-
-    #[test]
-    fn test_render_task_list() {
-        let lines = render_nodes("- [ ] unchecked\n- [x] checked\n- [-] in progress");
-        assert_snapshot!("task_list", logical_line_summary(&lines));
-    }
-
-    #[test]
-    fn test_render_thematic_break() {
-        let lines = render_nodes("above\n\n-----\n\nbelow");
-        assert_snapshot!("thematic_break", logical_line_summary(&lines));
-    }
-
-    #[test]
-    fn test_render_github_heading_rules() {
-        for level in 1..=6 {
-            let lines = render_nodes(&format!("{} Heading", "#".repeat(level)));
-            assert_eq!(
-                lines
-                    .iter()
-                    .any(|line| matches!(line.source, LogicalLineSource::ThematicBreak)),
-                level <= 2,
-                "H{level}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_render_blockquote() {
-        let lines = render_nodes(
-            "> quoted paragraph\n\
-             > \n\
-             > ```bash\n\
-             > echo hi\n\
-             > ```\n\
-             \n\
-             > - quoted item\n\
-             > - nested quote\n\
-             >   - deeper",
-        );
-        assert_snapshot!("blockquote", logical_line_summary(&lines));
-    }
-
-    #[test]
-    fn test_render_html_tabs_preserved_logically_expanded_visually() {
-        let lines = render_nodes("<pre>\n\tindented\n</pre>\n");
-        let html: Vec<&LogicalLine> = lines
-            .iter()
-            .filter(|l| matches!(l.source, LogicalLineSource::Html { .. }))
-            .collect();
-        assert_eq!(html.len(), 3);
-        assert_eq!(html[1].text_content(), "\tindented");
-
-        let theme = test_theme();
-        let ctx = test_ctx(&theme, 80);
-        let painted = html[1].render(&ctx).to_string();
-        assert!(!painted.contains('\t'));
-        assert!(painted.contains("    indented"));
-        assert_eq!(html[1].render_plain(&ctx).to_string(), painted);
-    }
-
-    #[test]
-    fn test_render_html_styles() {
-        let theme = test_theme();
-        let ctx = test_ctx(&theme, 80);
-
-        for (name, line) in [
-            (
-                "block",
-                render_nodes("<div class=\"card\">\n</div>\n")
-                    .iter()
-                    .find(|l| matches!(l.source, LogicalLineSource::Html { .. }))
-                    .unwrap()
-                    .render(&ctx),
-            ),
-            (
-                "inline",
-                render_nodes("x <img src=\"a.png\"> y")
-                    .iter()
-                    .find(|l| matches!(l.source, LogicalLineSource::Text(_)))
-                    .unwrap()
-                    .render(&ctx),
-            ),
-        ] {
-            let mut distinct: Vec<Color> = Vec::new();
-            for span in &line.spans {
-                if let Some(fg) = span.style.fg {
-                    if !distinct.contains(&fg) {
-                        distinct.push(fg);
-                    }
-                }
-            }
-            assert!(
-                distinct.len() >= 2,
-                "{name} HTML should use multiple syntax colors, got {distinct:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_render_inline_heading_styles() {
-        let theme = test_theme();
-        let ctx = test_ctx(&theme, 80);
-        let lines = render_nodes("# **Bold** title");
-        let heading = lines
-            .iter()
-            .find(|l| l.heading_level().is_some())
-            .expect("expected a heading");
-        let rendered = heading.render(&ctx);
-
-        assert_snapshot!("inline_heading_styles", ansi_line(&rendered));
-    }
-
-    #[test]
-    fn test_render_inline_list_item_styles() {
-        let theme = test_theme();
-        let ctx = test_ctx(&theme, 80);
-        let lines = render_nodes("- **bold item**");
-        let item = lines
-            .iter()
-            .find(|l| matches!(l.source, LogicalLineSource::ListItem(_)))
-            .expect("expected a list item");
-        let rendered = item.render(&ctx);
-
-        assert_snapshot!("inline_list_item_styles", ansi_line(&rendered));
-    }
-
-    #[test]
-    fn test_split_span_lines() {
-        let spans = vec![
-            InlineSpan {
-                text: "line one\n".into(),
-                style: vec![InlineStyle::Bold],
-            },
-            InlineSpan {
-                text: "line two".into(),
-                style: vec![],
-            },
-        ];
-        let lines = split_span_lines(&spans);
-        assert_eq!(lines.len(), 2);
-        assert_eq!(inline_text(&lines[0]), "line one");
-        assert_eq!(lines[0][0].style, vec![InlineStyle::Bold]);
-        assert_eq!(inline_text(&lines[1]), "line two");
-
-        // Empty input yields no lines.
-        assert!(split_span_lines(&[]).is_empty());
-        // Trailing newline drops the empty tail.
-        assert_eq!(
-            split_span_lines(&[InlineSpan {
-                text: "a\n".into(),
-                style: vec![]
-            }])
-            .len(),
-            1
-        );
-    }
-
-    #[test]
-    fn test_render_inline_styles_snapshot() {
-        let lines = render_nodes(
-            "**bold** *italic* ~~strike~~ `code` [link](https://x.dev) ![alt text](img.png)\n\
-             \n\
-             ## Heading with **bold**\n\
-             \n\
-             - **bold item**\n\
-             - *italic item*",
-        );
-        assert_snapshot!("inline_styles", logical_line_summary(&lines));
-    }
-
-    #[test]
-    fn test_render_table() {
-        let lines =
-            render_nodes("| Name  | Age |\n|-------|-----|\n| Alice | 30  |\n| Bob   | 25  |");
-        assert_snapshot!("table", logical_line_summary(&lines));
-    }
-
-    #[test]
-    fn test_render_table_inline_styles() {
-        let theme = test_theme();
-        let ctx = test_ctx(&theme, 80);
-        let lines = render_nodes(
-            "| Name | Reference |\n\
-             |------|-----------|\n\
-             | **bold** | [docs](https://x.dev) |",
-        );
-        let row = lines
-            .iter()
-            .filter(|line| matches!(line.source, LogicalLineSource::TableRow { .. }))
-            .map(|line| line.render(&ctx))
-            .find(|line| line.to_string().contains("bold"))
-            .expect("expected styled table body row");
-
-        assert_snapshot!("table_inline_styles", ansi_line(&row));
-    }
-
-    #[test]
-    fn test_render_mixed_runbook() {
-        let input = r#"# Setup
-
-Install dependencies.
-
-```bash
-npm install
-```
-
-## Test
-
-Run the test suite.
-
-```python [os:linux]
-pytest tests/
-```
-"#;
-        let lines = render_nodes(input);
-        assert_snapshot!("mixed_runbook", logical_line_summary(&lines));
-    }
-
-    #[test]
-    fn test_render_empty_input() {
-        let lines = render_nodes("");
-        assert!(lines.is_empty());
-    }
-
-    #[test]
-    fn test_render_code_ids_sequence() {
-        let lines = render_nodes("```bash\necho a\n```\n\n```python\nprint(1)\n```");
-        // Both code blocks should have distinct IDs
-        let code_lines: Vec<_> = lines.iter().filter(|line| line.is_code_info()).collect();
-        assert_eq!(code_lines.len(), 2);
-        let id0 = code_lines[0].code_id;
-        let id1 = code_lines[1].code_id;
-        assert!(id0.is_some());
-        assert!(id1.is_some());
-        assert_ne!(id0, id1);
-    }
-
-    #[test]
-    fn test_render_code_info_line_has_code_id() {
-        let lines = render_nodes("```bash\necho test\n```");
-        let code_info = lines.iter().find(|line| line.is_code_info());
-        assert!(code_info.is_some());
-        assert!(code_info.unwrap().code_id.is_some());
-    }
-
-    #[test]
-    fn test_render_code_body_associated_with_code_id() {
-        let lines = render_nodes("```bash\necho test\n```");
-        let code_bodies: Vec<_> = lines.iter().filter(|line| line.is_code_body()).collect();
-        assert!(!code_bodies.is_empty());
-        for body in code_bodies {
-            assert!(body.code_id.is_some(), "code body missing code_id");
-        }
-    }
-
-    #[test]
-    fn test_render_code_tabs_preserved_logically_expanded_visually() {
-        let lines = render_nodes(
-            "```go\npackage main\n\t\"fmt\"\n\tos.Setenv(\"FROM_GO\", \"set by go\")\n```",
-        );
-        let code_bodies: Vec<_> = lines.iter().filter(|line| line.is_code_body()).collect();
-        assert_eq!(code_bodies.len(), 3);
-        assert_eq!(code_bodies[0].text_content(), "package main");
-        assert_eq!(code_bodies[1].text_content(), "\t\"fmt\"");
-        assert_eq!(
-            code_bodies[2].text_content(),
-            "\tos.Setenv(\"FROM_GO\", \"set by go\")"
-        );
-
-        let theme = test_theme();
-        let ctx = test_ctx(&theme, 80);
-        let import_line = code_bodies[1].render(&ctx).to_string();
-        let call_line = code_bodies[2].render(&ctx).to_string();
-
-        assert!(!import_line.contains('\t'));
-        assert!(!call_line.contains('\t'));
-        assert!(import_line.contains("    \"fmt\""));
-        assert!(call_line.contains("    os.Setenv"));
-        assert!(!call_line.contains("os. Setenv"));
-    }
-
-    #[test]
-    fn test_render_heading_source() {
-        let lines = render_nodes("# Title\n\n## Subtitle");
-        let headings: Vec<_> = lines
-            .iter()
-            .filter(|line| line.heading_level().is_some())
-            .collect();
-        assert_eq!(headings.len(), 2);
-        assert_eq!(headings[0].heading_level(), Some(1));
-        assert_eq!(headings[1].heading_level(), Some(2));
-    }
-
-    #[test]
-    fn test_render_heading_level() {
-        let lines = render_nodes("# H1\n## H2\n### H3\n#### H4");
-        let levels: Vec<u8> = lines
-            .iter()
-            .filter_map(LogicalLine::heading_level)
-            .collect();
-        assert_eq!(levels, [1, 2, 3, 4]);
-    }
-
-    #[test]
     fn test_highlight_line_thai_match_middle() {
         let style = Style::default().fg(Color::Red);
         let line = highlight_line(Line::from("เปิดภาษาไทยได้"), "ภาษาไทย", style);
@@ -2298,38 +1746,6 @@ pytest tests/
         assert_eq!(line.to_string(), "สวัสดีจาก upmd");
         assert_eq!(line.spans[0].content, "สวัสดี");
         assert_eq!(line.spans[0].style.fg, Some(Color::Red));
-    }
-
-    #[test]
-    fn test_render_table_narrow() {
-        let doc = upmd_parser::new().parse("| Name | Age | City |\n|------|-----|------|\n| Alice | 30 | New York |\n| Bob | 25 | London |");
-        let theme = test_theme();
-        let ctx = test_ctx(&theme, 25);
-        let outputs = HashMap::new();
-        let renderer = MarkdownRenderer::new(&theme, &outputs, &doc.codes, 10, 25);
-        let lines = renderer.render(&doc.nodes).lines;
-        let summary: Vec<String> = lines
-            .iter()
-            .filter(|l| l.is_table())
-            .map(|l| l.render(&ctx).to_string())
-            .collect();
-        assert_snapshot!("table_narrow", summary.join("\n"));
-    }
-
-    #[test]
-    fn test_render_table_wide() {
-        let doc = upmd_parser::new().parse("| Name | Age | City |\n|------|-----|------|\n| Alice | 30 | New York |\n| Bob | 25 | London |");
-        let theme = test_theme();
-        let ctx = test_ctx(&theme, 80);
-        let outputs = HashMap::new();
-        let renderer = MarkdownRenderer::new(&theme, &outputs, &doc.codes, 10, 80);
-        let lines = renderer.render(&doc.nodes).lines;
-        let summary: Vec<String> = lines
-            .iter()
-            .filter(|l| l.is_table())
-            .map(|l| l.render(&ctx).to_string())
-            .collect();
-        assert_snapshot!("table_wide", summary.join("\n"));
     }
 
     /// Creates a [`Task`] pre-loaded with 50 lines of output for use in
@@ -2352,7 +1768,14 @@ pytest tests/
     ) -> String {
         let doc = upmd_parser::new().parse(markdown);
         let theme = test_theme();
-        let renderer = MarkdownRenderer::new(&theme, outputs, &doc.codes, inline_max_lines, 80);
+        let renderer = MarkdownRenderer::new(
+            &doc.source,
+            &theme,
+            outputs,
+            &doc.codes,
+            inline_max_lines,
+            80,
+        );
         let lines = renderer.render(&doc.nodes).lines;
         logical_line_summary(&lines)
     }
@@ -2434,6 +1857,7 @@ pytest tests/
                 text: "let value = 1;".into(),
                 style: Vec::new(),
             }],
+            "",
             false,
         );
 
@@ -2465,5 +1889,24 @@ pytest tests/
 
         assert!(!rendered.to_string().contains('⠲'));
         assert!(rendered.to_string().ends_with(" ME"));
+    }
+
+    #[test]
+    fn nested_children_do_not_change_following_list_item_identity() {
+        let markdown = "- first\n\n    | A | B |\n    |---|---|\n    | x | y |\n\n- after\n";
+        let doc = upmd_parser::new().parse(markdown);
+        let theme = test_theme();
+        let outputs = HashMap::new();
+        let identity = |mode| {
+            MarkdownRenderer::new(&doc.source, &theme, &outputs, &doc.codes, 10, 80)
+                .mode(mode)
+                .render(&doc.nodes)
+                .lines
+                .into_iter()
+                .find(|line| line.text_content().trim_start_matches("- ") == "after")
+                .expect("following list item")
+                .node_idx
+        };
+        assert_eq!(identity(RenderMode::Visual), identity(RenderMode::Markup));
     }
 }

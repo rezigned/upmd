@@ -2,8 +2,11 @@ pub mod nodes;
 pub mod options;
 pub mod parser;
 
+pub use parser::Parser;
+
 pub use nodes::{
     Code, CodeId, Codes, Dependencies, FrontmatterStyle, Heading, InlineSpan, InlineStyle, Node,
+    NodeKind, SourceText,
 };
 
 /// Completeness of [`Document::nodes`].
@@ -34,16 +37,13 @@ pub enum PartialReason {
 /// partial, or absent depending on `nodes_state`.
 #[derive(Clone, Debug, Default)]
 pub struct Document {
+    pub source: String,
     pub nodes: Vec<Node>,
     pub codes: Codes,
     pub headings: Vec<Heading>,
     pub nodes_state: NodesState,
 }
 
-pub trait Parser {
-    fn parse(&self, text: &str) -> Document;
-}
-
-pub fn new() -> impl Parser {
-    parser::Cmark::new()
+pub fn new() -> Parser {
+    Parser::new()
 }
