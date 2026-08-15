@@ -37,9 +37,11 @@ use crate::apps::theme::Theme;
 use crate::runner::CodeId;
 use keymap::{DerivedConfig, KeyMap};
 use upmd_parser::nodes::Node;
-use upmd_parser::Codes;
+use upmd_parser::{Codes, Document};
 
-use super::markdown::{highlight_line, LogicalLine, MarkdownHtml, MarkdownRenderer, RenderContext};
+use super::markdown::{
+    highlight_line, LogicalLine, MarkdownHtml, MarkdownRenderer, RenderContext, RenderMode,
+};
 use super::selection::SelectionState;
 use super::wrap::CopyLine;
 use crate::apps::task::Task;
@@ -74,6 +76,7 @@ enum LayoutLineIdentity {
         wrap_idx: usize,
     },
     Document {
+        node_idx: Option<usize>,
         logical_idx: usize,
         wrap_idx: usize,
     },
@@ -81,6 +84,7 @@ enum LayoutLineIdentity {
 
 /// Markdown preview state, rendering, and interaction.
 pub struct Preview {
+    source: String,
     nodes: Vec<Node>,
     /// Width-independent rendered content.
     logical_lines: Vec<LogicalLine>,
@@ -109,6 +113,8 @@ pub struct Preview {
     images: RefCell<ImageCache>,
     /// Directory that relative image paths resolve against (the open document's dir).
     image_base_dir: std::path::PathBuf,
+    /// Current render mode (visual vs source-preserving markup).
+    mode: Cell<RenderMode>,
 }
 
 #[derive(KeyMap, Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -120,6 +126,9 @@ pub enum Action {
     /// Toggles table of contents mode.
     #[key("c")]
     ToggleToc,
+    /// Toggles between visual and markup render modes.
+    #[key("v")]
+    ToggleMode,
     /// Jumps to a specific code block by ID.
     #[key("@digit")]
     Show(CodeId),
@@ -141,15 +150,21 @@ pub enum Action {
 impl Preview {
     /// Creates a preview from parsed AST nodes and code blocks.
     pub fn new(
-        nodes: Vec<Node>,
-        codes: Codes,
+        document: Document,
         theme: Theme,
         outputs: &HashMap<CodeId, Task>,
         inline_max_lines_cap: usize,
         keymap: DerivedConfig<Action>,
         image_base_dir: std::path::PathBuf,
     ) -> Self {
+        let Document {
+            source,
+            nodes,
+            codes,
+            ..
+        } = document;
         let mut preview = Self {
+            source,
             nodes,
             logical_lines: vec![],
             layout_lines: LayoutLines::new(),
@@ -169,6 +184,7 @@ impl Preview {
             code_prefix_overhead: HashMap::new(),
             images: RefCell::new(ImageCache::new()),
             image_base_dir,
+            mode: Cell::new(RenderMode::Visual),
         };
         preview.rebuild_view(outputs);
         if !preview.layout_lines.is_empty() {
@@ -179,6 +195,13 @@ impl Preview {
 
     pub fn prefer_status_gutter_for(&self, id: CodeId) {
         self.prefer_status_gutter.set(Some(id));
+    }
+
+    pub fn toggle_mode(&self) {
+        self.mode.set(match self.mode.get() {
+            RenderMode::Visual => RenderMode::Markup,
+            RenderMode::Markup => RenderMode::Visual,
+        });
     }
 
     /// Requests loading of images in the viewport and a small overdraw margin.
@@ -224,12 +247,14 @@ impl Preview {
 
     fn rebuild_view_at_width(&mut self, outputs: &HashMap<CodeId, Task>, width: usize) {
         let renderer = MarkdownRenderer::new(
+            &self.source,
             &self.theme,
             outputs,
             &self.code_index,
             self.inline_max_lines.get(),
             width,
-        );
+        )
+        .mode(self.mode.get());
         let mut old_lines = std::mem::take(&mut self.logical_lines);
         let rendered = renderer.render(&self.nodes);
         tracing::Span::current().record("lines", rendered.lines.len());
@@ -448,6 +473,7 @@ impl Preview {
                 })
             }
             None => Some(LayoutLineIdentity::Document {
+                node_idx: logical_lines[line.logical_idx].node_idx,
                 logical_idx: line.logical_idx,
                 wrap_idx: line.wrap_idx,
             }),
@@ -455,24 +481,32 @@ impl Preview {
     }
 
     fn layout_idx_for_identity(&self, identity: LayoutLineIdentity) -> Option<usize> {
-        let layout_lines = self.layout_lines.borrow();
-        let (logical_idx, wrap_idx) = match identity {
+        match identity {
             LayoutLineIdentity::Code {
                 id,
                 line_idx,
                 wrap_idx,
-            } => {
-                let first_logical_idx = layout_lines
-                    .iter()
-                    .find(|line| line.code_id(&self.logical_lines) == Some(id))?
-                    .logical_idx;
-                (first_logical_idx + line_idx, wrap_idx)
-            }
+            } => self.layout_idx_for_code_identity(id, line_idx, wrap_idx),
             LayoutLineIdentity::Document {
+                node_idx,
                 logical_idx,
                 wrap_idx,
-            } => (logical_idx, wrap_idx),
-        };
+            } => self.layout_idx_for_document_identity(node_idx, logical_idx, wrap_idx),
+        }
+    }
+
+    fn layout_idx_for_code_identity(
+        &self,
+        id: CodeId,
+        line_idx: usize,
+        wrap_idx: usize,
+    ) -> Option<usize> {
+        let layout_lines = self.layout_lines.borrow();
+        let first_logical_idx = layout_lines
+            .iter()
+            .find(|line| line.code_id(&self.logical_lines) == Some(id))?
+            .logical_idx;
+        let logical_idx = first_logical_idx + line_idx;
 
         layout_lines
             .iter()
@@ -481,6 +515,42 @@ impl Preview {
                 layout_lines
                     .iter()
                     .position(|line| line.logical_idx == logical_idx)
+            })
+    }
+
+    fn layout_idx_for_document_identity(
+        &self,
+        node_idx: Option<usize>,
+        logical_idx: usize,
+        wrap_idx: usize,
+    ) -> Option<usize> {
+        let layout_lines = self.layout_lines.borrow();
+
+        // Prefer the same wrapped row within the AST node, then the first row
+        // from that node before using the previous logical index.
+        node_idx
+            .and_then(|node_idx| {
+                layout_lines
+                    .iter()
+                    .position(|line| {
+                        self.logical_lines[line.logical_idx].node_idx == Some(node_idx)
+                            && line.wrap_idx == wrap_idx
+                    })
+                    .or_else(|| {
+                        layout_lines.iter().position(|line| {
+                            self.logical_lines[line.logical_idx].node_idx == Some(node_idx)
+                        })
+                    })
+            })
+            .or_else(|| {
+                layout_lines
+                    .iter()
+                    .position(|line| line.logical_idx == logical_idx && line.wrap_idx == wrap_idx)
+                    .or_else(|| {
+                        layout_lines
+                            .iter()
+                            .position(|line| line.logical_idx == logical_idx)
+                    })
             })
     }
 
@@ -1002,6 +1072,7 @@ impl Component for Preview {
             Action::PageUp => self.page_up(),
             Action::PageDown => self.page_down(),
             Action::ToggleToc => {}
+            Action::ToggleMode => self.toggle_mode(),
             Action::Copy => {
                 let ok = if let Some(text) = self
                     .selection
@@ -1212,7 +1283,6 @@ mod tests {
     use crate::apps::tui::testutil::ansi_line_summary;
     use insta::assert_snapshot;
     use std::collections::HashMap;
-    use upmd_parser::Parser;
 
     fn preview_from_markdown(markdown: &str) -> Preview {
         let doc = upmd_parser::new().parse(markdown);
@@ -1220,8 +1290,7 @@ mod tests {
         let outputs = HashMap::new();
         let keymap: DerivedConfig<Action> = toml::from_str("").unwrap();
         Preview::new(
-            doc.nodes,
-            doc.codes,
+            doc,
             theme,
             &outputs,
             10,
@@ -1256,6 +1325,7 @@ mod tests {
             }
             if updated != comment {
                 let doc = upmd_parser::new().parse(updated);
+                preview.source = doc.source;
                 preview.nodes = doc.nodes;
                 preview.code_index = doc.codes;
             }
@@ -1267,6 +1337,100 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn mode_toggle_switches_to_markup_and_preserves_code_selection() {
+        let mut preview = preview_from_markdown("# Title\n\n```bash\necho hello\n```");
+        preview.rebuild_layout_lines(60);
+        preview.select_code(1);
+
+        preview.toggle_mode();
+        preview.rebuild_view(&HashMap::new());
+
+        assert_eq!(preview.mode.get(), RenderMode::Markup);
+        assert_eq!(preview.selected_code_id(), Some(1));
+        let text = full_preview_text(&preview);
+        assert!(text.contains("# Title"), "got: {text}");
+        assert!(text.contains("echo hello"), "got: {text}");
+    }
+
+    #[test]
+    fn mode_toggle_preserves_paragraph_selection_across_headings() {
+        let markdown = "# One\n\n## Two\n\nmiddle paragraph\n\n# Three\n\n## Four\n\nend\n";
+        let mut preview = preview_from_markdown(markdown);
+        preview.rebuild_layout_lines(60);
+
+        let target = "middle paragraph";
+        let logical_idx = preview
+            .logical_lines
+            .iter()
+            .position(|l| l.text_content() == target)
+            .expect("paragraph logical line");
+        let layout_idx = preview
+            .layout_lines
+            .borrow()
+            .iter()
+            .position(|l| l.logical_idx == logical_idx)
+            .expect("paragraph layout line");
+        {
+            let mut state = preview.state.borrow_mut();
+            state.select(Some(layout_idx));
+            *state.offset_mut() = layout_idx;
+        }
+
+        for _ in 0..2 {
+            preview.toggle_mode();
+            preview.rebuild_view(&HashMap::new());
+            let selected = preview
+                .selected_logical_line()
+                .expect("selection preserved across mode toggle");
+            assert_eq!(
+                preview.logical_lines[selected].text_content(),
+                target,
+                "mode {:?}",
+                preview.mode.get()
+            );
+        }
+    }
+
+    #[test]
+    fn mode_toggle_maps_heading_rule_to_heading() {
+        let mut preview = preview_from_markdown("# One\n\nbody\n");
+        preview.rebuild_layout_lines(60);
+        let heading_idx = preview
+            .logical_lines
+            .iter()
+            .position(|line| line.text_content() == "# One")
+            .expect("heading line");
+        let rule_idx = heading_idx + 1;
+        let layout_idx = preview
+            .layout_lines
+            .borrow()
+            .iter()
+            .position(|line| line.logical_idx == rule_idx)
+            .expect("heading rule layout line");
+        preview.state.borrow_mut().select(Some(layout_idx));
+
+        preview.toggle_mode();
+        preview.rebuild_view(&HashMap::new());
+
+        let selected = preview
+            .selected_logical_line()
+            .expect("heading selection preserved");
+        assert_eq!(preview.logical_lines[selected].text_content(), "# One");
+    }
+
+    #[test]
+    fn markup_mode_does_not_reserve_image_rows() {
+        let mut preview = preview_from_markdown("![alt](image.png)");
+        preview.toggle_mode();
+        preview.rebuild_view(&HashMap::new());
+
+        assert!(
+            preview.logical_lines.iter().all(|l| !l.is_image()),
+            "markup mode should emit images as text"
+        );
     }
 
     #[test]
@@ -1529,8 +1693,7 @@ mod tests {
         outputs.insert(1, output);
         let keymap: DerivedConfig<Action> = toml::from_str("").unwrap();
         let preview = Preview::new(
-            doc.nodes,
-            doc.codes,
+            doc,
             theme,
             &outputs,
             10,
@@ -1863,8 +2026,7 @@ mod tests {
         let outputs = std::collections::HashMap::new();
         let keymap: keymap::DerivedConfig<Action> = toml::from_str("").unwrap();
         let preview = Preview::new(
-            doc.nodes,
-            doc.codes,
+            doc,
             theme,
             &outputs,
             10,

@@ -11,7 +11,7 @@ use crate::apps::config::Envs;
 use crate::apps::task::Task;
 use crate::{pty::process::Size as PtySize, pty::stream::Stream, runner};
 use std::collections::HashMap;
-use upmd_parser::{nodes, CodeId, Parser};
+use upmd_parser::{nodes, CodeId};
 use upmd_runtime::Cmd;
 
 /// Executes a code block, populating the given [`Task`].
@@ -92,7 +92,7 @@ pub fn reload_document(file: Option<&str>) -> Result<upmd_parser::Document, Stri
         None => return Err("No file path in config, cannot reload".into()),
     };
     let parser = upmd_parser::new();
-    Ok(parser.parse(&content))
+    Ok(parser.parse(content))
 }
 
 /// Merges captured environment variables into a session-wide list.

@@ -30,7 +30,7 @@ use crate::{
 };
 use color_eyre::Result;
 use keymap::{DerivedConfig, KeyMap};
-use upmd_parser::{Code, CodeId, Codes, Parser};
+use upmd_parser::{Code, CodeId, Codes};
 
 /// For the CLI, manages code block execution and navigation.
 pub struct App {
@@ -136,7 +136,7 @@ impl App {
     fn open_markdown_file(&mut self, path: &std::path::Path) -> Option<Cmd<Msg>> {
         match crate::reader::read_from_path(path) {
             Ok(input) => {
-                let doc = upmd_parser::new().parse(&input);
+                let doc = upmd_parser::new().parse(input);
                 if let Err(error) = self.load_document(doc) {
                     eprintln!("{error}");
                     self.failed.set(true);
@@ -534,7 +534,7 @@ impl App {
 }
 
 impl crate::RunApp for App {
-    fn from_input(input: &str, config: AppConfig) -> std::result::Result<Self, String> {
+    fn from_input(input: String, config: AppConfig) -> std::result::Result<Self, String> {
         let doc = upmd_parser::new().parse(input);
         Self::new(doc, config)
     }
@@ -1124,7 +1124,6 @@ impl<'a, W: io::Write> io::Write for LineCounter<'a, W> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use upmd_parser::Parser;
 
     fn make_config() -> AppConfig {
         AppConfig::new(crate::apps::config::ConfigArgs {
@@ -1200,16 +1199,7 @@ echo world
 
     #[test]
     fn test_create_with_no_code_blocks_shows_message() {
-        let mut app = App::new(
-            upmd_parser::Document {
-                nodes: vec![],
-                codes: Codes::default(),
-                headings: Vec::new(),
-                nodes_state: upmd_parser::NodesState::Full,
-            },
-            make_config(),
-        )
-        .unwrap();
+        let mut app = App::new(upmd_parser::Document::default(), make_config()).unwrap();
         let _ = app.create();
         assert_eq!(app.codes.len(), 0);
     }
@@ -1262,16 +1252,7 @@ echo world
 
     #[test]
     fn test_create_with_empty_codes() {
-        let mut app = App::new(
-            upmd_parser::Document {
-                nodes: vec![],
-                codes: Codes::default(),
-                headings: Vec::new(),
-                nodes_state: upmd_parser::NodesState::Full,
-            },
-            make_config(),
-        )
-        .unwrap();
+        let mut app = App::new(upmd_parser::Document::default(), make_config()).unwrap();
         let result = app.create();
         assert!(result.is_none(), "empty codes returns None");
     }
@@ -1335,6 +1316,7 @@ print("2")
     fn test_empty_codes_action_does_not_panic() {
         let app = App::new(
             upmd_parser::Document {
+                source: Default::default(),
                 nodes: vec![],
                 codes: Codes::default(),
                 headings: Vec::new(),
@@ -1353,16 +1335,7 @@ print("2")
 
     #[test]
     fn test_empty_all_plan_does_not_panic() {
-        let mut app = App::new(
-            upmd_parser::Document {
-                nodes: vec![],
-                codes: Codes::default(),
-                headings: Vec::new(),
-                nodes_state: upmd_parser::NodesState::Full,
-            },
-            make_config(),
-        )
-        .unwrap();
+        let mut app = App::new(upmd_parser::Document::default(), make_config()).unwrap();
         assert!(app.start_all().is_none());
     }
 
@@ -1370,16 +1343,7 @@ print("2")
     fn test_empty_codes_create_with_yes_does_not_panic() {
         let mut config = make_config();
         config.yes = true;
-        let mut app = App::new(
-            upmd_parser::Document {
-                nodes: vec![],
-                codes: Codes::default(),
-                headings: Vec::new(),
-                nodes_state: upmd_parser::NodesState::Full,
-            },
-            config,
-        )
-        .unwrap();
+        let mut app = App::new(upmd_parser::Document::default(), config).unwrap();
         let result = app.create();
         assert!(
             result.is_none(),

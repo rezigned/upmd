@@ -258,6 +258,11 @@ description = "Jumps to a specific code block by ID."
 keys = ["@digit"]
 symbol = "@digit"
 
+[keymap.preview.ToggleMode]
+description = "Toggles between visual and markup render modes."
+keys = ["v"]
+symbol = "v"
+
 [keymap.preview.ToggleToc]
 description = "Toggles table of contents mode."
 keys = ["c"]

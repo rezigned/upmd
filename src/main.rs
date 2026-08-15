@@ -15,7 +15,7 @@ mod utils;
 
 trait RunApp: Sized {
     fn from_input(
-        input: &str,
+        input: String,
         config: crate::apps::config::Config,
     ) -> std::result::Result<Self, String>;
 
@@ -66,7 +66,7 @@ fn run<App: RunApp>(config: crate::apps::config::Config) -> Result<ExitCode> {
     match crate::reader::resolve_input_target(&config.file)? {
         crate::reader::InputTarget::Stdin | crate::reader::InputTarget::File(_) => {
             let input = crate::reader::read_input(&config.file)?;
-            App::from_input(&input, config)
+            App::from_input(input, config)
                 .map_err(|error| color_eyre::eyre::eyre!(error))?
                 .run()
         }

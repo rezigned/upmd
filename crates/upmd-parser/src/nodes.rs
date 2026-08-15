@@ -2,7 +2,19 @@ use std::collections::HashMap;
 use std::ops::Range;
 
 #[derive(Debug, Clone)]
-pub enum Node {
+pub struct Node {
+    pub kind: NodeKind,
+    pub range: Range<usize>,
+}
+
+impl Node {
+    pub fn new(kind: NodeKind, range: Range<usize>) -> Self {
+        Self { kind, range }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum NodeKind {
     Heading {
         level: u8,
         text: Vec<InlineSpan>,
@@ -13,7 +25,7 @@ pub enum Node {
     Code(CodeId),
     Table(Table),
     Text(Vec<InlineSpan>),
-    HtmlBlock(String),
+    HtmlBlock,
     ThematicBreak,
     /// A standalone image paragraph (`![alt](src)` as its only content).
     Image {
@@ -23,7 +35,7 @@ pub enum Node {
     /// Leading YAML or TOML frontmatter.
     Frontmatter {
         style: FrontmatterStyle,
-        raw: String,
+        raw: SourceText,
     },
 }
 
@@ -33,13 +45,60 @@ pub enum FrontmatterStyle {
     Toml,
 }
 
+/// Text stored either as a byte range into [`crate::Document::source`] or as
+/// owned text when parsing changed the source representation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SourceText {
+    Source(Range<usize>),
+    Owned(Box<str>),
+}
+
+impl SourceText {
+    pub fn resolve<'a>(&'a self, source: &'a str) -> &'a str {
+        match self {
+            Self::Source(range) => &source[range.clone()],
+            Self::Owned(text) => text,
+        }
+    }
+
+    pub fn into_owned(self, source: &str) -> Self {
+        match self {
+            Self::Source(range) => Self::Owned(source[range].into()),
+            owned => owned,
+        }
+    }
+}
+
+impl From<String> for SourceText {
+    fn from(text: String) -> Self {
+        Self::Owned(text.into_boxed_str())
+    }
+}
+
+impl From<&str> for SourceText {
+    fn from(text: &str) -> Self {
+        Self::Owned(text.into())
+    }
+}
+
 /// A run of inline text with the formatting applied to it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InlineSpan {
-    pub text: String,
+    pub text: SourceText,
     /// Active styles for this run. Empty means plain text; styles nest in
     /// source order (e.g. bold inside italic becomes `[Italic, Bold]`).
     pub style: Vec<InlineStyle>,
+}
+
+impl InlineSpan {
+    pub fn text<'a>(&'a self, source: &'a str) -> &'a str {
+        self.text.resolve(source)
+    }
+
+    pub fn into_owned(mut self, source: &str) -> Self {
+        self.text = self.text.into_owned(source);
+        self
+    }
 }
 
 /// Inline markdown formatting applied to a [`InlineSpan`].
@@ -61,16 +120,16 @@ pub enum InlineStyle {
 }
 
 /// Concatenates span text into a single plain string (for search, copy, menus).
-pub fn inline_text(spans: &[InlineSpan]) -> String {
-    spans.iter().map(|s| s.text.as_str()).collect()
+pub fn inline_text(spans: &[InlineSpan], source: &str) -> String {
+    spans.iter().map(|span| span.text(source)).collect()
 }
 
 /// Concatenates span text, excluding HTML tags (for semantic labels).
-pub fn semantic_text(spans: &[InlineSpan]) -> String {
+pub fn semantic_text(spans: &[InlineSpan], source: &str) -> String {
     spans
         .iter()
-        .filter(|s| !s.style.contains(&InlineStyle::HtmlTag))
-        .map(|s| s.text.as_str())
+        .filter(|span| !span.style.contains(&InlineStyle::HtmlTag))
+        .map(|span| span.text(source))
         .collect()
 }
 
@@ -113,14 +172,14 @@ pub struct TableCell {
 }
 
 impl TableCell {
-    pub fn text(&self) -> String {
-        inline_text(&self.spans)
+    pub fn text(&self, source: &str) -> String {
+        inline_text(&self.spans, source)
     }
 
-    pub fn char_len(&self) -> usize {
+    pub fn char_len(&self, source: &str) -> usize {
         self.spans
             .iter()
-            .map(|span| span.text.chars().count())
+            .map(|span| span.text(source).chars().count())
             .sum()
     }
 }
