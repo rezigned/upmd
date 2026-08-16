@@ -341,6 +341,9 @@ pub struct LogicalLine {
     /// Multiple prefixes can stack (for example, a blockquote marker followed by
     /// a list marker). Keeping them separate preserves each prefix's style.
     pub prefixes: Vec<Span<'static>>,
+    /// Number of leading rendered characters repeated on wrapped rows, such as
+    /// `▎ ` in Visual mode or `> ` in Markup mode.
+    wrap_prefix_width: usize,
     /// Optional foreground color override for the gutter indicator (used by
     /// output lines to reflect task status).
     pub gutter_fg: Option<Color>,
@@ -397,7 +400,9 @@ impl LogicalLine {
 
     /// Creates a markup-mode text line, syntax-highlighted as markdown source.
     pub fn markup_text(text: impl Into<String>, is_block_start: bool) -> Self {
+        let text = text.into();
         Self {
+            wrap_prefix_width: source_quote_width(&text),
             source: LogicalLineSource::Text(LazyText::markdown(text)),
             is_block_start,
             ..Self::default()
@@ -531,6 +536,14 @@ impl LogicalLine {
             .sum()
     }
 
+    pub fn wrap_prefix_width(&self) -> usize {
+        self.wrap_prefix_width
+    }
+
+    pub fn reserved_prefix_width(&self) -> usize {
+        self.prefix_width().max(self.wrap_prefix_width)
+    }
+
     #[inline]
     pub fn heading_level(&self) -> Option<u8> {
         match self.source {
@@ -585,7 +598,11 @@ impl LogicalLine {
     /// Returns `true` for lines that must not be wrapped (already sized/formatted).
     #[inline]
     pub fn is_unwrappable(&self) -> bool {
-        self.is_table() || self.is_output() || self.is_code_info() || self.is_image()
+        self.is_table()
+            || self.is_output()
+            || self.is_code_info()
+            || self.is_image()
+            || matches!(self.source, LogicalLineSource::ThematicBreak)
     }
 
     /// Returns text content, preferring raw text if available.
@@ -1077,7 +1094,7 @@ impl SnapContext {
 struct RenderState {
     /// Snap targets are scoped separately from visual nesting.
     snap: SnapContext,
-    /// Current blockquote nesting depth. Each level adds a display-only "> ".
+    /// Current blockquote nesting depth. Each level adds a display-only gutter.
     quote_depth: usize,
     /// Extra display width before code content, keyed by code block.
     code_prefix_overhead: HashMap<CodeId, usize>,
@@ -1172,9 +1189,9 @@ impl<'a> MarkdownRenderer<'a> {
             }
             None => false,
         };
-        let quote_overhead = Self::quote_prefix_width(state.quote_depth);
-        if quote_overhead > 0 {
-            state.code_prefix_overhead.insert(code.id, quote_overhead);
+        let gutter_width = Self::quote_prefix_width(state.quote_depth);
+        if gutter_width > 0 {
+            state.code_prefix_overhead.insert(code.id, gutter_width);
         }
         let is_running = self.outputs.get(&code.id).is_some_and(|t| t.running());
         let gutter_fg = self.outputs.get(&code.id).and_then(|buffer| {
@@ -1195,11 +1212,15 @@ impl<'a> MarkdownRenderer<'a> {
     }
 
     fn quote_prefix_span(&self) -> Span<'static> {
-        // Quote markers sit outside code backgrounds. Pinning the background
+        // Quote prefixes sit outside code backgrounds. Pinning the background
         // avoids inheriting the highlighted/code block background that is added
         // later during LogicalLine::render.
+        let content = match self.mode {
+            RenderMode::Visual => "▎ ",
+            RenderMode::Markup => "> ",
+        };
         Span::styled(
-            "> ",
+            content,
             Style::default()
                 .fg(self.theme.muted)
                 .bg(self.theme.background),
@@ -1211,9 +1232,9 @@ impl<'a> MarkdownRenderer<'a> {
     }
 
     fn push_line(&self, lines: &mut Vec<LogicalLine>, mut line: LogicalLine, state: &RenderState) {
-        // Quote prefixes are outer chrome. Insert before any existing list/task
-        // prefix so rendering preserves markdown order: "> • item", not
-        // "• > item".
+        // Quote prefixes are outer chrome. Insert them before existing list/task
+        // prefixes so rendering preserves Markdown nesting order.
+        line.wrap_prefix_width = Self::quote_prefix_width(state.quote_depth);
         for _ in 0..state.quote_depth {
             line.prefixes.insert(0, self.quote_prefix_span());
         }
@@ -1590,6 +1611,32 @@ fn inline_style(theme: &Theme, style: &InlineStyle) -> Style {
         InlineStyle::Image { .. } => theme.image_style(),
         InlineStyle::HtmlTag => Style::default(),
     }
+}
+
+/// Returns the byte width of the leading `> ` quote markers in source text.
+fn source_quote_width(text: &str) -> usize {
+    // CommonMark permits up to three spaces before a blockquote marker.
+    const MAX_MARKER_INDENT: usize = 3;
+    let bytes = text.as_bytes();
+    let mut pos = 0;
+    let mut end = 0;
+
+    loop {
+        let spaces = bytes[pos..]
+            .iter()
+            .take(MAX_MARKER_INDENT)
+            .take_while(|&&b| b == b' ')
+            .count();
+        if bytes.get(pos + spaces) != Some(&b'>') {
+            break;
+        }
+        pos += spaces + 1; // consume leading spaces + '>'
+        if bytes.get(pos).is_some_and(|b| matches!(b, b' ' | b'\t')) {
+            pos += 1; // consume one optional space/tab after '>'
+        }
+        end = pos;
+    }
+    end
 }
 
 #[cfg(test)]

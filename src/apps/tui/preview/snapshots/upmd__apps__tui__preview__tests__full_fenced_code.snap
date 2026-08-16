@@ -1,7 +1,6 @@
 ---
 source: src/apps/tui/preview/mod.rs
-assertion_line: 1163
 expression: full_preview_text(&preview)
 ---
-▎ 1                                                Bash 
+▎ 1                                                Bash
 ▎ echo hello
