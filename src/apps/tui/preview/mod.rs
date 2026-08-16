@@ -218,7 +218,7 @@ impl Preview {
         let mut images = self.images.borrow_mut();
         for src in layout_lines[start..end]
             .iter()
-            .filter(|line| line.wrap_idx == 0)
+            .filter(|line| !line.is_continuation())
             .filter_map(|line| self.logical_lines[line.logical_idx].image_src())
         {
             images.request(src, &self.image_base_dir);
@@ -740,7 +740,7 @@ impl Preview {
         Some((col, pty_row as u16))
     }
 
-    /// Returns the prefix overhead in chars for a code block (e.g. 2 for "> " inside a blockquote).
+    /// Returns the gutter overhead in chars for a code block nested in a blockquote.
     pub fn code_prefix_overhead(&self, id: CodeId) -> usize {
         self.code_prefix_overhead.get(&id).copied().unwrap_or(0)
     }
@@ -772,7 +772,7 @@ impl Preview {
                 text = stripped.to_string();
                 CODE_GUTTER_WIDTH
             }
-            (true, None) if line.wrap_idx > 0 => CODE_GUTTER_WIDTH,
+            (true, None) if line.is_continuation() => CODE_GUTTER_WIDTH,
             _ => 0,
         };
         Some(CopyLine {
@@ -1341,7 +1341,13 @@ mod tests {
 
     #[test]
     fn mode_toggle_switches_to_markup_and_preserves_code_selection() {
-        let mut preview = preview_from_markdown("# Title\n\n```bash\necho hello\n```");
+        let markdown = r#"# Title
+[**bold** text](url "title")
+
+> ```bash
+> echo hello
+> ```"#;
+        let mut preview = preview_from_markdown(markdown);
         preview.rebuild_layout_lines(60);
         preview.select_code(1);
 
@@ -1352,7 +1358,12 @@ mod tests {
         assert_eq!(preview.selected_code_id(), Some(1));
         let text = full_preview_text(&preview);
         assert!(text.contains("# Title"), "got: {text}");
+        assert!(
+            text.contains("[**bold** text](url \"title\")"),
+            "got: {text}"
+        );
         assert!(text.contains("echo hello"), "got: {text}");
+        assert!(!text.contains("> >"), "got: {text}");
     }
 
     #[test]
@@ -1480,7 +1491,12 @@ mod tests {
             .layout_lines
             .borrow()
             .iter()
-            .map(|vl| render_layout_line(preview, vl, &ctx).to_string())
+            .map(|line| {
+                render_layout_line(preview, line, &ctx)
+                    .to_string()
+                    .trim_end_matches(' ')
+                    .to_owned()
+            })
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -1535,9 +1551,38 @@ mod tests {
     }
 
     #[test]
+    fn markup_nested_code_retains_quote_marker() {
+        let mut preview = preview_from_markdown(
+            r#"> 2. Another ordered item
+>
+> ```bash
+> echo \"code inside a blockquote\"
+> ```"#,
+        );
+        preview.toggle_mode();
+        preview.rebuild_view(&HashMap::new());
+        preview.rebuild_layout_lines(80);
+        let rows = full_preview_text(&preview);
+        let code_rows = rows
+            .lines()
+            .filter(|line| line.contains("Bash") || line.contains("echo"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(code_rows.len(), 2, "got: {rows}");
+        assert!(
+            code_rows.iter().all(|line| line.starts_with("> ▎ ")),
+            "interactive code rows should retain the Markup quote marker, got: {rows}"
+        );
+    }
+
+    #[test]
     fn snapshot_full_table() {
-        let preview =
-            preview_from_markdown("| Name | Age |\n|------|-----|\n| Alice | 30 |\n| Bob | 25 |");
+        let preview = preview_from_markdown(
+            r#"| Name | Age |
+|------|-----|
+| Alice | 30 |
+| Bob | 25 |"#,
+        );
         preview.rebuild_layout_lines(60);
         assert_snapshot!("full_table", full_preview_text(&preview));
     }
@@ -1659,7 +1704,7 @@ mod tests {
         let code_body_line = layout_lines
             .iter()
             .find(|line| {
-                line.wrap_idx == 0
+                !line.is_continuation()
                     && line.code_id(&preview.logical_lines) == Some(1)
                     && line.logical(&preview.logical_lines).is_code_body()
             })
@@ -1711,7 +1756,7 @@ mod tests {
             .borrow()
             .iter()
             .find(|line| {
-                line.wrap_idx == 0
+                !line.is_continuation()
                     && line.code_id(&preview.logical_lines) == Some(1)
                     && line.logical(&preview.logical_lines).is_code_body()
             })

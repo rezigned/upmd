@@ -1,10 +1,9 @@
 ---
 source: src/apps/tui/preview/mod.rs
-assertion_line: 1191
 expression: full_preview_text(&preview)
 ---
-> quoted paragraph
-> 
-> ▎ 1                                              Bash 
-> ▎ echo hi
->
+▎ quoted paragraph
+▎
+▎ ▎ 1                                              Bash
+▎ ▎ echo hi
+▎

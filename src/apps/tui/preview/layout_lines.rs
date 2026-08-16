@@ -27,6 +27,10 @@ impl LayoutLine {
         }
     }
 
+    pub fn is_continuation(&self) -> bool {
+        self.wrap_idx > 0
+    }
+
     pub fn logical<'a>(&self, logical_lines: &'a [LogicalLine]) -> &'a LogicalLine {
         &logical_lines[self.logical_idx]
     }
@@ -40,14 +44,16 @@ impl LayoutLine {
         logical_line: &LogicalLine,
         ctx: &RenderContext<'_>,
     ) -> ratatui::text::Line<'static> {
-        if logical_line.is_image() && self.wrap_idx > 0 {
+        if logical_line.is_image() && self.is_continuation() {
             return ratatui::text::Line::raw("");
         }
         let source = logical_line.render_plain(ctx);
         if logical_line.is_unwrappable() {
             source
         } else {
-            slice_line(&source, self.char_range.clone())
+            let mut line = slice_line(&source, self.char_range.clone());
+            self.prepend_wrap_prefix(logical_line, &source, &mut line);
+            line
         }
     }
 
@@ -59,7 +65,7 @@ impl LayoutLine {
         rendered_line: &ratatui::text::Line<'static>,
         ctx: &RenderContext<'_>,
     ) -> ratatui::text::Line<'static> {
-        if logical_line.is_image() && self.wrap_idx > 0 {
+        if logical_line.is_image() && self.is_continuation() {
             return ratatui::text::Line::raw("");
         }
         let mut line = if logical_line.is_unwrappable() {
@@ -67,7 +73,7 @@ impl LayoutLine {
         } else {
             slice_line(rendered_line, self.char_range.clone())
         };
-        if logical_line.has_code_gutter() && self.wrap_idx > 0 {
+        if logical_line.has_code_gutter() && self.is_continuation() {
             apply_gutter(
                 &mut line,
                 logical_line.is_unwrappable(),
@@ -78,7 +84,22 @@ impl LayoutLine {
                 logical_line.gutter_fg == Some(ctx.theme.warning),
             );
         }
+        self.prepend_wrap_prefix(logical_line, rendered_line, &mut line);
         line
+    }
+
+    fn prepend_wrap_prefix(
+        &self,
+        logical_line: &LogicalLine,
+        rendered_line: &ratatui::text::Line<'static>,
+        line: &mut ratatui::text::Line<'static>,
+    ) {
+        if !self.is_continuation() {
+            return;
+        }
+        let width = logical_line.wrap_prefix_width();
+        let prefix = slice_line(rendered_line, 0..width).spans;
+        line.spans.splice(0..0, prefix);
     }
 }
 
@@ -151,7 +172,7 @@ impl LayoutLines {
                 PREVIEW_FRAME_OVERHEAD
             };
             let wrap_width = width
-                .saturating_sub(overhead + logical_line.prefix_width())
+                .saturating_sub(overhead + logical_line.reserved_prefix_width())
                 .max(1);
             let rows = wrap_ranges(&line, wrap_width)
                 .into_iter()

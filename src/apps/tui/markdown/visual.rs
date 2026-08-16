@@ -408,7 +408,7 @@ mod tests {
             .expect("expected a list item inside the blockquote");
 
         assert_eq!(list_item.prefix_width(), 4);
-        assert_eq!(list_item.render(&ctx).to_string(), "> • quoted item");
+        assert_eq!(list_item.render(&ctx).to_string(), "▎ • quoted item");
     }
 
     #[test]

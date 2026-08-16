@@ -6,10 +6,10 @@ expression: full_preview_text(&preview)
 ────────────────────────────────────
 Install deps.
 
-▎ 1                            Bash 
+▎ 1                            Bash
 ▎ npm install
 
-> note
-> 
+▎ note
+▎
 • a
 • b
