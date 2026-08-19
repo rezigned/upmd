@@ -740,7 +740,7 @@ impl Preview {
         Some((col, pty_row as u16))
     }
 
-    /// Returns the gutter overhead in chars for a code block nested in a blockquote.
+    /// Returns display-prefix overhead before a code block's own gutter.
     pub fn code_prefix_overhead(&self, id: CodeId) -> usize {
         self.code_prefix_overhead.get(&id).copied().unwrap_or(0)
     }
@@ -760,21 +760,37 @@ impl Preview {
             spinner_char: ' ',
             viewport_width: self.layout_lines.last_width(),
         };
-        let rendered = line.render_plain(&self.logical_lines[line.logical_idx], &ctx);
-        let mut text: String = rendered
+        let logical_line = &self.logical_lines[line.logical_idx];
+        let mut rendered = line.render_plain(logical_line, &ctx);
+        let display_prefix_len = match (logical_line.has_code_gutter(), line.is_continuation()) {
+            (false, _) => 0,
+            (true, true) => CODE_GUTTER_WIDTH,
+            (true, false) => {
+                let gutter_idx = logical_line.prefixes.len();
+                if rendered
+                    .spans
+                    .get(gutter_idx)
+                    .is_some_and(|span| span.content == "▎")
+                {
+                    rendered.spans.remove(gutter_idx);
+                    if rendered
+                        .spans
+                        .get(gutter_idx)
+                        .is_some_and(|span| span.content == " ")
+                    {
+                        rendered.spans.remove(gutter_idx);
+                    }
+                    CODE_GUTTER_WIDTH
+                } else {
+                    0
+                }
+            }
+        };
+        let text = rendered
             .spans
             .iter()
             .map(|span| span.content.as_ref())
             .collect();
-        let has_code_gutter = self.logical_lines[line.logical_idx].has_code_gutter();
-        let display_prefix_len = match (has_code_gutter, text.strip_prefix("▎ ")) {
-            (true, Some(stripped)) => {
-                text = stripped.to_string();
-                CODE_GUTTER_WIDTH
-            }
-            (true, None) if line.is_continuation() => CODE_GUTTER_WIDTH,
-            _ => 0,
-        };
         Some(CopyLine {
             text,
             is_continuation: line.char_range.start > 0,
@@ -1573,6 +1589,32 @@ mod tests {
             code_rows.iter().all(|line| line.starts_with("> ▎ ")),
             "interactive code rows should retain the Markup quote marker, got: {rows}"
         );
+    }
+
+    #[test]
+    fn markup_nested_code_retains_list_indentation() {
+        for (markdown, prefix) in [
+            ("1. Parent\n\n   ```bash\n   echo ordered\n   ```", "   ▎ "),
+            ("- [ ] Parent\n\n  ```sh\n  echo task\n  ```", "  ▎ "),
+        ] {
+            let mut preview = preview_from_markdown(markdown);
+            preview.toggle_mode();
+            preview.rebuild_view(&HashMap::new());
+            preview.rebuild_layout_lines(80);
+            let rows = full_preview_text(&preview);
+            let code_rows = rows
+                .lines()
+                .filter(|line| {
+                    line.contains("Bash") || line.contains("Shell") || line.contains("echo")
+                })
+                .collect::<Vec<_>>();
+
+            assert_eq!(code_rows.len(), 2, "got: {rows}");
+            assert!(
+                code_rows.iter().all(|line| line.starts_with(prefix)),
+                "interactive code rows should retain {prefix:?}, got: {rows}"
+            );
+        }
     }
 
     #[test]

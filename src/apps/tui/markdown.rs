@@ -27,6 +27,9 @@ use upmd_parser::Codes;
 use crate::apps::task::Task;
 use crate::apps::tui::wrap::slice_line;
 
+/// CommonMark allows up to three leading spaces before a blockquote marker.
+const MAX_BLOCKQUOTE_MARKER_INDENT: usize = 3;
+
 /// How the preview renders the parsed markdown AST.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RenderMode {
@@ -344,6 +347,9 @@ pub struct LogicalLine {
     /// Number of leading rendered characters repeated on wrapped rows, such as
     /// `▎ ` in Visual mode or `> ` in Markup mode.
     wrap_prefix_width: usize,
+    /// Styled prefix painted on continuation rows when it differs from the
+    /// leading rendered text, such as spaces replacing a list marker.
+    wrap_prefixes: Option<Vec<Span<'static>>>,
     /// Optional foreground color override for the gutter indicator (used by
     /// output lines to reflect task status).
     pub gutter_fg: Option<Color>,
@@ -353,11 +359,9 @@ pub struct LogicalLine {
 
 impl LogicalLine {
     /// Creates an empty newline.
-    pub fn newline(code_id: Option<CodeId>, is_block_start: bool) -> Self {
+    pub fn newline() -> Self {
         Self {
             source: LogicalLineSource::Newline,
-            code_id,
-            is_block_start,
             ..Self::default()
         }
     }
@@ -376,12 +380,14 @@ impl LogicalLine {
         spans: Vec<InlineSpan>,
         source: &str,
         prefix: Span<'static>,
+        wrap_prefix: Span<'static>,
         is_block_start: bool,
     ) -> Self {
         Self {
             source: LogicalLineSource::ListItem(LazyText::from_spans(spans, source)),
             is_block_start,
             prefixes: vec![prefix],
+            wrap_prefixes: Some(vec![wrap_prefix]),
             ..Self::default()
         }
     }
@@ -540,6 +546,10 @@ impl LogicalLine {
         self.wrap_prefix_width
     }
 
+    pub fn wrap_prefixes(&self) -> Option<&[Span<'static>]> {
+        self.wrap_prefixes.as_deref()
+    }
+
     pub fn reserved_prefix_width(&self) -> usize {
         self.prefix_width().max(self.wrap_prefix_width)
     }
@@ -565,6 +575,11 @@ impl LogicalLine {
     #[inline]
     pub fn is_output(&self) -> bool {
         matches!(self.source, LogicalLineSource::Output(_))
+    }
+
+    #[inline]
+    pub fn is_newline(&self) -> bool {
+        matches!(self.source, LogicalLineSource::Newline)
     }
 
     #[inline]
@@ -1096,6 +1111,8 @@ struct RenderState {
     snap: SnapContext,
     /// Current blockquote nesting depth. Each level adds a display-only gutter.
     quote_depth: usize,
+    /// Ordered display prefixes contributed by the active render mode.
+    prefixes: Vec<Span<'static>>,
     /// Extra display width before code content, keyed by code block.
     code_prefix_overhead: HashMap<CodeId, usize>,
     /// Traversal index allocated to the next AST node.
@@ -1114,6 +1131,13 @@ impl RenderState {
 
     fn end_node(&mut self, parent: usize) {
         self.node_idx = parent;
+    }
+
+    fn prefix_width(&self) -> usize {
+        self.prefixes
+            .iter()
+            .map(|prefix| prefix.content.chars().count())
+            .sum()
     }
 }
 
@@ -1189,7 +1213,7 @@ impl<'a> MarkdownRenderer<'a> {
             }
             None => false,
         };
-        let gutter_width = Self::quote_prefix_width(state.quote_depth);
+        let gutter_width = state.prefix_width();
         if gutter_width > 0 {
             state.code_prefix_overhead.insert(code.id, gutter_width);
         }
@@ -1208,36 +1232,19 @@ impl<'a> MarkdownRenderer<'a> {
         self.push_line(lines, info, state);
         self.render_code_body(code, lines, state, gutter_fg, is_running);
         self.render_code_output(code, lines, state, gutter_fg, is_running);
-        self.push_line(lines, LogicalLine::newline(Some(code.id), false), state);
-    }
-
-    fn quote_prefix_span(&self) -> Span<'static> {
-        // Quote prefixes sit outside code backgrounds. Pinning the background
-        // avoids inheriting the highlighted/code block background that is added
-        // later during LogicalLine::render.
-        let content = match self.mode {
-            RenderMode::Visual => "▎ ",
-            RenderMode::Markup => "> ",
-        };
-        Span::styled(
-            content,
-            Style::default()
-                .fg(self.theme.muted)
-                .bg(self.theme.background),
-        )
-    }
-
-    fn quote_prefix_width(depth: usize) -> usize {
-        depth * 2
     }
 
     fn push_line(&self, lines: &mut Vec<LogicalLine>, mut line: LogicalLine, state: &RenderState) {
-        // Quote prefixes are outer chrome. Insert them before existing list/task
-        // prefixes so rendering preserves Markdown nesting order.
-        line.wrap_prefix_width = Self::quote_prefix_width(state.quote_depth);
-        for _ in 0..state.quote_depth {
-            line.prefixes.insert(0, self.quote_prefix_span());
+        let mut wrap_prefixes = state.prefixes.clone();
+        if let Some(line_prefixes) = line.wrap_prefixes.take() {
+            wrap_prefixes.extend(line_prefixes);
         }
+        line.wrap_prefix_width = wrap_prefixes
+            .iter()
+            .map(|prefix| prefix.content.chars().count())
+            .sum();
+        line.wrap_prefixes = (!wrap_prefixes.is_empty()).then_some(wrap_prefixes);
+        line.prefixes.splice(0..0, state.prefixes.iter().cloned());
         self.push_unquoted_line(lines, line, state);
     }
 
@@ -1615,8 +1622,7 @@ fn inline_style(theme: &Theme, style: &InlineStyle) -> Style {
 
 /// Returns the byte width of the leading `> ` quote markers in source text.
 fn source_quote_width(text: &str) -> usize {
-    // CommonMark permits up to three spaces before a blockquote marker.
-    const MAX_MARKER_INDENT: usize = 3;
+    // Leading indentation is bounded by the CommonMark blockquote rule.
     let bytes = text.as_bytes();
     let mut pos = 0;
     let mut end = 0;
@@ -1624,8 +1630,8 @@ fn source_quote_width(text: &str) -> usize {
     loop {
         let spaces = bytes[pos..]
             .iter()
-            .take(MAX_MARKER_INDENT)
-            .take_while(|&&b| b == b' ')
+            .take(MAX_BLOCKQUOTE_MARKER_INDENT)
+            .take_while(|&&byte| byte == b' ')
             .count();
         if bytes.get(pos + spaces) != Some(&b'>') {
             break;
@@ -1706,7 +1712,11 @@ mod tests {
                 } else {
                     text
                 };
-                format!("{:2}: [{}] {}", i, source_label(l), preview)
+                if preview.is_empty() {
+                    format!("{:2}: [{}]", i, source_label(l))
+                } else {
+                    format!("{:2}: [{}] {}", i, source_label(l), preview)
+                }
             })
             .collect::<Vec<_>>()
             .join("\n")

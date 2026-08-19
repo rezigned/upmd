@@ -98,7 +98,10 @@ impl LayoutLine {
             return;
         }
         let width = logical_line.wrap_prefix_width();
-        let prefix = slice_line(rendered_line, 0..width).spans;
+        let prefix = logical_line
+            .wrap_prefixes()
+            .map(<[ratatui::text::Span<'static>]>::to_vec)
+            .unwrap_or_else(|| slice_line(rendered_line, 0..width).spans);
         line.spans.splice(0..0, prefix);
     }
 }

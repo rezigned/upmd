@@ -1,14 +1,12 @@
 ---
-source: src/apps/tui/markdown.rs
-assertion_line: 1537
+source: src/apps/tui/markdown/visual.rs
 expression: logical_line_summary(&lines)
 ---
  0: [Text] quoted paragraph
- 1: [Newline] 
+ 1: [Newline]
  2: [CodeInfo] 1 Bash
  3: [CodeBody] echo hi
- 4: [Newline] 
+ 4: [Newline]
  5: [ListItem] quoted item
  6: [ListItem] nested quote
  7: [ListItem] deeper
- 8: [Newline]

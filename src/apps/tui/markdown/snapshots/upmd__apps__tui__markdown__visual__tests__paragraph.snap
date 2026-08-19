@@ -1,9 +1,7 @@
 ---
-source: src/apps/tui/markdown.rs
-assertion_line: 1421
+source: src/apps/tui/markdown/visual.rs
 expression: logical_line_summary(&lines)
 ---
  0: [Text] This is a paragraph.
- 1: [Newline] 
+ 1: [Newline]
  2: [Text] With a blank line.
- 3: [Newline]
