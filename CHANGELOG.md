@@ -1,19 +1,23 @@
-## [v0.2.4]
+## [0.2.5]
 
 ### 🚀 Features
 
 - *(runtime)* Schedule delayed actions via Cmd::after
 - *(cli)* Add --ci alias for --cli --yes
 - *(parser)* Recognize and render leading frontmatter (#24)
+- *(tui)* Add markup preview and retain parser source ranges (#29)
 
 ### 🐛 Bug Fixes
 
 - *(parser)* Match spaces around colons with ASCII attr regex
+- *(tui)* Render blockquote prefixes consistently (#30)
+- *(tui)* Preserve indentation of nested list blocks (#31)
 
 ### 🚜 Refactor
 
 - *(theme)* Resolve markdown styles from scope rules directly
 - *(tui)* Simplify layout rendering (#27)
+- *(tui)* Extract gutter glyph to config constant (#32)
 
 ### ⚡ Performance
 
@@ -24,7 +28,7 @@
 ### ⚙️ Miscellaneous Tasks
 
 - *(release)* Bump version to 0.2.3 (#23)
-- *(release)* Bump version to 0.2.4
+- *(release)* Bump version to 0.2.4 (#28)
 ## [v0.2.2]
 
 ### 🚀 Features
