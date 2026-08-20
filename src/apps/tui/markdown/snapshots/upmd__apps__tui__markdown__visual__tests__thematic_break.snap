@@ -1,11 +1,9 @@
 ---
-source: src/apps/tui/markdown.rs
-assertion_line: 1457
+source: src/apps/tui/markdown/visual.rs
 expression: logical_line_summary(&lines)
 ---
  0: [Text] above
- 1: [Newline] 
- 2: [ThematicBreak] 
- 3: [Newline] 
+ 1: [Newline]
+ 2: [ThematicBreak]
+ 3: [Newline]
  4: [Text] below
- 5: [Newline]

@@ -1,6 +1,6 @@
 ---
 source: src/apps/tui/markdown.rs
-assertion_line: 1691
+assertion_line: 1843
 expression: result
 ---
  0: [CodeInfo] 1 Bash
@@ -15,4 +15,3 @@ expression: result
  9: [Output] output line number 4
 10: [Output]                     This is output line 
 11: [Output] number 5
-12: [Newline]

@@ -1,18 +1,17 @@
 ---
-source: src/apps/tui/markdown.rs
+source: src/apps/tui/markdown/visual.rs
 expression: logical_line_summary(&lines)
 ---
  0: [Heading(1)] # Setup
- 1: [ThematicBreak] 
+ 1: [ThematicBreak]
  2: [Text] Install dependencies.
- 3: [Newline] 
+ 3: [Newline]
  4: [CodeInfo] 1 Bash
  5: [CodeBody] npm install
- 6: [Newline] 
+ 6: [Newline]
  7: [Heading(2)] ## Test
- 8: [ThematicBreak] 
+ 8: [ThematicBreak]
  9: [Text] Run the test suite.
-10: [Newline] 
+10: [Newline]
 11: [CodeInfo] 2 Python
 12: [CodeBody] pytest tests/
-13: [Newline]

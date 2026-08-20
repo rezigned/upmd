@@ -1,9 +1,9 @@
 ---
-source: src/apps/tui/markdown.rs
+source: src/apps/tui/markdown/visual.rs
 expression: logical_line_summary(&lines)
 ---
  0: [Heading(1)] # Hello
- 1: [ThematicBreak] 
+ 1: [ThematicBreak]
  2: [Heading(2)] ## World
- 3: [ThematicBreak] 
+ 3: [ThematicBreak]
  4: [Heading(3)] ### Rust

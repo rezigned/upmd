@@ -1,5 +1,6 @@
 //! Source-preserving Markdown rendering for the preview's Markup mode.
 
+use ratatui::{style::Style, text::Span};
 use std::ops::Range;
 
 use upmd_parser::nodes::{Node, NodeKind};
@@ -20,6 +21,15 @@ impl MarkdownRenderer<'_> {
             cursor = cursor.max(node.range.end);
         }
         self.render_markup_gap(cursor..self.source.len(), lines, state);
+    }
+
+    fn markup_code_prefix(&self, content: String) -> Span<'static> {
+        Span::styled(
+            content,
+            Style::default()
+                .fg(self.theme.muted)
+                .bg(self.theme.background),
+        )
     }
 
     fn render_markup_node(
@@ -65,11 +75,19 @@ impl MarkdownRenderer<'_> {
     ) {
         let mut cursor = range.start;
         for (code, quote_depth) in codes {
-            let raw_end = self.quote_prefix_start(cursor, code.range.start, *quote_depth);
+            let raw_end = self.code_prefix_start(cursor, code.range.start, *quote_depth);
             self.render_markup_source(cursor..raw_end, lines, state);
 
             let parent_depth = std::mem::replace(&mut state.quote_depth, *quote_depth);
+            let prefix = self.source[raw_end..code.range.start].to_owned();
+            let prefixes = if prefix.is_empty() {
+                Vec::new()
+            } else {
+                vec![self.markup_code_prefix(prefix)]
+            };
+            let parent_prefixes = std::mem::replace(&mut state.prefixes, prefixes);
             self.render_markup_node(code, lines, state);
+            state.prefixes = parent_prefixes;
             state.quote_depth = parent_depth;
             cursor = self.after_line_ending(cursor.max(code.range.end));
         }
@@ -90,10 +108,7 @@ impl MarkdownRenderer<'_> {
         }
     }
 
-    fn quote_prefix_start(&self, start: usize, end: usize, quote_depth: usize) -> usize {
-        if quote_depth == 0 {
-            return end;
-        }
+    fn code_prefix_start(&self, start: usize, end: usize, quote_depth: usize) -> usize {
         let line_start = self.source[start..end]
             .rfind('\n')
             .map_or(start, |offset| start + offset + 1);
@@ -153,7 +168,7 @@ impl MarkdownRenderer<'_> {
             newline_count.saturating_sub(1)
         };
         for _ in 0..blank_lines {
-            self.push_unquoted_line(lines, LogicalLine::newline(None, false), state);
+            self.push_unquoted_line(lines, LogicalLine::newline(), state);
         }
     }
 }

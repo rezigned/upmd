@@ -139,8 +139,6 @@ pub struct Heading {
     pub level: u8,
     pub text: String,
     pub source_range: Range<usize>,
-    pub start_line: usize,
-    pub end_line: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -157,12 +155,12 @@ pub enum ListKind {
     Task(TaskStatus),
 }
 
-/// A single list entry with depth, kind, text, and nested children.
+/// A single list entry whose child blocks are stored in source order.
 #[derive(Debug, Clone)]
 pub struct ListItem {
     pub depth: usize,
     pub kind: ListKind,
-    pub text: Vec<InlineSpan>,
+    pub range: Range<usize>,
     pub children: Vec<Node>,
 }
 

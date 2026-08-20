@@ -1,3 +1,5 @@
+use std::ops::Range;
+
 use pulldown_cmark::{
     Alignment as CmarkAlignment, CodeBlockKind, Event, HeadingLevel, MetadataBlockKind, Options,
     Parser as CmarkParser, Tag, TagEnd,
@@ -42,7 +44,6 @@ struct ParseState<'a> {
     iter: std::iter::Peekable<pulldown_cmark::OffsetIter<'a>>,
     codes: Codes,
     headings: Vec<super::Heading>,
-    line_starts: Vec<usize>,
 }
 
 impl<'a> ParseState<'a> {
@@ -54,7 +55,6 @@ impl<'a> ParseState<'a> {
                 .peekable(),
             codes: Codes::default(),
             headings: Vec::new(),
-            line_starts: line_starts(source),
         }
     }
 }
@@ -75,38 +75,28 @@ impl ParseState<'_> {
     }
 }
 
-fn line_starts(input: &str) -> Vec<usize> {
-    std::iter::once(0)
-        .chain(input.match_indices('\n').map(|(i, _)| i + 1))
-        .collect()
-}
-
-fn byte_to_line(line_starts: &[usize], byte: usize) -> usize {
-    match line_starts.binary_search(&byte) {
-        Ok(idx) => idx + 1,
-        Err(idx) => idx,
-    }
-    .max(1)
-}
+// Document    ::= Frontmatter? Blocks
+// Frontmatter ::= Text+
+// Frontmatter is recognized only as the first source construct.
 
 impl<'a> ParseState<'a> {
     fn parse_nodes(&mut self) -> Vec<Node> {
-        let frontmatter = match self.iter.peek() {
-            Some((Event::Start(Tag::MetadataBlock(kind)), range)) if range.start == 0 => {
-                Some((*kind, range.clone()))
-            }
-            _ => None,
-        }
-        .map(|(kind, range)| Node::new(self.parse_frontmatter(kind), range));
-
-        let mut nodes = self.parse_blocks(None);
+        let frontmatter = self.parse_frontmatter();
+        let mut nodes = self.parse_blocks();
         if let Some(frontmatter) = frontmatter {
             nodes.insert(0, frontmatter);
         }
         nodes
     }
 
-    fn parse_frontmatter(&mut self, kind: MetadataBlockKind) -> NodeKind {
+    fn parse_frontmatter(&mut self) -> Option<Node> {
+        let (kind, range) = match self.iter.peek() {
+            Some((Event::Start(Tag::MetadataBlock(kind)), range)) if range.start == 0 => {
+                (*kind, range.clone())
+            }
+            _ => return None,
+        };
+
         self.iter.next();
         let mut payload = None;
         for (event, range) in self.iter.by_ref() {
@@ -121,54 +111,64 @@ impl<'a> ParseState<'a> {
             MetadataBlockKind::PlusesStyle => FrontmatterStyle::Toml,
         };
         let raw = SourceText::Source(payload.expect("metadata block has content"));
-        NodeKind::Frontmatter { style, raw }
+        Some(Node::new(NodeKind::Frontmatter { style, raw }, range))
     }
 
-    // Root dispatch
+    // Block container
     //
-    // Blocks ::= (Paragraph | Heading | CodeBlock | Table | List | BlockQuote
-    //             | ThematicBreak | Text)*
+    // Blocks     ::= Block*
+    // Block      ::= Paragraph | Heading | CodeBlock | HtmlBlock | Table | List
+    //                | BlockQuote | ThematicBreak | ImageBlock | Text
+    // BlockQuote ::= Blocks
 
-    fn parse_blocks(&mut self, stop_at: Option<TagEnd>) -> Vec<Node> {
+    fn parse_blocks(&mut self) -> Vec<Node> {
         let mut nodes = Vec::new();
         while let Some((event, range)) = self.iter.next() {
-            if let Some(ref stop) = stop_at {
-                if matches!(&event, Event::End(tag) if *tag == *stop) {
-                    break;
-                }
+            if matches!(event, Event::End(_)) {
+                break;
             }
-            let kind = match event {
-                Event::End(_) => None,
-                Event::Start(Tag::Paragraph) => Some(self.parse_paragraph()),
-                Event::Start(Tag::Heading { level, .. }) => {
-                    Some(self.parse_heading(level, range.clone()))
-                }
-                Event::Start(Tag::List(start)) => Some(NodeKind::List(self.parse_list(1, start))),
-                Event::Start(Tag::BlockQuote(_)) => Some(NodeKind::BlockQuote(
-                    self.parse_blocks(Some(TagEnd::BlockQuote(None))),
-                )),
-                Event::Start(Tag::CodeBlock(kind)) => self.parse_code_block(kind),
-                Event::Start(Tag::HtmlBlock) => Some(self.parse_html_block()),
-                Event::Start(Tag::Table(alignments)) => Some(self.parse_table(&alignments)),
-                Event::Rule => Some(NodeKind::ThematicBreak),
-                Event::Text(text) => Some(NodeKind::Text(vec![text_span(
-                    self.source,
-                    range.clone(),
-                    &text,
-                    &[],
-                )])),
-                Event::Code(code) => Some(NodeKind::Text(vec![code_span(&code, &[])])),
-                _ => None,
-            };
-            if let Some(kind) = kind {
+            if let Some(kind) = self.parse_block_event(event, range.clone(), 1) {
                 nodes.push(Node::new(kind, range));
             }
         }
         nodes
     }
 
-    // Paragraph
+    fn parse_block_event(
+        &mut self,
+        event: Event<'a>,
+        range: Range<usize>,
+        list_depth: usize,
+    ) -> Option<NodeKind> {
+        match event {
+            Event::Start(Tag::Paragraph) => Some(self.parse_paragraph()),
+            Event::Start(Tag::Heading { level, .. }) => {
+                Some(self.parse_heading(level, range.clone()))
+            }
+            Event::Start(Tag::List(start)) => {
+                Some(NodeKind::List(self.parse_list(list_depth, start)))
+            }
+            Event::Start(Tag::BlockQuote(_)) => Some(NodeKind::BlockQuote(self.parse_blocks())),
+            Event::Start(Tag::CodeBlock(kind)) => self.parse_code_block(kind),
+            Event::Start(Tag::HtmlBlock) => Some(self.parse_html_block()),
+            Event::Start(Tag::Table(alignments)) => Some(self.parse_table(&alignments)),
+            Event::Rule => Some(NodeKind::ThematicBreak),
+            Event::Text(text) => Some(NodeKind::Text(vec![text_span(
+                self.source,
+                range,
+                &text,
+                &[],
+            )])),
+            Event::Code(code) => Some(NodeKind::Text(vec![code_span(&code, &[])])),
+            _ => None,
+        }
+    }
 
+    // Paragraph
+    //
+    // Paragraph  ::= InlineContent
+    // ImageBlock ::= Image
+    // A paragraph containing only one image is normalized to ImageBlock.
     fn parse_paragraph(&mut self) -> NodeKind {
         if matches!(self.iter.peek(), Some((Event::Start(Tag::Image { .. }), _))) {
             return self.parse_block_image();
@@ -202,39 +202,25 @@ impl<'a> ParseState<'a> {
     }
 
     // Heading
-
-    fn parse_heading(
-        &mut self,
-        level: HeadingLevel,
-        source_range: std::ops::Range<usize>,
-    ) -> NodeKind {
-        let heading_level = match level {
-            HeadingLevel::H1 => 1,
-            HeadingLevel::H2 => 2,
-            HeadingLevel::H3 => 3,
-            HeadingLevel::H4 => 4,
-            HeadingLevel::H5 => 5,
-            HeadingLevel::H6 => 6,
-        };
+    //
+    // Heading ::= InlineContent
+    fn parse_heading(&mut self, level: HeadingLevel, source_range: Range<usize>) -> NodeKind {
         let spans = self.parse_inline_content(TagEnd::Heading(level));
-        let text = semantic_text(&spans, self.source);
-        let text = text.trim().to_string();
+        let text = semantic_text(&spans, self.source).trim().to_string();
         let spans = trim_spans(spans, self.source);
+        let level = level as u8;
         self.headings.push(super::Heading {
-            level: heading_level,
+            level,
             text: text.clone(),
-            source_range: source_range.clone(),
-            start_line: byte_to_line(&self.line_starts, source_range.start),
-            end_line: byte_to_line(&self.line_starts, source_range.end.max(1) - 1),
+            source_range,
         });
-        NodeKind::Heading {
-            level: heading_level,
-            text: spans,
-        }
+        NodeKind::Heading { level, text: spans }
     }
 
     // Code block
-
+    //
+    // CodeBlock ::= (Text | Break)*
+    // Empty code blocks do not produce a node.
     fn parse_code_block(&mut self, kind: CodeBlockKind<'a>) -> Option<NodeKind> {
         let opts = match &kind {
             CodeBlockKind::Fenced(info) => info.to_string(),
@@ -260,7 +246,8 @@ impl<'a> ParseState<'a> {
     }
 
     // HTML block
-
+    //
+    // HtmlBlock ::= Html*
     fn parse_html_block(&mut self) -> NodeKind {
         for (event, _) in self.iter.by_ref() {
             if matches!(event, Event::End(TagEnd::HtmlBlock)) {
@@ -271,7 +258,11 @@ impl<'a> ParseState<'a> {
     }
 
     // Table
-
+    //
+    // Table     ::= TableHead TableRow*
+    // TableHead ::= TableCell*
+    // TableRow  ::= TableCell*
+    // TableCell ::= InlineContent
     fn parse_table(&mut self, alignments: &[CmarkAlignment]) -> NodeKind {
         let mapped: Vec<Alignment> = alignments.iter().map(Self::map_alignment).collect();
         let mut headers = Vec::new();
@@ -321,16 +312,18 @@ impl<'a> ParseState<'a> {
 
     // List
     //
-    // List       ::= Item+
-    // ListItem   ::= (TaskMarker? InlineContent BlockChildren*)
+    // List     ::= ListItem+
+    // ListItem ::= Block*
+    // Tight inline content is normalized to a Paragraph child. A leading task
+    // marker sets ListKind and is omitted from that paragraph's content.
 
     fn parse_list(&mut self, depth: usize, start_num: Option<u64>) -> Vec<ListItem> {
         let mut items = Vec::new();
         loop {
             match self.iter.next() {
                 Some((Event::End(TagEnd::List(_)), _)) => break,
-                Some((Event::Start(Tag::Item), _)) => {
-                    items.push(self.parse_list_item(depth, items.len(), start_num));
+                Some((Event::Start(Tag::Item), range)) => {
+                    items.push(self.parse_list_item(depth, items.len(), start_num, range));
                 }
                 None => break,
                 _ => {}
@@ -339,54 +332,55 @@ impl<'a> ParseState<'a> {
         items
     }
 
-    fn parse_list_item(&mut self, depth: usize, index: usize, start_num: Option<u64>) -> ListItem {
-        let mut spans = Vec::new();
-        let mut stack = Vec::new();
+    fn parse_list_item(
+        &mut self,
+        depth: usize,
+        index: usize,
+        start_num: Option<u64>,
+        item_range: Range<usize>,
+    ) -> ListItem {
         let mut children = Vec::new();
         let mut task_kind: Option<ListKind> = None;
+        // A tight-list item such as `- item` emits bare inline events; a loose
+        // item separated by blank lines emits a `Paragraph` container. Collect
+        // the tight item's implicit paragraph separately.
+        let mut tight_spans = Vec::new();
+        let mut tight_range: Option<Range<usize>> = None;
+        let mut stack = Vec::new();
 
         while let Some((event, range)) = self.iter.next() {
             let Some(event) =
-                self.consume_inline_event(event, range.clone(), &mut stack, &mut spans)
+                self.consume_inline_event(event, range.clone(), &mut stack, &mut tight_spans)
             else {
+                tight_range.get_or_insert_with(|| range.clone()).end = range.end;
                 continue;
             };
-
             match event {
                 Event::End(TagEnd::Item) => break,
-                Event::TaskListMarker(checked) => {
-                    task_kind = Some(ListKind::Task(if checked {
-                        TaskStatus::Checked
-                    } else {
-                        TaskStatus::Unchecked
-                    }));
+                Event::Start(Tag::Paragraph) => {
+                    if let Some(kind) = self.take_task_marker() {
+                        task_kind = Some(kind);
+                    }
+                    let paragraph =
+                        trim_spans(self.parse_inline_content(TagEnd::Paragraph), self.source);
+                    children.push(Node::new(NodeKind::Paragraph(paragraph), range));
                 }
-                Event::Start(Tag::CodeBlock(kind)) => {
-                    if let Some(kind) = self.parse_code_block(kind) {
+                Event::TaskListMarker(checked) => {
+                    task_kind = Some(task_list_kind(checked));
+                }
+                event => {
+                    if let Some(kind) = self.parse_block_event(event, range.clone(), depth + 1) {
                         children.push(Node::new(kind, range));
                     }
                 }
-                Event::Start(Tag::HtmlBlock) => {
-                    children.push(Node::new(self.parse_html_block(), range));
-                }
-                Event::Start(Tag::List(start)) => {
-                    let kind = NodeKind::List(self.parse_list(depth + 1, start));
-                    children.push(Node::new(kind, range));
-                }
-                Event::Start(Tag::BlockQuote(_)) => {
-                    let kind =
-                        NodeKind::BlockQuote(self.parse_blocks(Some(TagEnd::BlockQuote(None))));
-                    children.push(Node::new(kind, range));
-                }
-                Event::Start(Tag::Table(alignments)) => {
-                    children.push(Node::new(self.parse_table(&alignments), range));
-                }
-                Event::Start(Tag::Heading { level, .. }) => {
-                    let kind = self.parse_heading(level, range.clone());
-                    children.push(Node::new(kind, range));
-                }
-                Event::Start(Tag::Paragraph) => {}
-                _ => {}
+            }
+        }
+
+        if let Some(range) = tight_range {
+            let paragraph = trim_spans(tight_spans, self.source);
+            if !paragraph.is_empty() {
+                let index = children.partition_point(|child| child.range.start < range.start);
+                children.insert(index, Node::new(NodeKind::Paragraph(paragraph), range));
             }
         }
 
@@ -401,15 +395,31 @@ impl<'a> ParseState<'a> {
         ListItem {
             depth,
             kind,
-            text: trim_spans(spans, self.source),
+            range: item_range,
             children,
         }
     }
 
+    fn take_task_marker(&mut self) -> Option<ListKind> {
+        let checked = match self.iter.peek() {
+            Some((Event::TaskListMarker(checked), _)) => *checked,
+            _ => return None,
+        };
+        self.iter.next();
+        Some(task_list_kind(checked))
+    }
+
     // Shared inline content parser
     //
-    // InlineContent ::= (Text | Code | Break | Emphasis | Strong | Strike
-    //                    | Link | Image)*
+    // InlineContent ::= Inline*
+    // Inline        ::= Text | Code | InlineHtml | Break | Emphasis | Strong
+    //                   | Strike | Link | Image
+    // Break         ::= SoftBreak | HardBreak
+    // Emphasis      ::= InlineContent
+    // Strong        ::= InlineContent
+    // Strike        ::= InlineContent
+    // Link          ::= InlineContent
+    // Image         ::= InlineContent
 
     /// Consumes events until `stop`, producing styled inline spans.
     fn parse_inline_content(&mut self, stop: TagEnd) -> Vec<InlineSpan> {
@@ -540,6 +550,14 @@ impl<'a> ParseState<'a> {
     }
 }
 
+fn task_list_kind(checked: bool) -> ListKind {
+    ListKind::Task(if checked {
+        TaskStatus::Checked
+    } else {
+        TaskStatus::Unchecked
+    })
+}
+
 /// Builds a plain inline span carrying the active style stack.
 fn text_span(
     source: &str,
@@ -630,6 +648,13 @@ mod tests {
         match &node.kind {
             NodeKind::Code(id) => doc.codes.by_id(*id).unwrap(),
             _ => panic!("Expected Code"),
+        }
+    }
+
+    fn list_item_text(item: &ListItem, source: &str) -> String {
+        match item.children.first().map(|node| &node.kind) {
+            Some(NodeKind::Paragraph(spans)) => inline_text(spans, source),
+            _ => String::new(),
         }
     }
 
@@ -754,7 +779,7 @@ mod tests {
                 NodeKind::List(items) => {
                     for &(idx, expected_text, ref expected_kind) in &expected_checks {
                         assert_eq!(
-                            inline_text(&items[idx].text, input),
+                            list_item_text(&items[idx], input),
                             expected_text,
                             "item {idx}, input: {input:?}"
                         );
@@ -767,6 +792,28 @@ mod tests {
                 _ => panic!("Expected List, input: {input:?}"),
             }
         }
+    }
+
+    #[test]
+    fn test_list_item_stores_all_blocks_as_children() {
+        let input = "1. First item\n\n   Nested paragraph.\n\n   ```sh\n   echo nested\n   ```";
+        let doc = Parser::new().parse(input);
+        let NodeKind::List(items) = &doc.nodes[0].kind else {
+            panic!("expected list");
+        };
+        let item = &items[0];
+        assert_eq!(&input[item.range.clone()], input);
+
+        assert_eq!(item.children.len(), 3);
+        let NodeKind::Paragraph(first) = &item.children[0].kind else {
+            panic!("expected first paragraph");
+        };
+        assert_eq!(inline_text(first, input), "First item");
+        let NodeKind::Paragraph(paragraph) = &item.children[1].kind else {
+            panic!("expected nested paragraph before code");
+        };
+        assert_eq!(inline_text(paragraph, input), "Nested paragraph.");
+        assert!(matches!(item.children[2].kind, NodeKind::Code(_)));
     }
 
     #[test]
@@ -827,7 +874,7 @@ mod tests {
         assert_eq!(doc.headings.len(), 2);
         assert_eq!(doc.headings[0].level, 1);
         assert_eq!(doc.headings[0].text, "Title");
-        assert_eq!(doc.headings[0].start_line, 1);
+        assert_eq!(doc.headings[0].source_range, 0..8);
         assert_eq!(doc.headings[1].level, 2);
         assert_eq!(doc.headings[1].text, "Run `make`");
         assert_eq!(doc.nodes_state, crate::NodesState::Full);
@@ -902,9 +949,12 @@ mod tests {
                 assert_eq!(children.len(), 1);
                 match &children[0].kind {
                     NodeKind::Paragraph(spans) => {
-                        assert!(inline_text(spans, text).contains("blockquote"))
+                        assert_eq!(
+                            inline_text(spans, text),
+                            "This is a blockquote\nwith multiple lines"
+                        );
                     }
-                    _ => panic!("Expected Paragraph in BlockQuote"),
+                    _ => panic!("Expected Paragraph"),
                 }
             }
             _ => panic!("Expected BlockQuote"),
@@ -928,10 +978,10 @@ mod tests {
             _ => panic!("expected list"),
         };
         assert_eq!(items.len(), 2);
-        assert_eq!(inline_text(&items[0].text, text), "item 1");
-        assert_eq!(inline_text(&items[1].text, text), "item 2");
-        assert_eq!(items[0].children.len(), 1);
-        assert!(matches!(&items[0].children[0].kind, NodeKind::Code(code_id)
+        assert_eq!(list_item_text(&items[0], text), "item 1");
+        assert_eq!(list_item_text(&items[1], text), "item 2");
+        assert_eq!(items[0].children.len(), 2);
+        assert!(matches!(&items[0].children[1].kind, NodeKind::Code(code_id)
             if doc.codes.iter().any(|c| c.id == *code_id && c.content.trim() == "echo hi")));
     }
 
@@ -1134,13 +1184,12 @@ mod tests {
                 other => panic!("Expected List for {markdown:?}, got {other:?}"),
             };
 
-            assert_eq!(inline_text(&items[0].text, &input), expected_text);
-            assert_eq!(items[0].text.len(), 1, "input: {markdown:?}");
-
-            assert_eq!(
-                items[0].text[0].style, expected_styles,
-                "input: {markdown:?}"
-            );
+            let NodeKind::Paragraph(spans) = &items[0].children[0].kind else {
+                panic!("expected list-item paragraph");
+            };
+            assert_eq!(inline_text(spans, &input), expected_text);
+            assert_eq!(spans.len(), 1, "input: {markdown:?}");
+            assert_eq!(spans[0].style, expected_styles, "input: {markdown:?}");
         }
     }
     #[test]

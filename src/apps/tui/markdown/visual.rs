@@ -3,13 +3,13 @@
 use std::rc::Rc;
 
 use ratatui::{style::Style, text::Span};
-use upmd_parser::nodes::{InlineSpan, ListKind, TaskStatus};
+use upmd_parser::nodes::{InlineSpan, ListItem, ListKind, Node, NodeKind, TaskStatus};
 
 use crate::apps::config::PREVIEW_FRAME_OVERHEAD;
 
 use super::{
     owned_table, render_table, split_span_lines, FrontmatterBlock, LogicalLine, LogicalLineSource,
-    MarkdownHtml, MarkdownRenderer, MarkdownTable, RenderState,
+    MarkdownHtml, MarkdownRenderer, MarkdownTable, RenderState, MAX_BLOCKQUOTE_MARKER_INDENT,
 };
 
 impl MarkdownRenderer<'_> {
@@ -19,9 +19,47 @@ impl MarkdownRenderer<'_> {
         lines: &mut Vec<LogicalLine>,
         state: &mut RenderState,
     ) {
-        for node in nodes {
-            self.render_node(node, lines, state);
+        self.render_nodes(nodes, lines, state, Self::render_node);
+        if lines.last().is_some_and(LogicalLine::is_newline) {
+            lines.pop();
         }
+    }
+
+    /// Whether this heading renders its own visual separator.
+    fn has_heading_rule(node: &Node) -> bool {
+        matches!(
+            &node.kind,
+            NodeKind::Heading { level, .. } if *level <= 2
+        )
+    }
+
+    /// Renders each node with one trailing separator in the current nesting
+    /// context, except after H1/H2. The outermost render removes the final one.
+    fn render_nodes(
+        &self,
+        nodes: &[Node],
+        lines: &mut Vec<LogicalLine>,
+        state: &mut RenderState,
+        mut render: impl FnMut(&Self, &Node, &mut Vec<LogicalLine>, &mut RenderState),
+    ) {
+        for node in nodes {
+            render(self, node, lines, state);
+            if lines.last().is_some_and(LogicalLine::is_newline) {
+                lines.pop();
+            }
+            if !Self::has_heading_rule(node) {
+                self.push_line(lines, LogicalLine::newline(), state);
+            }
+        }
+    }
+
+    fn visual_quote_prefix(&self) -> Span<'static> {
+        Span::styled(
+            "▎ ",
+            Style::default()
+                .fg(self.theme.muted)
+                .bg(self.theme.background),
+        )
     }
 
     pub(super) fn render_node(
@@ -43,7 +81,6 @@ impl MarkdownRenderer<'_> {
                         state,
                     );
                 }
-                self.push_line(lines, LogicalLine::newline(None, false), state);
             }
             NodeKind::Frontmatter { style, raw } => {
                 let block = Rc::new(FrontmatterBlock::new(
@@ -57,7 +94,6 @@ impl MarkdownRenderer<'_> {
                         state,
                     );
                 }
-                self.push_line(lines, LogicalLine::newline(None, false), state);
             }
             NodeKind::Text(t) => {
                 self.render_highlighted_lines(t, lines, true, state);
@@ -73,11 +109,9 @@ impl MarkdownRenderer<'_> {
                 // snap target for a following non-quoted code block, and an
                 // outer paragraph should not snap to quoted code.
                 let parent_snap = std::mem::take(&mut state.snap);
-                state.quote_depth += 1;
-                for child in children {
-                    self.render_node(child, lines, state);
-                }
-                state.quote_depth = state.quote_depth.saturating_sub(1);
+                state.prefixes.push(self.visual_quote_prefix());
+                self.render_nodes(children, lines, state, Self::render_node);
+                state.prefixes.pop();
                 state.snap = parent_snap;
             }
             NodeKind::Heading { text: t, level } => {
@@ -103,7 +137,7 @@ impl MarkdownRenderer<'_> {
                     LogicalLine::heading_lazy_spans(content, self.source, *level),
                     state,
                 );
-                if *level <= 2 {
+                if Self::has_heading_rule(node) {
                     self.push_line(lines, LogicalLine::heading_rule(), state);
                 }
                 state.snap.title_line = Some(line_idx);
@@ -114,7 +148,7 @@ impl MarkdownRenderer<'_> {
                 let table_width = self
                     .viewport_width
                     .saturating_sub(PREVIEW_FRAME_OVERHEAD)
-                    .saturating_sub(Self::quote_prefix_width(state.quote_depth))
+                    .saturating_sub(state.prefix_width())
                     .max(1);
                 let table = owned_table(table, self.source);
                 let rendered = render_table(&table, "", self.theme, table_width);
@@ -128,11 +162,9 @@ impl MarkdownRenderer<'_> {
                         state,
                     );
                 }
-                self.push_line(lines, LogicalLine::newline(None, false), state);
             }
             NodeKind::ThematicBreak => {
                 self.push_line(lines, LogicalLine::thematic_break(), state);
-                self.push_line(lines, LogicalLine::newline(None, false), state);
             }
             NodeKind::Image { alt, src } => {
                 let line = LogicalLine {
@@ -144,7 +176,6 @@ impl MarkdownRenderer<'_> {
                     ..LogicalLine::default()
                 };
                 self.push_line(lines, line, state);
-                self.push_line(lines, LogicalLine::newline(None, false), state);
             }
         }
         state.end_node(parent_identity);
@@ -169,7 +200,6 @@ impl MarkdownRenderer<'_> {
             first = false;
             emitted = true;
         }
-        self.push_line(lines, LogicalLine::newline(None, false), state);
         if emitted {
             Some(start_idx)
         } else {
@@ -177,57 +207,124 @@ impl MarkdownRenderer<'_> {
         }
     }
 
+    /// Returns source indentation for a nested block after stripping enclosing
+    /// blockquote prefixes.
+    fn nested_block_indent(&self, offset: usize) -> usize {
+        let line_start = self.source[..offset]
+            .rfind('\n')
+            .map_or(0, |index| index + 1);
+        let mut prefix = &self.source[line_start..offset];
+
+        loop {
+            let spaces = prefix
+                .bytes()
+                .take(MAX_BLOCKQUOTE_MARKER_INDENT)
+                .take_while(|byte| *byte == b' ')
+                .count();
+            let Some(rest) = prefix.get(spaces..) else {
+                break;
+            };
+            let Some(rest) = rest.strip_prefix('>') else {
+                break;
+            };
+            prefix = rest
+                .strip_prefix(' ')
+                .or_else(|| rest.strip_prefix('\t'))
+                .unwrap_or(rest);
+        }
+
+        prefix
+            .chars()
+            .fold(0, |width, ch| width + if ch == '\t' { 4 } else { 1 })
+    }
+
     fn render_list(
         &self,
-        items: &[upmd_parser::nodes::ListItem],
+        items: &[ListItem],
         lines: &mut Vec<LogicalLine>,
         state: &mut RenderState,
     ) {
-        for (i, item) in items.iter().enumerate() {
-            let indent = " ".repeat(item.depth.saturating_sub(1) * 4);
+        for (index, item) in items.iter().enumerate() {
+            self.render_list_item(item, index == 0, lines, state);
+        }
+    }
 
-            let (marker, color) = match &item.kind {
-                ListKind::Bullet => ("• ".to_string(), self.theme.foreground),
-                ListKind::Ordered(n) => (format!("{}. ", n), self.theme.foreground),
-                ListKind::Task(status) => match status {
-                    TaskStatus::Checked => ("󰱒  ".to_string(), self.theme.success),
-                    TaskStatus::InProgress => ("󰡖  ".to_string(), self.theme.muted),
-                    TaskStatus::Unchecked => ("󰄱  ".to_string(), self.theme.muted),
+    fn render_list_item(
+        &self,
+        item: &ListItem,
+        is_list_start: bool,
+        lines: &mut Vec<LogicalLine>,
+        state: &mut RenderState,
+    ) {
+        let indent = " ".repeat(item.depth.saturating_sub(1) * 4);
+        let (marker, color) = match &item.kind {
+            ListKind::Bullet => ("• ".to_string(), self.theme.foreground),
+            ListKind::Ordered(number) => (format!("{number}. "), self.theme.foreground),
+            ListKind::Task(TaskStatus::Checked) => ("󰱒  ".to_string(), self.theme.success),
+            ListKind::Task(TaskStatus::InProgress) => ("󰡖  ".to_string(), self.theme.muted),
+            ListKind::Task(TaskStatus::Unchecked) => ("󰄱  ".to_string(), self.theme.muted),
+        };
+        let continuation = format!("{}{}", indent, " ".repeat(marker.chars().count()));
+
+        let (paragraph, children) = match item.children.split_first() {
+            Some((
+                Node {
+                    kind: NodeKind::Paragraph(spans),
+                    ..
                 },
+                children,
+            )) => (Some(spans.as_slice()), children),
+            _ => (None, item.children.as_slice()),
+        };
+        let paragraph_lines = paragraph.map_or_else(
+            || vec![Vec::new()],
+            |spans| split_span_lines(spans, self.source),
+        );
+
+        for (line_index, line) in paragraph_lines.into_iter().enumerate() {
+            let prefix = if line_index == 0 {
+                Span::styled(format!("{indent}{marker}"), Style::default().fg(color))
+            } else {
+                Span::raw(continuation.clone())
             };
-
-            let continuation = format!("{}{}", indent, " ".repeat(marker.chars().count()));
-
-            for (line_idx, line) in split_span_lines(&item.text, self.source)
-                .into_iter()
-                .enumerate()
-            {
-                let prefix = if line_idx == 0 {
-                    Span::styled(format!("{}{}", indent, marker), Style::default().fg(color))
-                } else {
-                    Span::raw(continuation.clone())
-                };
-                self.push_line(
-                    lines,
-                    LogicalLine::list_item_spans(
-                        line,
-                        self.source,
-                        prefix,
-                        i == 0 && line_idx == 0,
-                    ),
-                    state,
-                );
-            }
-            // Render nested children (code blocks, sub-lists, etc.) in the same
-            // quote scope so blockquote chrome applies consistently.
-            for child in &item.children {
-                self.render_node(child, lines, state);
-            }
+            self.push_line(
+                lines,
+                LogicalLine::list_item_spans(
+                    line,
+                    self.source,
+                    prefix,
+                    Span::raw(continuation.clone()),
+                    is_list_start && line_index == 0,
+                ),
+                state,
+            );
         }
-        // Skip trailing newline for nested lists to avoid blank lines between siblings.
-        if items.first().is_some_and(|i| i.depth == 1) {
-            self.push_line(lines, LogicalLine::newline(None, false), state);
+
+        self.render_nodes(children, lines, state, Self::render_list_child);
+    }
+
+    fn render_list_child(
+        &self,
+        child: &Node,
+        lines: &mut Vec<LogicalLine>,
+        state: &mut RenderState,
+    ) {
+        let indent = if matches!(child.kind, NodeKind::List(_)) {
+            0
+        } else {
+            self.nested_block_indent(child.range.start)
+        };
+        if indent == 0 {
+            self.render_node(child, lines, state);
+            return;
         }
+
+        state.prefixes.push(Span::styled(
+            " ".repeat(indent),
+            Style::default().bg(self.theme.background),
+        ));
+        self.render_node(child, lines, state);
+        state.prefixes.pop();
     }
 }
 
@@ -299,7 +396,11 @@ mod tests {
                 } else {
                     text
                 };
-                format!("{:2}: [{}] {}", i, source_label(l), preview)
+                if preview.is_empty() {
+                    format!("{:2}: [{}]", i, source_label(l))
+                } else {
+                    format!("{:2}: [{}] {}", i, source_label(l), preview)
+                }
             })
             .collect::<Vec<_>>()
             .join("\n")
@@ -409,6 +510,36 @@ mod tests {
 
         assert_eq!(list_item.prefix_width(), 4);
         assert_eq!(list_item.render(&ctx).to_string(), "▎ • quoted item");
+    }
+
+    #[test]
+    fn test_nested_list_blocks_preserve_source_indentation() {
+        let theme = test_theme();
+        let ctx = test_ctx(&theme, 80);
+        let lines = render_nodes(
+            "1. First ordered item\n\n   Paragraph nested under the item.\n\n   ```python\n   print(\"list code\")\n   ```\n\n   > Quote nested under the item.\n   >\n   > - Quoted bullet\n\n2. Second ordered item\n\n   | A | B |\n   |---|---|\n   | x | y |\n\n- [ ] Parent task\n\n  > Task quote.\n\n  ```sh\n  echo task\n  ```",
+        );
+        let rendered = lines
+            .iter()
+            .map(|line| line.render(&ctx).to_string())
+            .collect::<Vec<_>>();
+
+        for expected in [
+            "   Paragraph nested under the item.",
+            "   ▎ 1",
+            "   ▎ print(\"list code\")",
+            "   ▎ Quote nested under the item.",
+            "   ▎ • Quoted bullet",
+            "   ┌",
+            "  ▎ Task quote.",
+            "  ▎ 2",
+            "  ▎ echo task",
+        ] {
+            assert!(
+                rendered.iter().any(|line| line.starts_with(expected)),
+                "missing {expected:?} in {rendered:#?}"
+            );
+        }
     }
 
     #[test]

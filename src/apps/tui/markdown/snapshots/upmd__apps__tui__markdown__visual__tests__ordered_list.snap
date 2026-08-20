@@ -1,9 +1,8 @@
 ---
-source: src/apps/tui/markdown.rs
-assertion_line: 1445
+source: src/apps/tui/markdown/visual.rs
+assertion_line: 587
 expression: logical_line_summary(&lines)
 ---
  0: [ListItem] first
  1: [ListItem] second
  2: [ListItem] third
- 3: [Newline]
