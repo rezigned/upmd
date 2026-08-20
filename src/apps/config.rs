@@ -62,6 +62,9 @@ pub const PREVIEW_FRAME_OVERHEAD: usize = 4;
 /// Width of the gutter prepended to code-block lines (`"▎ "`).
 pub const CODE_GUTTER_WIDTH: usize = 2;
 
+/// Vertical-bar glyph used for code-block and blockquote gutters.
+pub const GUTTER_GLYPH: &str = "▎";
+
 /// Total horizontal overhead for code-block content (frame + gutter).
 pub const PREVIEW_CODE_WRAP_OVERHEAD: usize = PREVIEW_FRAME_OVERHEAD + CODE_GUTTER_WIDTH;
 

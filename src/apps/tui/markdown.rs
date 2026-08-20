@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use unicode_width::UnicodeWidthChar;
 
-use crate::apps::config::PREVIEW_FRAME_OVERHEAD;
+use crate::apps::config::{GUTTER_GLYPH, PREVIEW_FRAME_OVERHEAD};
 use crate::apps::theme::Theme;
 use crate::runner::CodeId;
 use upmd_parser::nodes::{
@@ -886,7 +886,7 @@ pub fn apply_gutter(
         prefer_status_gutter,
         is_running,
     );
-    let gutter = Span::styled("\u{258E}", gs);
+    let gutter = Span::styled(GUTTER_GLYPH, gs);
     let has_content = !line.spans.is_empty();
     line.spans.insert(0, gutter);
     if has_content {

@@ -29,9 +29,9 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use crate::apps::config::{
-    BORDER_HEIGHT, CODE_GUTTER_WIDTH, INLINE_MAX_LINES_DEFAULT, INLINE_MAX_LINES_FRACTION,
-    INLINE_MAX_LINES_MIN, OVERDRAW_FRACTION, PREVIEW_CONTENT_TOP_OFFSET, PREVIEW_CONTENT_X_OFFSET,
-    PREVIEW_FRAME_OVERHEAD,
+    BORDER_HEIGHT, CODE_GUTTER_WIDTH, GUTTER_GLYPH, INLINE_MAX_LINES_DEFAULT,
+    INLINE_MAX_LINES_FRACTION, INLINE_MAX_LINES_MIN, OVERDRAW_FRACTION, PREVIEW_CONTENT_TOP_OFFSET,
+    PREVIEW_CONTENT_X_OFFSET, PREVIEW_FRAME_OVERHEAD,
 };
 use crate::apps::theme::Theme;
 use crate::runner::CodeId;
@@ -770,7 +770,7 @@ impl Preview {
                 if rendered
                     .spans
                     .get(gutter_idx)
-                    .is_some_and(|span| span.content == "▎")
+                    .is_some_and(|span| span.content == GUTTER_GLYPH)
                 {
                     rendered.spans.remove(gutter_idx);
                     if rendered
