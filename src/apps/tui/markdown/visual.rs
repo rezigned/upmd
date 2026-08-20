@@ -5,7 +5,7 @@ use std::rc::Rc;
 use ratatui::{style::Style, text::Span};
 use upmd_parser::nodes::{InlineSpan, ListItem, ListKind, Node, NodeKind, TaskStatus};
 
-use crate::apps::config::PREVIEW_FRAME_OVERHEAD;
+use crate::apps::config::{GUTTER_GLYPH, PREVIEW_FRAME_OVERHEAD};
 
 use super::{
     owned_table, render_table, split_span_lines, FrontmatterBlock, LogicalLine, LogicalLineSource,
@@ -55,7 +55,7 @@ impl MarkdownRenderer<'_> {
 
     fn visual_quote_prefix(&self) -> Span<'static> {
         Span::styled(
-            "▎ ",
+            format!("{GUTTER_GLYPH} "),
             Style::default()
                 .fg(self.theme.muted)
                 .bg(self.theme.background),
