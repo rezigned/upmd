@@ -1,28 +1,45 @@
 //! Source-preserving Markdown rendering for the preview's Markup mode.
 
 use ratatui::{style::Style, text::Span};
-use std::ops::Range;
+use std::{ops::Deref, ops::Range};
 
 use upmd_parser::nodes::{Node, NodeKind};
 
-use super::{LogicalLine, LogicalLineSource, MarkdownRenderer, RenderState};
+use super::{
+    LogicalLine, LogicalLineSource, MarkdownRenderer, ModeRenderer, RenderState, SourcePosition,
+};
 
-impl MarkdownRenderer<'_> {
-    pub(super) fn render_markup(
-        &self,
-        nodes: &[Node],
-        lines: &mut Vec<LogicalLine>,
-        state: &mut RenderState,
-    ) {
+pub(super) struct Markup<'renderer, 'document> {
+    renderer: &'renderer MarkdownRenderer<'document>,
+}
+
+impl<'renderer, 'document> Markup<'renderer, 'document> {
+    pub(super) fn new(renderer: &'renderer MarkdownRenderer<'document>) -> Self {
+        Self { renderer }
+    }
+}
+
+impl<'document> Deref for Markup<'_, 'document> {
+    type Target = MarkdownRenderer<'document>;
+
+    fn deref(&self) -> &Self::Target {
+        self.renderer
+    }
+}
+
+impl ModeRenderer for Markup<'_, '_> {
+    fn render(&self, nodes: &[Node], lines: &mut Vec<LogicalLine>, state: &mut RenderState) {
         let mut cursor = 0;
         for node in nodes {
-            self.render_markup_gap(cursor..node.range.start, lines, state);
+            self.render_markup_gap(cursor..node.range.start, lines);
             self.render_markup_node(node, lines, state);
             cursor = cursor.max(node.range.end);
         }
-        self.render_markup_gap(cursor..self.source.len(), lines, state);
+        self.render_markup_gap(cursor..self.source.len(), lines);
     }
+}
 
+impl Markup<'_, '_> {
     fn markup_code_prefix(&self, content: String) -> Span<'static> {
         Span::styled(
             content,
@@ -38,8 +55,11 @@ impl MarkdownRenderer<'_> {
         lines: &mut Vec<LogicalLine>,
         state: &mut RenderState,
     ) {
-        let parent_identity = state.begin_node();
         let start_line = lines.len();
+        let parent_position = std::mem::replace(
+            &mut state.source_position,
+            SourcePosition::At(self.source_line_start(node.range.start)),
+        );
 
         match &node.kind {
             NodeKind::Code(code_id) => self.render_markup_code(*code_id, lines, state),
@@ -55,15 +75,15 @@ impl MarkdownRenderer<'_> {
                 }
                 self.render_markup_code_ranges(node.range.clone(), &codes, lines, state);
             }
-            _ => self.render_markup_source(node.range.clone(), lines, state),
+            _ => self.render_markup_source(node.range.clone(), lines),
         }
 
         match node.kind {
-            NodeKind::Heading { .. } => state.snap.title_line = Some(start_line),
-            NodeKind::Paragraph(_) => state.snap.description_line = Some(start_line),
+            NodeKind::Heading { .. } => state.snap_title_line = Some(start_line),
+            NodeKind::Paragraph(_) => state.snap_description_line = Some(start_line),
             _ => {}
         }
-        state.end_node(parent_identity);
+        state.source_position = parent_position;
     }
 
     fn render_markup_code_ranges(
@@ -76,7 +96,7 @@ impl MarkdownRenderer<'_> {
         let mut cursor = range.start;
         for (code, quote_depth) in codes {
             let raw_end = self.code_prefix_start(cursor, code.range.start, *quote_depth);
-            self.render_markup_source(cursor..raw_end, lines, state);
+            self.render_markup_source(cursor..raw_end, lines);
 
             let parent_depth = std::mem::replace(&mut state.quote_depth, *quote_depth);
             let prefix = self.source[raw_end..code.range.start].to_owned();
@@ -91,7 +111,7 @@ impl MarkdownRenderer<'_> {
             state.quote_depth = parent_depth;
             cursor = self.after_line_ending(cursor.max(code.range.end));
         }
-        self.render_markup_source(cursor..range.end, lines, state);
+        self.render_markup_source(cursor..range.end, lines);
     }
 
     fn render_markup_code(
@@ -133,26 +153,22 @@ impl MarkdownRenderer<'_> {
         }
     }
 
-    fn render_markup_source(
-        &self,
-        range: Range<usize>,
-        lines: &mut Vec<LogicalLine>,
-        state: &mut RenderState,
-    ) {
-        let Some(source) = self.source.get(range) else {
+    fn render_markup_source(&self, range: Range<usize>, lines: &mut Vec<LogicalLine>) {
+        let Some(source) = self.source.get(range.clone()) else {
             return;
         };
-        for (index, line) in source.lines().enumerate() {
-            self.push_unquoted_line(lines, LogicalLine::markup_text(line, index == 0), state);
+        let mut offset = range.start;
+        // Keep line endings so each rendered row retains its exact source byte range.
+        for (index, raw_line) in source.split_inclusive('\n').enumerate() {
+            let start = offset;
+            offset += raw_line.len();
+            let line = raw_line.trim_end_matches(['\r', '\n']);
+            let position = source_position_for_line(line, start, offset, range.end);
+            lines.push(LogicalLine::markup_text(line, index == 0).with_source_position(position));
         }
     }
 
-    fn render_markup_gap(
-        &self,
-        range: Range<usize>,
-        lines: &mut Vec<LogicalLine>,
-        state: &mut RenderState,
-    ) {
+    fn render_markup_gap(&self, range: Range<usize>, lines: &mut Vec<LogicalLine>) {
         let Some(gap) = self.source.get(range.clone()) else {
             return;
         };
@@ -168,8 +184,27 @@ impl MarkdownRenderer<'_> {
             newline_count.saturating_sub(1)
         };
         for _ in 0..blank_lines {
-            self.push_unquoted_line(lines, LogicalLine::newline(), state);
+            lines.push(
+                LogicalLine::newline().with_source_position(SourcePosition::Before(
+                    self.source_line_start(range.end),
+                )),
+            );
         }
+    }
+}
+
+/// Returns `Before` for trailing blank lines, otherwise `At`.
+fn source_position_for_line(
+    line: &str,
+    line_start: usize,
+    line_end: usize,
+    range_end: usize,
+) -> SourcePosition {
+    let blank = line.chars().all(|c| c.is_whitespace() || c == '>');
+    if blank && line_end < range_end {
+        SourcePosition::Before(line_end)
+    } else {
+        SourcePosition::At(line_start)
     }
 }
 
@@ -210,7 +245,7 @@ mod tests {
 
     fn markup_text(lines: &[LogicalLine]) -> String {
         let theme = test_theme();
-        let ctx = RenderContext {
+        let ctx = LineRenderContext {
             theme: &theme,
             active_code_id: None,
             prefer_status_gutter: None,

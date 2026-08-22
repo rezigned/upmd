@@ -1,6 +1,6 @@
 //! Semantic terminal rendering for the preview's Visual mode.
 
-use std::rc::Rc;
+use std::{ops::Deref, rc::Rc};
 
 use ratatui::{style::Style, text::Span};
 use upmd_parser::nodes::{InlineSpan, ListItem, ListKind, Node, NodeKind, TaskStatus};
@@ -9,22 +9,38 @@ use crate::apps::config::{GUTTER_GLYPH, PREVIEW_FRAME_OVERHEAD};
 
 use super::{
     owned_table, render_table, split_span_lines, FrontmatterBlock, LogicalLine, LogicalLineSource,
-    MarkdownHtml, MarkdownRenderer, MarkdownTable, RenderState, MAX_BLOCKQUOTE_MARKER_INDENT,
+    MarkdownHtml, MarkdownRenderer, MarkdownTable, ModeRenderer, RenderState, SourcePosition,
+    MAX_BLOCKQUOTE_MARKER_INDENT,
 };
 
-impl MarkdownRenderer<'_> {
-    pub(super) fn render_visual(
-        &self,
-        nodes: &[upmd_parser::nodes::Node],
-        lines: &mut Vec<LogicalLine>,
-        state: &mut RenderState,
-    ) {
+pub(super) struct Visual<'renderer, 'document> {
+    renderer: &'renderer MarkdownRenderer<'document>,
+}
+
+impl<'renderer, 'document> Visual<'renderer, 'document> {
+    pub(super) fn new(renderer: &'renderer MarkdownRenderer<'document>) -> Self {
+        Self { renderer }
+    }
+}
+
+impl<'document> Deref for Visual<'_, 'document> {
+    type Target = MarkdownRenderer<'document>;
+
+    fn deref(&self) -> &Self::Target {
+        self.renderer
+    }
+}
+
+impl ModeRenderer for Visual<'_, '_> {
+    fn render(&self, nodes: &[Node], lines: &mut Vec<LogicalLine>, state: &mut RenderState) {
         self.render_nodes(nodes, lines, state, Self::render_node);
         if lines.last().is_some_and(LogicalLine::is_newline) {
             lines.pop();
         }
     }
+}
 
+impl Visual<'_, '_> {
     /// Whether this heading renders its own visual separator.
     fn has_heading_rule(node: &Node) -> bool {
         matches!(
@@ -42,13 +58,17 @@ impl MarkdownRenderer<'_> {
         state: &mut RenderState,
         mut render: impl FnMut(&Self, &Node, &mut Vec<LogicalLine>, &mut RenderState),
     ) {
-        for node in nodes {
+        for (index, node) in nodes.iter().enumerate() {
             render(self, node, lines, state);
             if lines.last().is_some_and(LogicalLine::is_newline) {
                 lines.pop();
             }
             if !Self::has_heading_rule(node) {
-                self.push_line(lines, LogicalLine::newline(), state);
+                let position = nodes.get(index + 1).map_or_else(
+                    || SourcePosition::At(self.source_line_start(node.range.end)),
+                    |next| SourcePosition::Before(self.source_line_start(next.range.start)),
+                );
+                self.push_line_at(lines, LogicalLine::newline(), position, state);
             }
         }
     }
@@ -69,7 +89,10 @@ impl MarkdownRenderer<'_> {
         state: &mut RenderState,
     ) {
         use upmd_parser::nodes::NodeKind;
-        let parent_identity = state.begin_node();
+        let parent_position = std::mem::replace(
+            &mut state.source_position,
+            SourcePosition::At(self.source_line_start(node.range.start)),
+        );
         match &node.kind {
             NodeKind::HtmlBlock => {
                 let html = self.source[node.range.clone()].to_owned();
@@ -100,7 +123,7 @@ impl MarkdownRenderer<'_> {
             }
             NodeKind::Paragraph(t) => {
                 if let Some(idx) = self.render_highlighted_lines(t, lines, true, state) {
-                    state.snap.description_line = Some(idx);
+                    state.snap_description_line = Some(idx);
                 }
             }
             NodeKind::BlockQuote(children) => {
@@ -108,11 +131,14 @@ impl MarkdownRenderer<'_> {
                 // context is scoped: a quoted paragraph should not become the
                 // snap target for a following non-quoted code block, and an
                 // outer paragraph should not snap to quoted code.
-                let parent_snap = std::mem::take(&mut state.snap);
+                let parent_snap = (
+                    state.snap_title_line.take(),
+                    state.snap_description_line.take(),
+                );
                 state.prefixes.push(self.visual_quote_prefix());
                 self.render_nodes(children, lines, state, Self::render_node);
                 state.prefixes.pop();
-                state.snap = parent_snap;
+                (state.snap_title_line, state.snap_description_line) = parent_snap;
             }
             NodeKind::Heading { text: t, level } => {
                 let line_idx = lines.len();
@@ -140,7 +166,7 @@ impl MarkdownRenderer<'_> {
                 if Self::has_heading_rule(node) {
                     self.push_line(lines, LogicalLine::heading_rule(), state);
                 }
-                state.snap.title_line = Some(line_idx);
+                state.snap_title_line = Some(line_idx);
             }
             NodeKind::List(items) => self.render_list(items, lines, state),
             NodeKind::Code(code_id) => self.render_code(*code_id, lines, state),
@@ -178,7 +204,7 @@ impl MarkdownRenderer<'_> {
                 self.push_line(lines, line, state);
             }
         }
-        state.end_node(parent_identity);
+        state.source_position = parent_position;
     }
 
     fn render_highlighted_lines(
@@ -287,7 +313,7 @@ impl MarkdownRenderer<'_> {
             } else {
                 Span::raw(continuation.clone())
             };
-            self.push_line(
+            self.push_line_at(
                 lines,
                 LogicalLine::list_item_spans(
                     line,
@@ -296,6 +322,7 @@ impl MarkdownRenderer<'_> {
                     Span::raw(continuation.clone()),
                     is_list_start && line_index == 0,
                 ),
+                SourcePosition::At(self.source_line_start(item.range.start)),
                 state,
             );
         }
@@ -344,8 +371,8 @@ mod tests {
         Theme::new("base16-ocean.dark", false)
     }
 
-    fn test_ctx(theme: &Theme, width: usize) -> RenderContext<'_> {
-        RenderContext {
+    fn test_ctx(theme: &Theme, width: usize) -> LineRenderContext<'_> {
+        LineRenderContext {
             theme,
             active_code_id: None,
             prefer_status_gutter: None,
@@ -371,7 +398,7 @@ mod tests {
             LogicalLineSource::Text(_) => "Text".to_string(),
             LogicalLineSource::ListItem(_) => "ListItem".to_string(),
             LogicalLineSource::Heading { level, .. } => format!("Heading({level})"),
-            LogicalLineSource::CodeInfo(_) => "CodeInfo".to_string(),
+            LogicalLineSource::CodeInfo { .. } => "CodeInfo".to_string(),
             LogicalLineSource::CodeBody(_) => "CodeBody".to_string(),
             LogicalLineSource::Output(_) => "Output".to_string(),
             LogicalLineSource::Html { .. } => "Html".to_string(),

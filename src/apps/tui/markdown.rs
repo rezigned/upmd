@@ -19,8 +19,8 @@ use crate::apps::config::{GUTTER_GLYPH, PREVIEW_FRAME_OVERHEAD};
 use crate::apps::theme::Theme;
 use crate::runner::CodeId;
 use upmd_parser::nodes::{
-    inline_text, Alignment, Code, DepsToken, FrontmatterStyle, InlineSpan, InlineStyle, Table,
-    TableCell,
+    inline_text, Alignment, Code, DepsToken, FrontmatterStyle, InlineSpan, InlineStyle, Node,
+    Table, TableCell,
 };
 use upmd_parser::Codes;
 
@@ -40,8 +40,8 @@ pub enum RenderMode {
     Markup,
 }
 
-/// Render-time context passed to [`LogicalLine::render`].
-pub struct RenderContext<'a> {
+/// Per-frame inputs used to render a [`LogicalLine`].
+pub struct LineRenderContext<'a> {
     pub theme: &'a Theme,
     pub active_code_id: Option<CodeId>,
     /// When set, this block's task status color overrides active gutter color.
@@ -210,13 +210,6 @@ impl FrontmatterBlock {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct CodeInfoLine {
-    left: Vec<(String, Style)>,
-    right: String,
-    style: Style,
-}
-
 #[derive(Debug)]
 struct TableRenderCache {
     viewport_width: usize,
@@ -275,7 +268,11 @@ pub enum LogicalLineSource {
         level: u8,
         text: LazyText,
     },
-    CodeInfo(CodeInfoLine),
+    CodeInfo {
+        left: Vec<(String, Style)>,
+        right: String,
+        style: Style,
+    },
     CodeBody(LazyText),
     Output(Text<'static>),
     /// One row of a raw HTML block highlighted and cached as a complete block.
@@ -327,6 +324,35 @@ impl LogicalLineSource {
     }
 }
 
+/// Source byte-offset anchor for a rendered line, used to remap the
+/// viewport/selection when toggling between Visual and Markup render modes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SourcePosition {
+    At(usize),
+    Before(usize),
+}
+
+impl Default for SourcePosition {
+    fn default() -> Self {
+        Self::At(0)
+    }
+}
+
+impl SourcePosition {
+    pub(crate) fn offset(self) -> usize {
+        match self {
+            Self::At(offset) | Self::Before(offset) => offset,
+        }
+    }
+
+    pub(crate) fn same_kind(self, other: Self) -> bool {
+        matches!(
+            (self, other),
+            (Self::At(_), Self::At(_)) | (Self::Before(_), Self::Before(_))
+        )
+    }
+}
+
 /// Renderable content and metadata for one semantic preview line.
 ///
 /// A logical line is width-independent; preview layout maps it to one or more
@@ -353,8 +379,8 @@ pub struct LogicalLine {
     /// Optional foreground color override for the gutter indicator (used by
     /// output lines to reflect task status).
     pub gutter_fg: Option<Color>,
-    /// AST node index used to preserve the viewport across render modes.
-    pub node_idx: Option<usize>,
+    /// Stable source position used to preserve the viewport across render modes.
+    pub(crate) source_position: SourcePosition,
 }
 
 impl LogicalLine {
@@ -364,6 +390,11 @@ impl LogicalLine {
             source: LogicalLineSource::Newline,
             ..Self::default()
         }
+    }
+
+    pub(crate) fn with_source_position(mut self, position: SourcePosition) -> Self {
+        self.source_position = position;
+        self
     }
 
     /// Creates a text line from inline markdown spans.
@@ -425,7 +456,7 @@ impl LogicalLine {
         is_running: bool,
     ) -> Self {
         Self {
-            source: LogicalLineSource::CodeInfo(CodeInfoLine { left, right, style }),
+            source: LogicalLineSource::CodeInfo { left, right, style },
             code_id: Some(code_id),
             is_block_start: is_start,
             is_code_start: is_start,
@@ -564,7 +595,7 @@ impl LogicalLine {
 
     #[inline]
     pub fn is_code_info(&self) -> bool {
-        matches!(self.source, LogicalLineSource::CodeInfo(_))
+        matches!(self.source, LogicalLineSource::CodeInfo { .. })
     }
 
     #[inline]
@@ -586,7 +617,7 @@ impl LogicalLine {
     pub fn has_code_gutter(&self) -> bool {
         matches!(
             self.source,
-            LogicalLineSource::CodeInfo(_)
+            LogicalLineSource::CodeInfo { .. }
                 | LogicalLineSource::CodeBody(_)
                 | LogicalLineSource::Output(_)
         )
@@ -627,9 +658,9 @@ impl LogicalLine {
             | LogicalLineSource::ListItem(text)
             | LogicalLineSource::CodeBody(text)
             | LogicalLineSource::Heading { text, .. } => text.text.clone(),
-            LogicalLineSource::CodeInfo(info) => {
-                let left: String = info.left.iter().map(|(text, _)| text.as_str()).collect();
-                format!("{left} {}", info.right.trim_end())
+            LogicalLineSource::CodeInfo { left, right, .. } => {
+                let left: String = left.iter().map(|(text, _)| text.as_str()).collect();
+                format!("{left} {}", right.trim_end())
             }
             LogicalLineSource::Output(text) => text.to_string(),
             LogicalLineSource::Html { block, row_idx } => block.raw_line(*row_idx).to_owned(),
@@ -653,7 +684,7 @@ impl LogicalLine {
     /// 3. `apply_chrome`: display prefixes and the code gutter.
     ///
     /// Called once per frame by the preview pane.
-    pub fn render(&self, ctx: &RenderContext<'_>) -> Line<'static> {
+    pub fn render(&self, ctx: &LineRenderContext<'_>) -> Line<'static> {
         self.render_with(ctx, true)
     }
 
@@ -661,12 +692,12 @@ impl LogicalLine {
     ///
     /// Layout and painted output must contain the same characters in the same
     /// order. Styles may differ, but width and wrapping must not.
-    pub fn render_plain(&self, ctx: &RenderContext<'_>) -> Line<'static> {
+    pub fn render_plain(&self, ctx: &LineRenderContext<'_>) -> Line<'static> {
         self.render_with(ctx, false)
     }
 
     /// Populates the content cache without applying viewport-dependent paint.
-    pub fn ensure_rendered(&self, ctx: &RenderContext<'_>) -> bool {
+    pub fn ensure_rendered(&self, ctx: &LineRenderContext<'_>) -> bool {
         if let Some(text) = self.lazy_text() {
             if text.cached.borrow().is_none() {
                 drop(self.render_content(ctx));
@@ -676,7 +707,7 @@ impl LogicalLine {
         false
     }
 
-    fn render_with(&self, ctx: &RenderContext<'_>, highlight: bool) -> Line<'static> {
+    fn render_with(&self, ctx: &LineRenderContext<'_>, highlight: bool) -> Line<'static> {
         if let Some(mut line) = self.render_synthetic(ctx) {
             self.apply_prefixes(&mut line);
             return line;
@@ -699,7 +730,7 @@ impl LogicalLine {
         &self,
         line: &mut Line<'static>,
         is_active: bool,
-        ctx: &RenderContext<'_>,
+        ctx: &LineRenderContext<'_>,
     ) {
         if self.is_code_body() {
             let bg = ctx.theme.code_style();
@@ -723,14 +754,14 @@ impl LogicalLine {
         line.spans = spans;
     }
 
-    fn apply_chrome(&self, line: &mut Line<'static>, is_active: bool, ctx: &RenderContext<'_>) {
+    fn apply_chrome(&self, line: &mut Line<'static>, is_active: bool, ctx: &LineRenderContext<'_>) {
         self.add_gutter(line, is_active, ctx);
         self.apply_prefixes(line);
     }
 
     /// Handles synthetic line types (thematic break, table) that bypass content
     /// rendering; `render` adds display prefixes afterward.
-    fn render_synthetic(&self, ctx: &RenderContext<'_>) -> Option<Line<'static>> {
+    fn render_synthetic(&self, ctx: &LineRenderContext<'_>) -> Option<Line<'static>> {
         match &self.source {
             LogicalLineSource::ThematicBreak => {
                 let width = ctx
@@ -754,7 +785,7 @@ impl LogicalLine {
     }
 
     /// Renders text-identical content without syntax highlighting.
-    fn render_plain_content(&self, ctx: &RenderContext<'_>) -> Line<'static> {
+    fn render_plain_content(&self, ctx: &LineRenderContext<'_>) -> Line<'static> {
         match &self.source {
             LogicalLineSource::Html { block, row_idx } => {
                 expand_tabs_in_line(Line::raw(block.raw_line(*row_idx).to_owned()))
@@ -771,7 +802,7 @@ impl LogicalLine {
     }
 
     /// Renders the main line content, caching semantic Markdown or syntax-highlighted code.
-    fn render_content(&self, ctx: &RenderContext<'_>) -> Line<'static> {
+    fn render_content(&self, ctx: &LineRenderContext<'_>) -> Line<'static> {
         match &self.source {
             LogicalLineSource::Text(text)
             | LogicalLineSource::ListItem(text)
@@ -815,14 +846,13 @@ impl LogicalLine {
             }
             LogicalLineSource::Html { block, row_idx } => block.line(*row_idx, ctx.theme),
             LogicalLineSource::Frontmatter { block, row_idx } => block.line(*row_idx, ctx.theme),
-            LogicalLineSource::CodeInfo(info) => {
+            LogicalLineSource::CodeInfo { left, right, style } => {
                 let prefix_width = self.prefix_width();
                 let wrap_width = ctx
                     .viewport_width
                     .saturating_sub(crate::apps::config::PREVIEW_CODE_WRAP_OVERHEAD + prefix_width)
                     .max(1);
-                let mut spans: Vec<Span<'static>> = info
-                    .left
+                let mut spans: Vec<Span<'static>> = left
                     .iter()
                     .map(|(text, style)| Span::styled(text.clone(), *style))
                     .collect();
@@ -833,11 +863,11 @@ impl LogicalLine {
                     ));
                 }
                 let left_chars: usize = spans.iter().map(|span| span.content.chars().count()).sum();
-                let right_chars = info.right.chars().count();
+                let right_chars = right.chars().count();
                 let gap = wrap_width.saturating_sub(left_chars + right_chars).max(1);
-                spans.push(Span::styled(" ".repeat(gap), info.style));
-                spans.push(Span::styled(info.right.clone(), info.style));
-                Line::from(spans).style(info.style)
+                spans.push(Span::styled(" ".repeat(gap), *style));
+                spans.push(Span::styled(right.clone(), *style));
+                Line::from(spans).style(*style)
             }
             LogicalLineSource::Output(text) => {
                 text.lines.first().cloned().unwrap_or_else(|| Line::raw(""))
@@ -851,7 +881,7 @@ impl LogicalLine {
     }
 
     /// Adds a gutter indicator for highlightable lines.
-    fn add_gutter(&self, line: &mut Line<'static>, is_active: bool, ctx: &RenderContext<'_>) {
+    fn add_gutter(&self, line: &mut Line<'static>, is_active: bool, ctx: &LineRenderContext<'_>) {
         if !self.has_code_gutter() {
             return;
         }
@@ -1085,52 +1115,28 @@ fn render_table_cell(
     spans
 }
 
-/// Render-time context for code-block snap-to-heading/paragraph.
-#[derive(Default)]
-struct SnapContext {
-    /// Index of the heading LogicalLine that precedes the next code block.
-    title_line: Option<usize>,
-    /// Index of the first paragraph LogicalLine that precedes the next code block.
-    description_line: Option<usize>,
-}
-
-impl SnapContext {
-    /// Consumes the best snap target. Prefers title, falls back to description.
-    /// Clears both after returning, so adjacent code blocks don't reuse context.
-    fn take_target(&mut self) -> Option<usize> {
-        let target = self.title_line.or(self.description_line);
-        self.title_line = None;
-        self.description_line = None;
-        target
-    }
-}
-
 #[derive(Default)]
 struct RenderState {
-    /// Snap targets are scoped separately from visual nesting.
-    snap: SnapContext,
+    /// Default source anchor inherited by lines emitted for the current node.
+    source_position: SourcePosition,
+    /// Heading and paragraph candidates for the next code block's snap target.
+    snap_title_line: Option<usize>,
+    snap_description_line: Option<usize>,
     /// Current blockquote nesting depth. Each level adds a display-only gutter.
     quote_depth: usize,
     /// Ordered display prefixes contributed by the active render mode.
     prefixes: Vec<Span<'static>>,
     /// Extra display width before code content, keyed by code block.
     code_prefix_overhead: HashMap<CodeId, usize>,
-    /// Traversal index allocated to the next AST node.
-    next_node_idx: usize,
-    /// Index of the node currently being rendered.
-    node_idx: usize,
 }
 
 impl RenderState {
-    fn begin_node(&mut self) -> usize {
-        let parent = self.node_idx;
-        self.next_node_idx += 1;
-        self.node_idx = self.next_node_idx;
-        parent
-    }
-
-    fn end_node(&mut self, parent: usize) {
-        self.node_idx = parent;
+    /// Consumes the best snap target and clears both candidates.
+    fn take_snap_target(&mut self) -> Option<usize> {
+        let target = self.snap_title_line.or(self.snap_description_line);
+        self.snap_title_line = None;
+        self.snap_description_line = None;
+        target
     }
 
     fn prefix_width(&self) -> usize {
@@ -1144,6 +1150,10 @@ impl RenderState {
 pub struct RenderedMarkdown {
     pub lines: Vec<LogicalLine>,
     pub code_prefix_overhead: HashMap<CodeId, usize>,
+}
+
+trait ModeRenderer {
+    fn render(&self, nodes: &[Node], lines: &mut Vec<LogicalLine>, state: &mut RenderState);
 }
 
 /// From AST nodes to ratatui `Text` lines.
@@ -1182,12 +1192,12 @@ impl<'a> MarkdownRenderer<'a> {
         self
     }
 
-    pub fn render(&self, nodes: &[upmd_parser::nodes::Node]) -> RenderedMarkdown {
+    pub fn render(&self, nodes: &[Node]) -> RenderedMarkdown {
         let mut lines = Vec::new();
         let mut state = RenderState::default();
         match self.mode {
-            RenderMode::Visual => self.render_visual(nodes, &mut lines, &mut state),
-            RenderMode::Markup => self.render_markup(nodes, &mut lines, &mut state),
+            RenderMode::Visual => visual::Visual::new(self).render(nodes, &mut lines, &mut state),
+            RenderMode::Markup => markup::Markup::new(self).render(nodes, &mut lines, &mut state),
         }
         RenderedMarkdown {
             lines,
@@ -1195,12 +1205,19 @@ impl<'a> MarkdownRenderer<'a> {
         }
     }
 
+    fn source_line_start(&self, offset: usize) -> usize {
+        let offset = offset.min(self.source.len());
+        self.source[..offset]
+            .rfind('\n')
+            .map_or(0, |newline| newline + 1)
+    }
+
     fn render_code(&self, code_id: CodeId, lines: &mut Vec<LogicalLine>, state: &mut RenderState) {
         let code = self
             .codes
             .by_id(code_id)
             .expect("CodeId must resolve to a Code in Document.codes");
-        let is_start = match state.snap.take_target() {
+        let is_start = match state.take_snap_target() {
             Some(idx) => {
                 if let Some(line) = lines.get_mut(idx) {
                     line.code_id = Some(code.id);
@@ -1234,7 +1251,18 @@ impl<'a> MarkdownRenderer<'a> {
         self.render_code_output(code, lines, state, gutter_fg, is_running);
     }
 
-    fn push_line(&self, lines: &mut Vec<LogicalLine>, mut line: LogicalLine, state: &RenderState) {
+    fn push_line(&self, lines: &mut Vec<LogicalLine>, line: LogicalLine, state: &RenderState) {
+        self.push_line_at(lines, line, state.source_position, state);
+    }
+
+    fn push_line_at(
+        &self,
+        lines: &mut Vec<LogicalLine>,
+        mut line: LogicalLine,
+        source_position: SourcePosition,
+        state: &RenderState,
+    ) {
+        line.source_position = source_position;
         let mut wrap_prefixes = state.prefixes.clone();
         if let Some(line_prefixes) = line.wrap_prefixes.take() {
             wrap_prefixes.extend(line_prefixes);
@@ -1245,16 +1273,6 @@ impl<'a> MarkdownRenderer<'a> {
             .sum();
         line.wrap_prefixes = (!wrap_prefixes.is_empty()).then_some(wrap_prefixes);
         line.prefixes.splice(0..0, state.prefixes.iter().cloned());
-        self.push_unquoted_line(lines, line, state);
-    }
-
-    fn push_unquoted_line(
-        &self,
-        lines: &mut Vec<LogicalLine>,
-        mut line: LogicalLine,
-        state: &RenderState,
-    ) {
-        line.node_idx = Some(state.node_idx);
         lines.push(line);
     }
 
@@ -1657,8 +1675,8 @@ mod tests {
         Theme::new("base16-ocean.dark", false)
     }
 
-    fn test_ctx(theme: &Theme, width: usize) -> RenderContext<'_> {
-        RenderContext {
+    fn test_ctx(theme: &Theme, width: usize) -> LineRenderContext<'_> {
+        LineRenderContext {
             theme,
             active_code_id: None,
             prefer_status_gutter: None,
@@ -1687,7 +1705,7 @@ mod tests {
             LogicalLineSource::Text(_) => "Text".to_string(),
             LogicalLineSource::ListItem(_) => "ListItem".to_string(),
             LogicalLineSource::Heading { level, .. } => format!("Heading({level})"),
-            LogicalLineSource::CodeInfo(_) => "CodeInfo".to_string(),
+            LogicalLineSource::CodeInfo { .. } => "CodeInfo".to_string(),
             LogicalLineSource::CodeBody(_) => "CodeBody".to_string(),
             LogicalLineSource::Output(_) => "Output".to_string(),
             LogicalLineSource::Html { .. } => "Html".to_string(),
@@ -1932,7 +1950,7 @@ mod tests {
     #[test]
     fn running_code_body_does_not_append_spinner() {
         let theme = test_theme();
-        let ctx = RenderContext {
+        let ctx = LineRenderContext {
             theme: &theme,
             active_code_id: Some(1),
             prefer_status_gutter: None,
@@ -1962,7 +1980,7 @@ mod tests {
                 .into_iter()
                 .find(|line| line.text_content().trim_start_matches("- ") == "after")
                 .expect("following list item")
-                .node_idx
+                .source_position
         };
         assert_eq!(identity(RenderMode::Visual), identity(RenderMode::Markup));
     }

@@ -40,7 +40,8 @@ use upmd_parser::nodes::Node;
 use upmd_parser::{Codes, Document};
 
 use super::markdown::{
-    highlight_line, LogicalLine, MarkdownHtml, MarkdownRenderer, RenderContext, RenderMode,
+    highlight_line, LineRenderContext, LogicalLine, MarkdownHtml, MarkdownRenderer, RenderMode,
+    SourcePosition,
 };
 use super::selection::SelectionState;
 use super::wrap::CopyLine;
@@ -76,8 +77,7 @@ enum LayoutLineIdentity {
         wrap_idx: usize,
     },
     Document {
-        node_idx: Option<usize>,
-        logical_idx: usize,
+        source_position: SourcePosition,
         wrap_idx: usize,
     },
 }
@@ -473,8 +473,7 @@ impl Preview {
                 })
             }
             None => Some(LayoutLineIdentity::Document {
-                node_idx: logical_lines[line.logical_idx].node_idx,
-                logical_idx: line.logical_idx,
+                source_position: logical_lines[line.logical_idx].source_position,
                 wrap_idx: line.wrap_idx,
             }),
         }
@@ -488,10 +487,9 @@ impl Preview {
                 wrap_idx,
             } => self.layout_idx_for_code_identity(id, line_idx, wrap_idx),
             LayoutLineIdentity::Document {
-                node_idx,
-                logical_idx,
+                source_position,
                 wrap_idx,
-            } => self.layout_idx_for_document_identity(node_idx, logical_idx, wrap_idx),
+            } => self.layout_idx_for_document_identity(source_position, wrap_idx),
         }
     }
 
@@ -520,38 +518,22 @@ impl Preview {
 
     fn layout_idx_for_document_identity(
         &self,
-        node_idx: Option<usize>,
-        logical_idx: usize,
+        source_position: SourcePosition,
         wrap_idx: usize,
     ) -> Option<usize> {
-        let layout_lines = self.layout_lines.borrow();
+        self.layout_lines
+            .borrow()
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, layout)| {
+                let candidate = self.logical_lines[layout.logical_idx].source_position;
+                let different_kind = !candidate.same_kind(source_position);
+                let source_distance = candidate.offset().abs_diff(source_position.offset());
+                let different_wrap = layout.wrap_idx != wrap_idx;
 
-        // Prefer the same wrapped row within the AST node, then the first row
-        // from that node before using the previous logical index.
-        node_idx
-            .and_then(|node_idx| {
-                layout_lines
-                    .iter()
-                    .position(|line| {
-                        self.logical_lines[line.logical_idx].node_idx == Some(node_idx)
-                            && line.wrap_idx == wrap_idx
-                    })
-                    .or_else(|| {
-                        layout_lines.iter().position(|line| {
-                            self.logical_lines[line.logical_idx].node_idx == Some(node_idx)
-                        })
-                    })
+                (different_kind, source_distance, different_wrap)
             })
-            .or_else(|| {
-                layout_lines
-                    .iter()
-                    .position(|line| line.logical_idx == logical_idx && line.wrap_idx == wrap_idx)
-                    .or_else(|| {
-                        layout_lines
-                            .iter()
-                            .position(|line| line.logical_idx == logical_idx)
-                    })
-            })
+            .map(|(index, _)| index)
     }
 
     fn layout_extent_for_code(
@@ -753,7 +735,7 @@ impl Preview {
     /// Builds a [`CopyLine`] from a layout line.
     fn copy_line_at(&self, line_idx: usize) -> Option<CopyLine> {
         let line = self.layout_lines.get(line_idx)?;
-        let ctx = RenderContext {
+        let ctx = LineRenderContext {
             theme: &self.theme,
             active_code_id: None,
             prefer_status_gutter: None,
@@ -1013,7 +995,7 @@ impl Preview {
     ) -> Option<(usize, usize)> {
         let layout_lines = self.layout_lines.borrow();
         let offset = self.state.borrow().offset();
-        let ctx = RenderContext {
+        let ctx = LineRenderContext {
             theme: &self.theme,
             active_code_id: None,
             prefer_status_gutter: None,
@@ -1159,7 +1141,7 @@ impl Output for Preview {
             None => None,
         };
 
-        let ctx = RenderContext {
+        let ctx = LineRenderContext {
             theme: &self.theme,
             active_code_id,
             prefer_status_gutter,
@@ -1233,7 +1215,7 @@ impl Preview {
         layout_lines: &[LayoutLine],
         offset: usize,
         viewport: usize,
-        ctx: &RenderContext<'_>,
+        ctx: &LineRenderContext<'_>,
     ) {
         let start = offset.saturating_sub(viewport);
         let end = offset
@@ -1422,6 +1404,67 @@ mod tests {
     }
 
     #[test]
+    fn mode_toggle_preserves_nested_source_boundary() {
+        let markdown = "\
+> Outer\n\
+>\n\
+> > Inner\n\
+> >\n\
+> > | A | B |\n\
+> > |---|---|\n\
+> > | x | y |\n\
+>\n\
+> Back\n";
+        let mut preview = preview_from_markdown(markdown);
+        preview.rebuild_layout_lines(60);
+        let back = preview
+            .logical_lines
+            .iter()
+            .position(|line| line.text_content() == "Back")
+            .expect("outer quote paragraph");
+        let separator = back - 1;
+        let source_position = preview.logical_lines[separator].source_position;
+        let back_source_start = markdown.find("> Back").expect("Back source line");
+        assert_eq!(
+            source_position,
+            SourcePosition::Before(back_source_start),
+            "separator must anchor immediately before Back"
+        );
+        let layout_idx = preview
+            .layout_lines
+            .borrow()
+            .iter()
+            .position(|line| line.logical_idx == separator)
+            .expect("separator layout line");
+        {
+            let mut state = preview.state.borrow_mut();
+            state.select(Some(layout_idx));
+            *state.offset_mut() = layout_idx;
+        }
+
+        for _ in 0..2 {
+            preview.toggle_mode();
+            preview.rebuild_view(&HashMap::new());
+            let selected = preview
+                .selected_logical_line()
+                .expect("source boundary selection");
+            assert_eq!(
+                preview.logical_lines[selected].source_position,
+                source_position
+            );
+            assert!(
+                preview
+                    .logical_lines
+                    .get(selected + 1)
+                    .is_some_and(|line| line.text_content().ends_with("Back")),
+                "mode {:?} selected the wrong source boundary",
+                preview.mode.get()
+            );
+            assert_eq!(preview.state.borrow().offset(), preview.selected_idx());
+        }
+    }
+
+    #[test]
     fn mode_toggle_maps_heading_rule_to_heading() {
         let mut preview = preview_from_markdown("# One\n\nbody\n");
         preview.rebuild_layout_lines(60);
@@ -1472,7 +1515,7 @@ mod tests {
         assert!(row
             .render_plain(
                 &preview.logical_lines[0],
-                &RenderContext {
+                &LineRenderContext {
                     theme: &preview.theme,
                     active_code_id: None,
                     prefer_status_gutter: None,
@@ -1487,7 +1530,7 @@ mod tests {
     fn render_layout_line(
         preview: &Preview,
         layout_line: &LayoutLine,
-        ctx: &RenderContext<'_>,
+        ctx: &LineRenderContext<'_>,
     ) -> Line<'static> {
         let logical_line = &preview.logical_lines[layout_line.logical_idx];
         let rendered_line = logical_line.render(ctx);
@@ -1496,7 +1539,7 @@ mod tests {
 
     /// Renders every layout row to its final text, joined with newlines.
     fn full_preview_text(preview: &Preview) -> String {
-        let ctx = RenderContext {
+        let ctx = LineRenderContext {
             theme: &preview.theme,
             active_code_id: None,
             prefer_status_gutter: None,
@@ -1680,7 +1723,7 @@ mod tests {
             "start **[abcdefghijklmnopqrstuvwxyz](https://example.com)** end",
         );
         preview.rebuild_layout_lines(12);
-        let ctx = RenderContext {
+        let ctx = LineRenderContext {
             theme: &preview.theme,
             active_code_id: None,
             prefer_status_gutter: None,
@@ -1754,7 +1797,7 @@ mod tests {
             .clone();
         drop(layout_lines);
 
-        let ctx = RenderContext {
+        let ctx = LineRenderContext {
             theme: &preview.theme,
             active_code_id: Some(1),
             prefer_status_gutter: None,
@@ -1805,7 +1848,7 @@ mod tests {
             .expect("expected a code body layout line")
             .clone();
 
-        let active_ctx = RenderContext {
+        let active_ctx = LineRenderContext {
             theme: &preview.theme,
             active_code_id: Some(1),
             prefer_status_gutter: None,
@@ -1824,7 +1867,7 @@ mod tests {
             Some(preview.theme.active)
         );
 
-        let status_ctx = RenderContext {
+        let status_ctx = LineRenderContext {
             theme: &preview.theme,
             active_code_id: Some(1),
             prefer_status_gutter: Some(1),
@@ -1852,7 +1895,7 @@ mod tests {
             .iter()
             .find(|line| line.is_code_info())
             .expect("expected a code info logical line");
-        let ctx = RenderContext {
+        let ctx = LineRenderContext {
             theme: &preview.theme,
             active_code_id: Some(1),
             prefer_status_gutter: None,
@@ -1890,7 +1933,7 @@ mod tests {
             .clone();
         drop(layout_lines);
 
-        let ctx = RenderContext {
+        let ctx = LineRenderContext {
             theme: &preview.theme,
             active_code_id: None,
             prefer_status_gutter: None,
@@ -1922,7 +1965,7 @@ mod tests {
         let display_len = line
             .render_plain(
                 &preview.logical_lines[line.logical_idx],
-                &RenderContext {
+                &LineRenderContext {
                     theme: &preview.theme,
                     active_code_id: None,
                     prefer_status_gutter: None,
