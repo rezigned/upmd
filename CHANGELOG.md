@@ -1,4 +1,18 @@
-## [0.2.5]
+## [0.2.6]
+
+### 🐛 Bug Fixes
+
+- *(tui)* Allow concurrent standalone tasks (#37)
+
+### 🚜 Refactor
+
+- *(tui)* Extract mode renderers and preserve viewport (#34)
+- *(tui)* Separate content cache preparation (#36)
+
+### ⚡ Performance
+
+- *(tui)* Batch and reuse syntax highlights (#35)
+## [v0.2.5]
 
 ### 🚀 Features
 
@@ -29,6 +43,7 @@
 
 - *(release)* Bump version to 0.2.3 (#23)
 - *(release)* Bump version to 0.2.4 (#28)
+- *(release)* Bump version to 0.2.5 (#33)
 ## [v0.2.2]
 
 ### 🚀 Features
