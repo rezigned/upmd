@@ -256,7 +256,8 @@ impl App {
 
     fn start_target(&mut self, id: CodeId) -> Option<Cmd<Msg>> {
         match Workflow::for_target(self.content.codes(), id) {
-            Ok(workflow) => self.start_plan(workflow),
+            Ok(workflow) if workflow.graph().has_deps() => self.start_plan(workflow),
+            Ok(_) => self.execute_block(id),
             Err(error) => {
                 self.notify_error(error);
                 None
@@ -266,7 +267,8 @@ impl App {
 
     fn rerun_target(&mut self, id: CodeId) -> Option<Cmd<Msg>> {
         match Workflow::for_target_rerun(self.content.codes(), id) {
-            Ok(workflow) => self.start_plan(workflow),
+            Ok(workflow) if workflow.graph().has_deps() => self.start_plan(workflow),
+            Ok(_) => self.execute_block(id),
             Err(error) => {
                 self.notify_error(error);
                 None
