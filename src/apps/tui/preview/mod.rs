@@ -6,18 +6,17 @@
 //! width-dependent slice described by the layout line:
 //!
 //! ```text
-//! Node → LogicalLine ──┬─ render → rendered Line ─┬─→ terminal row
-//!                      ├─ width  → LayoutLine(s) ─┤
-//!                      └──── render metadata ─────┘
+//! Node → LogicalLine ──┬─ prepare/cache → render → Line ─┬─→ terminal row
+//!                      ├───── width → LayoutLine(s) ─────┤
+//!                      └──────── render metadata ────────┘
 //! ```
 //!
 //! Content or output changes rebuild logical and layout lines. Width changes
 //! rebuild only layout lines. Rendering and interaction use the full layout
 //! index. Final row rendering covers the viewport and its overdraw margin.
-//! Expensive content caches are prefetched one viewport ahead.
+//! Expensive syntax caches are batch-prefetched around the viewport and reused
+//! across unchanged logical rebuilds.
 
-#[cfg(test)]
-use ratatui::text::Line;
 use ratatui::{
     layout::Rect,
     text::Text,
@@ -25,8 +24,7 @@ use ratatui::{
     Frame,
 };
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
-use std::rc::Rc;
+use std::collections::HashMap;
 
 use crate::apps::config::{
     BORDER_HEIGHT, CODE_GUTTER_WIDTH, GUTTER_GLYPH, INLINE_MAX_LINES_DEFAULT,
@@ -40,8 +38,8 @@ use upmd_parser::nodes::Node;
 use upmd_parser::{Codes, Document};
 
 use super::markdown::{
-    highlight_line, LineRenderContext, LogicalLine, MarkdownHtml, MarkdownRenderer, RenderMode,
-    SourcePosition,
+    highlight_line, prepare_lines, LineRenderContext, LogicalLine, LogicalLineSource,
+    MarkdownRenderer, RenderMode, SourcePosition,
 };
 use super::selection::SelectionState;
 use super::wrap::CopyLine;
@@ -109,6 +107,8 @@ pub struct Preview {
     copy_result: Cell<Option<bool>>,
     /// Prefix overhead in chars per code block (non-zero only for blockquote-nested blocks).
     code_prefix_overhead: HashMap<CodeId, usize>,
+    /// Highlighted Markup rows retained while Visual mode is active.
+    markup_line_cache: HashMap<usize, Text<'static>>,
     /// Cache of images referenced by the document, keyed by resolved path.
     images: RefCell<ImageCache>,
     /// Directory that relative image paths resolve against (the open document's dir).
@@ -182,6 +182,7 @@ impl Preview {
             copy_result: Cell::new(None),
             code_index: codes,
             code_prefix_overhead: HashMap::new(),
+            markup_line_cache: HashMap::new(),
             images: RefCell::new(ImageCache::new()),
             image_base_dir,
             mode: Cell::new(RenderMode::Visual),
@@ -261,37 +262,25 @@ impl Preview {
         self.logical_lines = rendered.lines;
         self.code_prefix_overhead = rendered.code_prefix_overhead;
 
-        // Reuse caches from the previous render for unchanged lines. HTML
-        // blocks are reused by whole-block source; other lines match on text.
-        let old_html: HashMap<String, Rc<MarkdownHtml>> = old_lines
-            .iter()
-            .filter_map(LogicalLine::html_block)
-            .map(|block| (block.source().to_owned(), Rc::clone(block)))
-            .collect();
-        let mut old_raw_iter = old_lines
-            .iter_mut()
-            .filter_map(LogicalLine::lazy_text_mut)
-            .peekable();
+        // Reuse lazy render caches from unchanged lines.
+        self.retain_markup_caches(&mut old_lines);
+        let mut old_raw_iter = old_lines.iter_mut().filter_map(LogicalLine::lazy_text_mut);
 
         for line in &mut self.logical_lines {
-            if let Some(block) = line.html_block() {
-                if let Some(cached) = old_html.get(block.source()) {
-                    line.reuse_html_block(cached);
+            if let LogicalLineSource::Markup(text) = &mut line.source {
+                if let Some(cached) = self
+                    .markup_line_cache
+                    .remove(&line.source_position.offset())
+                {
+                    *text.cached.get_mut() = Some(cached);
                 }
                 continue;
             }
             let Some(text) = line.lazy_text_mut() else {
                 continue;
             };
-            while let Some(old) = old_raw_iter.peek() {
-                if text.text == old.text && text.language == old.language && text.spans == old.spans
-                {
-                    if let Some(old) = old_raw_iter.next() {
-                        std::mem::swap(&mut text.cached, &mut old.cached);
-                    }
-                    break;
-                }
-                old_raw_iter.next();
+            if let Some(old) = old_raw_iter.find(|old| text.same_content(old)) {
+                std::mem::swap(&mut text.cached, &mut old.cached);
             }
         }
 
@@ -301,6 +290,18 @@ impl Preview {
 
         if width > 0 {
             self.rebuild_layout_lines_preserving(width, &old_lines);
+        }
+    }
+
+    fn retain_markup_caches(&mut self, lines: &mut [LogicalLine]) {
+        for line in lines {
+            let LogicalLineSource::Markup(text) = &mut line.source else {
+                continue;
+            };
+            if let Some(cached) = text.cached.get_mut().take() {
+                self.markup_line_cache
+                    .insert(line.source_position.offset(), cached);
+            }
         }
     }
 
@@ -637,6 +638,7 @@ impl Preview {
     pub fn set_theme(&mut self, theme: &Theme) {
         self.theme.clone_from(theme);
         self.logical_lines.iter().for_each(|l| l.clear_cache());
+        self.markup_line_cache.clear();
     }
 
     pub fn selected_code_id(&self) -> Option<CodeId> {
@@ -1221,20 +1223,18 @@ impl Preview {
         let end = offset
             .saturating_add(viewport.saturating_mul(2))
             .min(layout_lines.len());
-        let mut prefetched = HashSet::new();
-        let mut populated_caches = 0;
-        for layout_line in &layout_lines[start..end] {
-            if prefetched.insert(layout_line.logical_idx)
-                && layout_line
-                    .logical(&self.logical_lines)
-                    .ensure_rendered(ctx)
-            {
-                populated_caches += 1;
-            }
-        }
+        let Some(first) = layout_lines.get(start) else {
+            return;
+        };
+        let Some(last) = layout_lines.get(end.saturating_sub(1)) else {
+            return;
+        };
+        let logical_range = first.logical_idx..last.logical_idx.saturating_add(1);
+        let prefetched_lines = logical_range.len();
+        let populated_caches = prepare_lines(&self.logical_lines, logical_range, ctx);
         if populated_caches > 0 {
             tracing::debug!(
-                prefetched_lines = prefetched.len(),
+                prefetched_lines,
                 populated_caches,
                 "prefetched preview content caches"
             );
@@ -1280,6 +1280,7 @@ mod tests {
     use super::*;
     use crate::apps::tui::testutil::ansi_line_summary;
     use insta::assert_snapshot;
+    use ratatui::text::Line;
     use std::collections::HashMap;
 
     fn preview_from_markdown(markdown: &str) -> Preview {
@@ -1301,22 +1302,21 @@ mod tests {
     fn html_block_cache_rebuilds() {
         let comment = "<!--\ninside comment\n-->\n";
         let div = "<div>\ninside element\n</div>\n";
-        let block = |p: &Preview| {
-            Rc::clone(
-                p.logical_lines
-                    .iter()
-                    .find_map(LogicalLine::html_block)
-                    .expect("HTML block"),
-            )
-        };
 
         for (name, updated, change_theme, expect_reuse) in [
             ("unchanged", comment, false, true),
-            ("theme changed", comment, true, true),
+            ("theme changed", comment, true, false),
             ("source changed", div, false, false),
         ] {
             let mut preview = preview_from_markdown(comment);
-            let before = block(&preview);
+            let ctx = LineRenderContext {
+                theme: &preview.theme,
+                active_code_id: None,
+                prefer_status_gutter: None,
+                spinner_char: ' ',
+                viewport_width: 80,
+            };
+            prepare_lines(&preview.logical_lines, 0..preview.logical_lines.len(), &ctx);
 
             if change_theme {
                 preview.set_theme(&Theme::new("base16-ocean.dark", true));
@@ -1329,11 +1329,16 @@ mod tests {
             }
             preview.rebuild_view(&HashMap::new());
 
-            assert_eq!(
-                Rc::ptr_eq(&before, &block(&preview)),
-                expect_reuse,
-                "{name}"
-            );
+            let cached: Vec<bool> = preview
+                .logical_lines
+                .iter()
+                .filter_map(|line| match &line.source {
+                    LogicalLineSource::Html(text) => Some(text.cached.borrow().is_some()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(cached.len(), 3, "{name}");
+            assert_eq!(cached.iter().all(|cached| *cached), expect_reuse, "{name}");
         }
     }
 

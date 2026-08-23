@@ -9,7 +9,7 @@ use crate::apps::config::{GUTTER_GLYPH, PREVIEW_FRAME_OVERHEAD};
 
 use super::{
     owned_table, render_table, split_span_lines, FrontmatterBlock, LogicalLine, LogicalLineSource,
-    MarkdownHtml, MarkdownRenderer, MarkdownTable, ModeRenderer, RenderState, SourcePosition,
+    MarkdownRenderer, MarkdownTable, ModeRenderer, RenderState, SourcePosition,
     MAX_BLOCKQUOTE_MARKER_INDENT,
 };
 
@@ -95,14 +95,8 @@ impl Visual<'_, '_> {
         );
         match &node.kind {
             NodeKind::HtmlBlock => {
-                let html = self.source[node.range.clone()].to_owned();
-                let block = Rc::new(MarkdownHtml::new(html));
-                for row_idx in 0..block.len() {
-                    self.push_line(
-                        lines,
-                        LogicalLine::html(Rc::clone(&block), row_idx, row_idx == 0),
-                        state,
-                    );
+                for (row_idx, line) in self.source[node.range.clone()].lines().enumerate() {
+                    self.push_line(lines, LogicalLine::html(line, row_idx == 0), state);
                 }
             }
             NodeKind::Frontmatter { style, raw } => {
@@ -396,12 +390,13 @@ mod tests {
     fn source_label(line: &LogicalLine) -> String {
         match &line.source {
             LogicalLineSource::Text(_) => "Text".to_string(),
+            LogicalLineSource::Markup(_) => "Markup".to_string(),
             LogicalLineSource::ListItem(_) => "ListItem".to_string(),
             LogicalLineSource::Heading { level, .. } => format!("Heading({level})"),
             LogicalLineSource::CodeInfo { .. } => "CodeInfo".to_string(),
             LogicalLineSource::CodeBody(_) => "CodeBody".to_string(),
             LogicalLineSource::Output(_) => "Output".to_string(),
-            LogicalLineSource::Html { .. } => "Html".to_string(),
+            LogicalLineSource::Html(_) => "Html".to_string(),
             LogicalLineSource::Frontmatter { .. } => "Frontmatter".to_string(),
             LogicalLineSource::TableRow { .. } => "Table".to_string(),
             LogicalLineSource::Image { .. } => "Image".to_string(),
@@ -652,7 +647,7 @@ mod tests {
         let lines = render_nodes("<pre>\n\tindented\n</pre>\n");
         let html: Vec<&LogicalLine> = lines
             .iter()
-            .filter(|l| matches!(l.source, LogicalLineSource::Html { .. }))
+            .filter(|l| matches!(l.source, LogicalLineSource::Html(_)))
             .collect();
         assert_eq!(html.len(), 3);
         assert_eq!(html[1].text_content(), "\tindented");
@@ -675,7 +670,7 @@ mod tests {
                 "block",
                 render_nodes("<div class=\"card\">\n</div>\n")
                     .iter()
-                    .find(|l| matches!(l.source, LogicalLineSource::Html { .. }))
+                    .find(|l| matches!(l.source, LogicalLineSource::Html(_)))
                     .unwrap()
                     .render(&ctx),
             ),

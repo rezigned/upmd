@@ -12,6 +12,7 @@ use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::ops::Range;
 use std::rc::Rc;
 use unicode_width::UnicodeWidthChar;
 
@@ -85,6 +86,10 @@ impl LazyText {
         text.spans = spans;
         text
     }
+
+    pub(crate) fn same_content(&self, other: &Self) -> bool {
+        self.text == other.text && self.language == other.language && self.spans == other.spans
+    }
 }
 
 impl Default for LazyText {
@@ -95,56 +100,6 @@ impl Default for LazyText {
             spans: Vec::new(),
             cached: std::cell::RefCell::new(None),
         }
-    }
-}
-
-#[derive(Debug)]
-pub struct MarkdownHtml {
-    source: String,
-    lines: Vec<String>,
-    cached: RefCell<Option<Text<'static>>>,
-}
-
-impl MarkdownHtml {
-    fn new(source: String) -> Self {
-        let lines = source.lines().map(str::to_owned).collect();
-        Self {
-            source,
-            lines,
-            cached: RefCell::new(None),
-        }
-    }
-
-    pub(crate) fn source(&self) -> &str {
-        &self.source
-    }
-
-    fn len(&self) -> usize {
-        self.lines.len()
-    }
-
-    fn raw_line(&self, row_idx: usize) -> &str {
-        self.lines.get(row_idx).map_or("", String::as_str)
-    }
-
-    fn line(&self, row_idx: usize, theme: &Theme) -> Line<'static> {
-        let mut cached = self.cached.borrow_mut();
-        if cached.is_none() {
-            let mut rendered = theme.highlight(&self.source, "html");
-            for line in &mut rendered.lines {
-                *line = expand_tabs_in_line(std::mem::take(line));
-            }
-            *cached = Some(rendered);
-        }
-        cached
-            .as_ref()
-            .and_then(|text| text.lines.get(row_idx))
-            .cloned()
-            .unwrap_or_else(|| expand_tabs_in_line(Line::raw(self.raw_line(row_idx).to_owned())))
-    }
-
-    fn clear_cache(&self) {
-        *self.cached.borrow_mut() = None;
     }
 }
 
@@ -263,6 +218,8 @@ impl MarkdownTable {
 #[derive(Debug, Clone, Default)]
 pub enum LogicalLineSource {
     Text(LazyText),
+    /// Raw Markdown source prepared in viewport-sized syntax-highlighted batches.
+    Markup(LazyText),
     ListItem(LazyText),
     Heading {
         level: u8,
@@ -275,11 +232,8 @@ pub enum LogicalLineSource {
     },
     CodeBody(LazyText),
     Output(Text<'static>),
-    /// One row of a raw HTML block highlighted and cached as a complete block.
-    Html {
-        block: Rc<MarkdownHtml>,
-        row_idx: usize,
-    },
+    /// One row of a raw HTML block.
+    Html(LazyText),
     Frontmatter {
         block: Rc<FrontmatterBlock>,
         row_idx: usize,
@@ -306,6 +260,8 @@ impl LogicalLineSource {
     fn lazy_text_mut(&mut self) -> Option<&mut LazyText> {
         match self {
             LogicalLineSource::Text(text)
+            | LogicalLineSource::Markup(text)
+            | LogicalLineSource::Html(text)
             | LogicalLineSource::ListItem(text)
             | LogicalLineSource::CodeBody(text)
             | LogicalLineSource::Heading { text, .. } => Some(text),
@@ -316,6 +272,8 @@ impl LogicalLineSource {
     fn lazy_text(&self) -> Option<&LazyText> {
         match self {
             LogicalLineSource::Text(text)
+            | LogicalLineSource::Markup(text)
+            | LogicalLineSource::Html(text)
             | LogicalLineSource::ListItem(text)
             | LogicalLineSource::CodeBody(text)
             | LogicalLineSource::Heading { text, .. } => Some(text),
@@ -440,7 +398,7 @@ impl LogicalLine {
         let text = text.into();
         Self {
             wrap_prefix_width: source_quote_width(&text),
-            source: LogicalLineSource::Text(LazyText::markdown(text)),
+            source: LogicalLineSource::Markup(LazyText::markdown(text)),
             is_block_start,
             ..Self::default()
         }
@@ -484,9 +442,9 @@ impl LogicalLine {
     }
 
     /// Creates one row of a raw HTML block.
-    pub fn html(block: Rc<MarkdownHtml>, row_idx: usize, is_block_start: bool) -> Self {
+    pub fn html(text: impl Into<String>, is_block_start: bool) -> Self {
         Self {
-            source: LogicalLineSource::Html { block, row_idx },
+            source: LogicalLineSource::Html(LazyText::new(text, "html")),
             is_block_start,
             ..Self::default()
         }
@@ -537,26 +495,10 @@ impl LogicalLine {
         self.source.lazy_text()
     }
 
-    pub fn html_block(&self) -> Option<&Rc<MarkdownHtml>> {
-        match &self.source {
-            LogicalLineSource::Html { block, .. } => Some(block),
-            _ => None,
-        }
-    }
-
-    pub fn reuse_html_block(&mut self, cached: &Rc<MarkdownHtml>) {
-        if let LogicalLineSource::Html { block, .. } = &mut self.source {
-            if block.source() == cached.source() {
-                *block = Rc::clone(cached);
-            }
-        }
-    }
-
     /// Clears cached content so the next render uses the current theme.
     pub fn clear_cache(&self) {
         match &self.source {
             LogicalLineSource::TableRow { table, .. } => table.clear_cache(),
-            LogicalLineSource::Html { block, .. } => block.clear_cache(),
             LogicalLineSource::Frontmatter { block, .. } => block.clear_cache(),
             _ => {
                 if let Some(text) = self.lazy_text() {
@@ -655,6 +597,8 @@ impl LogicalLine {
     pub fn text_content(&self) -> String {
         match &self.source {
             LogicalLineSource::Text(text)
+            | LogicalLineSource::Markup(text)
+            | LogicalLineSource::Html(text)
             | LogicalLineSource::ListItem(text)
             | LogicalLineSource::CodeBody(text)
             | LogicalLineSource::Heading { text, .. } => text.text.clone(),
@@ -663,7 +607,6 @@ impl LogicalLine {
                 format!("{left} {}", right.trim_end())
             }
             LogicalLineSource::Output(text) => text.to_string(),
-            LogicalLineSource::Html { block, row_idx } => block.raw_line(*row_idx).to_owned(),
             LogicalLineSource::Frontmatter { block, row_idx } => {
                 block.raw_line(*row_idx).to_owned()
             }
@@ -787,9 +730,6 @@ impl LogicalLine {
     /// Renders text-identical content without syntax highlighting.
     fn render_plain_content(&self, ctx: &LineRenderContext<'_>) -> Line<'static> {
         match &self.source {
-            LogicalLineSource::Html { block, row_idx } => {
-                expand_tabs_in_line(Line::raw(block.raw_line(*row_idx).to_owned()))
-            }
             LogicalLineSource::Frontmatter { block, row_idx } => {
                 expand_tabs_in_line(Line::raw(block.raw_line(*row_idx).to_owned()))
             }
@@ -805,6 +745,8 @@ impl LogicalLine {
     fn render_content(&self, ctx: &LineRenderContext<'_>) -> Line<'static> {
         match &self.source {
             LogicalLineSource::Text(text)
+            | LogicalLineSource::Markup(text)
+            | LogicalLineSource::Html(text)
             | LogicalLineSource::ListItem(text)
             | LogicalLineSource::CodeBody(text)
             | LogicalLineSource::Heading { text, .. } => {
@@ -844,7 +786,6 @@ impl LogicalLine {
                 *cache = Some(rendered);
                 line
             }
-            LogicalLineSource::Html { block, row_idx } => block.line(*row_idx, ctx.theme),
             LogicalLineSource::Frontmatter { block, row_idx } => block.line(*row_idx, ctx.theme),
             LogicalLineSource::CodeInfo { left, right, style } => {
                 let prefix_width = self.prefix_width();
@@ -895,6 +836,95 @@ impl LogicalLine {
             self.is_running,
         );
     }
+}
+
+/// Returns line text eligible for batched syntax highlighting.
+fn batch_text(line: &LogicalLine) -> Option<&LazyText> {
+    match &line.source {
+        LogicalLineSource::Markup(text) | LogicalLineSource::Html(text) => Some(text),
+        _ => None,
+    }
+}
+
+/// Prepares cached line content for a logical range.
+pub(super) fn prepare_lines(
+    lines: &[LogicalLine],
+    range: Range<usize>,
+    ctx: &LineRenderContext<'_>,
+) -> usize {
+    let same_batch =
+        |left: &LogicalLine, right: &LogicalLine| match (batch_text(left), batch_text(right)) {
+            (Some(left), Some(right)) => left.language == right.language,
+            (None, None) => true,
+            _ => false,
+        };
+
+    let end = range.end.min(lines.len());
+    let mut start = range.start.min(end);
+    while start > 0
+        && start < end
+        && batch_text(&lines[start]).is_some()
+        && !lines[start].is_block_start
+        && same_batch(&lines[start - 1], &lines[start])
+    {
+        start -= 1;
+    }
+
+    let mut populated = 0;
+    for batch in lines[start..end].chunk_by(same_batch) {
+        if batch_text(&batch[0]).is_some() {
+            populated += prepare_syntax_batch(batch, ctx);
+        } else {
+            populated += batch
+                .iter()
+                .filter(|line| line.ensure_rendered(ctx))
+                .count();
+        }
+    }
+    populated
+}
+
+/// Highlights a same-language line batch once and fills its missing caches.
+fn prepare_syntax_batch(batch: &[LogicalLine], ctx: &LineRenderContext<'_>) -> usize {
+    if batch
+        .iter()
+        .all(|line| batch_text(line).is_some_and(|text| text.cached.borrow().is_some()))
+    {
+        return 0;
+    }
+
+    let source_len = batch
+        .iter()
+        .filter_map(batch_text)
+        .map(|text| text.text.len() + 1)
+        .sum();
+    let mut source = String::with_capacity(source_len);
+    for line in batch {
+        source.push_str(&batch_text(line).expect("syntax batch line").text);
+        source.push('\n');
+    }
+
+    let mut populated = 0;
+    let mut rendered = ctx
+        .theme
+        .highlight(
+            &source,
+            &batch_text(&batch[0]).expect("syntax batch line").language,
+        )
+        .lines
+        .into_iter();
+    for line in batch {
+        let text = batch_text(line).expect("syntax batch line");
+        let rendered_line = rendered
+            .next()
+            .unwrap_or_else(|| Line::raw(text.text.clone()));
+        let mut cache = text.cached.borrow_mut();
+        if cache.is_none() {
+            *cache = Some(Text::from(expand_tabs_in_line(rendered_line)));
+            populated += 1;
+        }
+    }
+    populated
 }
 
 /// Prepends gutter "▎". Priority: running > active > status > inactive.
@@ -972,8 +1002,7 @@ fn render_table(
     }
 
     let n = table.headers.len();
-    let min_col_width = 3usize; // enough for "…"
-                                // Table frame overhead: left border + right border + n separators between columns.
+    let min_col_width = 3usize;
     let frame_overhead = 3 * n + 1;
 
     let natural_widths: Vec<usize> = (0..n)
@@ -1703,12 +1732,13 @@ mod tests {
     fn source_label(line: &LogicalLine) -> String {
         match &line.source {
             LogicalLineSource::Text(_) => "Text".to_string(),
+            LogicalLineSource::Markup(_) => "Markup".to_string(),
             LogicalLineSource::ListItem(_) => "ListItem".to_string(),
             LogicalLineSource::Heading { level, .. } => format!("Heading({level})"),
             LogicalLineSource::CodeInfo { .. } => "CodeInfo".to_string(),
             LogicalLineSource::CodeBody(_) => "CodeBody".to_string(),
             LogicalLineSource::Output(_) => "Output".to_string(),
-            LogicalLineSource::Html { .. } => "Html".to_string(),
+            LogicalLineSource::Html(_) => "Html".to_string(),
             LogicalLineSource::Frontmatter { .. } => "Frontmatter".to_string(),
             LogicalLineSource::TableRow { .. } => "Table".to_string(),
             LogicalLineSource::Image { .. } => "Image".to_string(),
@@ -1738,6 +1768,19 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn test_prepare_lines_batches_adjacent_markup_blocks() {
+        let lines = vec![
+            LogicalLine::markup_text("# Heading", true),
+            LogicalLine::markup_text("paragraph", true),
+            LogicalLine::markup_text("> quote", true),
+        ];
+        let theme = test_theme();
+        let populated = prepare_lines(&lines, 0..lines.len(), &test_ctx(&theme, 80));
+
+        assert_eq!(populated, 3);
     }
 
     #[test]
