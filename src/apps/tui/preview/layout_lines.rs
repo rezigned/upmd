@@ -5,7 +5,7 @@ use crate::apps::config::{PREVIEW_CODE_WRAP_OVERHEAD, PREVIEW_FRAME_OVERHEAD};
 use crate::apps::theme::Theme;
 use crate::runner::CodeId;
 
-use crate::apps::tui::markdown::{apply_gutter, LogicalLine, RenderContext};
+use crate::apps::tui::markdown::{apply_gutter, LineRenderContext, LogicalLine};
 use crate::apps::tui::wrap::{slice_line, wrap_ranges};
 
 /// Width-dependent slice of a logical line occupying one terminal row.
@@ -42,7 +42,7 @@ impl LayoutLine {
     pub fn render_plain(
         &self,
         logical_line: &LogicalLine,
-        ctx: &RenderContext<'_>,
+        ctx: &LineRenderContext<'_>,
     ) -> ratatui::text::Line<'static> {
         if logical_line.is_image() && self.is_continuation() {
             return ratatui::text::Line::raw("");
@@ -63,7 +63,7 @@ impl LayoutLine {
         &self,
         logical_line: &LogicalLine,
         rendered_line: &ratatui::text::Line<'static>,
-        ctx: &RenderContext<'_>,
+        ctx: &LineRenderContext<'_>,
     ) -> ratatui::text::Line<'static> {
         if logical_line.is_image() && self.is_continuation() {
             return ratatui::text::Line::raw("");
@@ -145,7 +145,7 @@ impl LayoutLines {
             return None;
         }
         self.last_width.set(width);
-        let ctx = RenderContext {
+        let ctx = LineRenderContext {
             theme,
             active_code_id: None,
             prefer_status_gutter: None,
