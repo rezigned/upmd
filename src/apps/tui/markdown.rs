@@ -280,6 +280,11 @@ impl LogicalLineSource {
             _ => None,
         }
     }
+
+    /// Returns true for raw source rendered by a syntax highlighter.
+    fn is_syntax_source(&self) -> bool {
+        matches!(self, Self::Markup(_) | Self::Html(_) | Self::CodeBody(_))
+    }
 }
 
 /// Source byte-offset anchor for a rendered line, used to remap the
@@ -639,15 +644,31 @@ impl LogicalLine {
         self.render_with(ctx, false)
     }
 
-    /// Populates the content cache without applying viewport-dependent paint.
-    pub fn ensure_rendered(&self, ctx: &LineRenderContext<'_>) -> bool {
-        if let Some(text) = self.lazy_text() {
-            if text.cached.borrow().is_none() {
-                drop(self.render_content(ctx));
-                return true;
-            }
+    /// Populates this line's reusable content cache if it is empty.
+    fn ensure_content_cached(&self, ctx: &LineRenderContext<'_>) -> bool {
+        let Some(text) = self.lazy_text() else {
+            return false;
+        };
+        if text.cached.borrow().is_some() {
+            return false;
         }
-        false
+
+        let mut rendered = if self.source.is_syntax_source() {
+            ctx.theme.highlight(&text.text, &text.language)
+        } else {
+            let line = match &self.source {
+                LogicalLineSource::Heading { .. } => render_heading_spans(&text.spans, ctx.theme),
+                _ => {
+                    render_inline_spans(&text.spans, "", ctx.theme.markdown_text_style(), ctx.theme)
+                }
+            };
+            Text::from(line)
+        };
+        for line in &mut rendered.lines {
+            *line = expand_tabs_in_line(std::mem::take(line));
+        }
+        *text.cached.borrow_mut() = Some(rendered);
+        true
     }
 
     fn render_with(&self, ctx: &LineRenderContext<'_>, highlight: bool) -> Line<'static> {
@@ -750,65 +771,17 @@ impl LogicalLine {
             | LogicalLineSource::ListItem(text)
             | LogicalLineSource::CodeBody(text)
             | LogicalLineSource::Heading { text, .. } => {
-                let mut cache = text.cached.borrow_mut();
-                if let Some(hit) = &*cache {
-                    return hit
-                        .lines
-                        .first()
-                        .cloned()
-                        .unwrap_or_else(|| expand_tabs_in_line(Line::raw(text.text.clone())));
-                }
-
-                let mut rendered = if text.spans.is_empty() {
-                    ctx.theme.highlight(&text.text, &text.language)
-                } else {
-                    let line = match self.source {
-                        LogicalLineSource::Heading { .. } => {
-                            render_heading_spans(&text.spans, ctx.theme)
-                        }
-                        _ => render_inline_spans(
-                            &text.spans,
-                            "",
-                            ctx.theme.markdown_text_style(),
-                            ctx.theme,
-                        ),
-                    };
-                    Text::from(line)
-                };
-                for line in &mut rendered.lines {
-                    *line = expand_tabs_in_line(std::mem::take(line));
-                }
-                let line = rendered
-                    .lines
-                    .first()
+                self.ensure_content_cached(ctx);
+                let cache = text.cached.borrow();
+                cache
+                    .as_ref()
+                    .and_then(|cached| cached.lines.first())
                     .cloned()
-                    .unwrap_or_else(|| expand_tabs_in_line(Line::raw(text.text.clone())));
-                *cache = Some(rendered);
-                line
+                    .unwrap_or_else(|| expand_tabs_in_line(Line::raw(text.text.clone())))
             }
             LogicalLineSource::Frontmatter { block, row_idx } => block.line(*row_idx, ctx.theme),
             LogicalLineSource::CodeInfo { left, right, style } => {
-                let prefix_width = self.prefix_width();
-                let wrap_width = ctx
-                    .viewport_width
-                    .saturating_sub(crate::apps::config::PREVIEW_CODE_WRAP_OVERHEAD + prefix_width)
-                    .max(1);
-                let mut spans: Vec<Span<'static>> = left
-                    .iter()
-                    .map(|(text, style)| Span::styled(text.clone(), *style))
-                    .collect();
-                if self.is_running {
-                    spans.push(Span::styled(
-                        format!(" {}", ctx.spinner_char),
-                        ctx.theme.active_fg_style(),
-                    ));
-                }
-                let left_chars: usize = spans.iter().map(|span| span.content.chars().count()).sum();
-                let right_chars = right.chars().count();
-                let gap = wrap_width.saturating_sub(left_chars + right_chars).max(1);
-                spans.push(Span::styled(" ".repeat(gap), *style));
-                spans.push(Span::styled(right.clone(), *style));
-                Line::from(spans).style(*style)
+                self.render_code_info(left, right, *style, ctx)
             }
             LogicalLineSource::Output(text) => {
                 text.lines.first().cloned().unwrap_or_else(|| Line::raw(""))
@@ -819,6 +792,37 @@ impl LogicalLine {
             }
             LogicalLineSource::ThematicBreak | LogicalLineSource::Newline => Line::raw(""),
         }
+    }
+
+    /// Renders the width-dependent code block header and running spinner.
+    fn render_code_info(
+        &self,
+        left: &[(String, Style)],
+        right: &str,
+        style: Style,
+        ctx: &LineRenderContext<'_>,
+    ) -> Line<'static> {
+        let wrap_width = ctx
+            .viewport_width
+            .saturating_sub(crate::apps::config::PREVIEW_CODE_WRAP_OVERHEAD + self.prefix_width())
+            .max(1);
+        let mut spans: Vec<Span<'static>> = left
+            .iter()
+            .map(|(text, style)| Span::styled(text.clone(), *style))
+            .collect();
+        if self.is_running {
+            spans.push(Span::styled(
+                format!(" {}", ctx.spinner_char),
+                ctx.theme.active_fg_style(),
+            ));
+        }
+        let left_chars: usize = spans.iter().map(|span| span.content.chars().count()).sum();
+        let gap = wrap_width
+            .saturating_sub(left_chars + right.chars().count())
+            .max(1);
+        spans.push(Span::styled(" ".repeat(gap), style));
+        spans.push(Span::styled(right.to_owned(), style));
+        Line::from(spans).style(style)
     }
 
     /// Adds a gutter indicator for highlightable lines.
@@ -877,7 +881,7 @@ pub(super) fn prepare_lines(
         } else {
             populated += batch
                 .iter()
-                .filter(|line| line.ensure_rendered(ctx))
+                .filter(|line| line.ensure_content_cached(ctx))
                 .count();
         }
     }
@@ -1985,9 +1989,9 @@ mod tests {
         let cached = &line.lazy_text().expect("expected lazy text").cached;
         assert!(cached.borrow().is_none());
 
-        assert!(line.ensure_rendered(&ctx));
+        assert!(line.ensure_content_cached(&ctx));
         assert!(cached.borrow().is_some());
-        assert!(!line.ensure_rendered(&ctx));
+        assert!(!line.ensure_content_cached(&ctx));
     }
 
     #[test]
