@@ -8,12 +8,21 @@ use std::process::Command;
 
 #[cfg(unix)]
 #[test]
-fn cli_block_yes_prints_pty_output_before_exit() {
+fn cli_block_prints_pty_output_tail_before_exit() {
     let tmp = tempfile::tempdir().expect("create temp dir");
     std::fs::write(tmp.path().join("listed-file.txt"), "").expect("create listed file");
 
     let markdown = tmp.path().join("case.md");
-    std::fs::write(&markdown, "```shell\nls\n```\n").expect("write markdown");
+    std::fs::write(
+        &markdown,
+        r#"```shell
+for i in $(seq 1 5000); do printf 'line-%04d\n' "$i"; done
+ls
+printf 'FINAL-PTY-TAIL\n'
+```
+"#,
+    )
+    .expect("write markdown");
 
     let output = Command::new(env!("CARGO_BIN_EXE_upmd"))
         .arg(&markdown)
@@ -32,6 +41,10 @@ fn cli_block_yes_prints_pty_output_before_exit() {
     assert!(
         stdout.contains("listed-file.txt"),
         "CLI output should include PTY stdout\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("FINAL-PTY-TAIL"),
+        "CLI output should include the final PTY output\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
 }
 

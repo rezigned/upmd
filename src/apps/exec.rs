@@ -3,14 +3,13 @@
 //! Owns the per-code-block output state and provides shared functions
 //! for running code, processing PTY output streams, and reloading documents.
 
-use std::path::PathBuf;
+use std::{collections::HashMap, path::PathBuf};
 
 use crossbeam_channel::Receiver;
 
 use crate::apps::config::Envs;
 use crate::apps::task::Task;
 use crate::{pty::process::Size as PtySize, pty::stream::Stream, runner};
-use std::collections::HashMap;
 use upmd_parser::{nodes, CodeId};
 use upmd_runtime::Cmd;
 
@@ -104,19 +103,22 @@ pub fn merge_envs(dest: &mut Envs, captured: &Envs) {
 
 /// Creates a stream command that forwards process output and control separately.
 ///
-/// PTY output can be effectively infinite (`yes` is the canonical case), so
-/// `Out` is best-effort on the low-priority queue. Lifecycle/state messages go
-/// to the high-priority queue so `Exit`/`End` cannot sit behind stale output.
+/// PTY output uses the bounded low-priority queue, which applies backpressure
+/// instead of dropping chunks. Lifecycle/state messages use the high-priority
+/// queue so the runtime handles them before already-queued output.
 pub fn stream_rx<M: Send + 'static>(
     id: CodeId,
     rx: Receiver<Stream>,
     mk_msg: impl Fn(CodeId, Stream) -> M + Send + 'static,
 ) -> Cmd<M> {
     Cmd::priority_stream(move |output_tx, control_tx| {
-        while let Ok(msg) = rx.recv() {
-            if matches!(msg, Stream::Out(_)) {
-                let _ = output_tx.try_send(mk_msg(id, msg));
-            } else if control_tx.send(mk_msg(id, msg)).is_err() {
+        while let Ok(stream) = rx.recv() {
+            let sender = if matches!(stream, Stream::Out(_)) {
+                &output_tx
+            } else {
+                &control_tx
+            };
+            if sender.send(mk_msg(id, stream)).is_err() {
                 break;
             }
         }
