@@ -29,8 +29,8 @@ pub const PTY_DEFAULT_ROWS: u16 = 24;
 /// Height of the footer row in the full-screen output view.
 pub const OUTPUT_FOOTER_HEIGHT: u16 = 1;
 
-/// Stream channel capacity (1000 messages).
-pub const STREAM_CHANNEL_SIZE: usize = 1000;
+/// Capacity of the raw PTY stream channel (`0` for rendezvous backpressure).
+pub const STREAM_CHANNEL_SIZE: usize = 0;
 
 // Preview layout constants
 
