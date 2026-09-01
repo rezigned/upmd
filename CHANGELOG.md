@@ -1,4 +1,10 @@
-## [0.2.6]
+## [v0.2.7]
+
+### 🐛 Bug Fixes
+
+- *(exec)* Preserve PTY output under backpressure (#39)
+- *(changelog)* Pass v-prefixed tag to pre-release hook
+## [v0.2.6]
 
 ### 🐛 Bug Fixes
 
@@ -12,6 +18,10 @@
 ### ⚡ Performance
 
 - *(tui)* Batch and reuse syntax highlights (#35)
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* Bump version to 0.2.6 (#38)
 ## [v0.2.5]
 
 ### 🚀 Features
