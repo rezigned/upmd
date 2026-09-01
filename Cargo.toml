@@ -1,7 +1,7 @@
 [package]
 name = "upmd"
 description = "Run tasks and dependency-aware workflows from Markdown in a real terminal"
-version = "0.2.6"
+version = "0.2.7"
 edition = "2021"
 rust-version = "1.82"
 repository = "https://github.com/rezigned/upmd"
@@ -79,7 +79,7 @@ consolidate-commits = false
 tag-name = "v{{version}}"
 tag-message = "{{version}}"
 pre-release-commit-message = "chore(release): bump version to {{version}}"
-pre-release-hook = ["git", "cliff", "-o", "CHANGELOG.md", "--tag", "{{version}}"]
+pre-release-hook = ["git", "cliff", "-o", "CHANGELOG.md", "--tag", "v{{version}}"]
 publish = false
 
 # Config for 'cargo-dist'
