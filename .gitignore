@@ -11,3 +11,6 @@ target
 
 # Others
 .DS_Store
+
+# Nix build result
+/result
