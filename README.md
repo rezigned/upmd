@@ -48,6 +48,45 @@ brew install rezigned/tap/upmd
 cargo install --git https://github.com/rezigned/upmd.git
 ```
 
+**Nix**
+
+*Flakes*  
+You can try it in the shell without needing to install it first.
+```bash
+# Requires experimental features `flakes` and `nix-command` enabled
+nix run github:rezigned/upmd -- DEMO.md
+```
+
+Install it temporarily in your shell
+```bash
+nix shell github:rezigned/upmd
+```
+
+
+*NixOS*  
+Install on NixOS as an overlay
+```nix
+{
+  inputs = {
+    nixpkgs.url = "https://channels.nixos.org/nixpkgs-unstable/nixexprs.tar.zst";
+
+    upmd.url = "github:rezigned/upmd";
+    upmd.inputs.nixpkgs.follows = "nixpkgs";
+  };
+  
+  # NixOS Configurations...
+}
+```
+
+In your `configuration.nix`
+```nix
+{inputs, pkgs, ...}: {
+  nixpkgs.overlays = [inputs.upmd.overlays.default];
+  environment.systemPackages = [pkgs.upmd];
+}
+```
+
+
 ## Quick start
 
 ```bash
