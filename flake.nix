@@ -46,5 +46,10 @@
             echo "Welcome to the upmd development environment!"
           '';
         };
-      });
+      })
+    // {
+      overlays.default = final: prev: {
+        upmd = prev.callPackage ./default.nix {};
+      };
+    };
 }
