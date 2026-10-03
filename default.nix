@@ -1,8 +1,8 @@
 {
   pkgs ? import <nixpkgs> {},
   lib ? pkgs.lib,
-  rustPlatform,
-  python3,
+  rustPlatform ? pkgs.rustPlatform,
+  python3 ? pkgs.python3,
 }: let
   manifest = lib.importTOML ./Cargo.toml;
 in
@@ -10,7 +10,7 @@ in
     pname = manifest.package.name;
     version = manifest.package.version;
 
-    nativeBuildInputs = [
+    nativeCheckInputs = [
       # Needed for test:
       # runner::tests::unix::test_python_state_capture_roundtrip
       python3
@@ -22,6 +22,9 @@ in
     cargoLock.outputHashes = {
       "vt100-0.16.2" = "sha256-18opt/6FxwTx1CfWUEUm3QajujJvddBdvFDkRpopTtE=";
     };
+
+    # Uncomment when debugging
+    # buildType = "debug";
 
     checkFlags = [
       # FIXME: Skipped because NixOS is not guaranteed to have /bin/bash,
