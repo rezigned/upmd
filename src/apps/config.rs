@@ -2,7 +2,7 @@ use crate::apps::theme::Theme;
 use keymap::{DerivedConfig, KeyMapConfig};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub const LOGO: [&str; 4] = [
     "                   ▄",
@@ -581,6 +581,13 @@ impl UserConfig {
     }
 }
 
+/// Working-directory selection for code execution.
+#[derive(Debug, Clone)]
+pub enum WorkingDir {
+    Auto,
+    Path(PathBuf),
+}
+
 /// Merged application configuration from CLI arguments, user config, and defaults.
 #[derive(Debug, Default, Clone)]
 pub struct Config {
@@ -600,7 +607,7 @@ pub struct Config {
     /// Per-language binary overrides.
     pub binaries: HashMap<String, upmd_runner::RunnerOptions>,
     /// Working directory for code execution.
-    pub working_dir: Option<PathBuf>,
+    pub working_dir: Option<WorkingDir>,
 }
 
 pub type Envs = BTreeMap<String, String>;
@@ -623,10 +630,24 @@ pub struct ConfigArgs {
     pub transparent: bool,
     pub keymap: KeymapConfig,
     pub binaries: HashMap<String, upmd_runner::RunnerOptions>,
-    pub working_dir: Option<PathBuf>,
+    pub working_dir: Option<WorkingDir>,
 }
 
 impl Config {
+    /// Resolves the configured directory against the active Markdown file.
+    pub fn resolve_working_dir(&self) -> Option<PathBuf> {
+        match self.working_dir.as_ref()? {
+            WorkingDir::Auto => self.file.as_deref().map(|file| {
+                Path::new(file)
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .unwrap_or_else(|| Path::new("."))
+                    .to_path_buf()
+            }),
+            WorkingDir::Path(path) => Some(path.clone()),
+        }
+    }
+
     pub fn new(args: ConfigArgs) -> Self {
         Self {
             theme: Theme::new(&args.theme, args.transparent),

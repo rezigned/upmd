@@ -87,8 +87,7 @@ impl App {
         // see mutations from prior blocks (like cd or export).
         let envs = std::env::vars().collect();
         let cwd = config
-            .working_dir
-            .clone()
+            .resolve_working_dir()
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
 
         Self {
@@ -143,6 +142,10 @@ impl App {
                     return Some(Cmd::quit());
                 }
                 self.picker = None;
+                self.config.file = Some(path.display().to_string());
+                if let Some(cwd) = self.config.resolve_working_dir() {
+                    self.cwd = cwd;
+                }
             }
             Err(err) => {
                 // In picker mode, errors are fatal since there's no

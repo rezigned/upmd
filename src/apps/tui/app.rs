@@ -60,7 +60,7 @@ pub struct App {
     file_picker_root: Option<PathBuf>,
     output: tui::output::Output,
     workflow: WorkflowState,
-    last_cwd: Option<PathBuf>,
+    cwd: Option<PathBuf>,
     started: bool,
     /// Transient flash notification at the bottom right.
     notification: Option<tui::notification::FlashMessage>,
@@ -160,7 +160,9 @@ impl App {
             file_picker_root: None,
             output: tui::output::Output::new(config.keymap.output()),
             workflow: WorkflowState::default(),
-            last_cwd: None,
+            cwd: config
+                .resolve_working_dir()
+                .or_else(|| std::env::current_dir().ok()),
             notification: None,
             started: false,
         }
@@ -181,10 +183,7 @@ impl App {
                 envs,
                 self.config.capture_state,
                 &self.config.binaries,
-                self.config
-                    .working_dir
-                    .clone()
-                    .or_else(|| self.last_cwd.clone()),
+                self.cwd.clone(),
             )
             .map(|receiver| exec::stream_rx(id, receiver, Msg::StreamUpdate));
 
@@ -333,7 +332,7 @@ impl App {
                 self.envs.merge_envs(env);
             }
             if let Some(cwd) = cwd {
-                self.last_cwd = Some(cwd);
+                self.cwd = Some(cwd);
             }
             return;
         }
@@ -347,7 +346,7 @@ impl App {
                 self.envs.merge_envs(envs);
             }
             if let Some(cwd) = state.cwd {
-                self.last_cwd = Some(cwd);
+                self.cwd = Some(cwd);
             }
         }
     }
@@ -1342,6 +1341,9 @@ impl App {
                 match self.load_document(doc) {
                     Ok(()) => {
                         self.config.file = Some(path.display().to_string());
+                        if let Some(cwd) = self.config.resolve_working_dir() {
+                            self.cwd = Some(cwd);
+                        }
                         self.overlay = None;
                         self.view = View::Home;
                     }

@@ -1,8 +1,6 @@
-use std::path::PathBuf;
-
 use clap::{ArgAction, Parser};
 
-use crate::apps::config::{Config, ConfigArgs, UserConfig};
+use crate::apps::config::{Config, ConfigArgs, UserConfig, WorkingDir};
 
 /// Run code blocks from Markdown in the terminal.
 #[derive(Parser, Debug)]
@@ -23,7 +21,7 @@ pub struct Args {
     #[arg(long, default_value_t = false)]
     pub ci: bool,
 
-    /// Working directory for code execution (default: current directory).
+    /// Initial working directory for code execution (:auto uses the Markdown file's directory).
     #[arg(short = 'd', long, value_name = "DIR")]
     pub working_dir: Option<String>,
 
@@ -91,7 +89,10 @@ impl From<Args> for Config {
 /// CLI flags explicitly set by the user take precedence over the config file.
 pub fn build_config(args: Args, user_cfg: UserConfig) -> Config {
     let theme = args.theme.unwrap_or_else(|| user_cfg.theme().to_string());
-    let working_dir = args.working_dir.map(PathBuf::from);
+    let working_dir = args.working_dir.map(|dir| match dir.as_str() {
+        ":auto" => WorkingDir::Auto,
+        _ => WorkingDir::Path(dir.into()),
+    });
     let transparent = args
         .tui_args
         .transparent

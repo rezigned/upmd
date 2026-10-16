@@ -50,6 +50,30 @@ printf 'FINAL-PTY-TAIL\n'
 
 #[cfg(unix)]
 #[test]
+fn auto_working_directory_uses_markdown_parent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let docs = tmp.path().join("docs");
+    std::fs::create_dir(&docs).unwrap();
+    std::fs::write(docs.join("marker.txt"), "markdown-directory\n").unwrap();
+    std::fs::write(docs.join("run.md"), "```sh\ncat marker.txt\n```\n").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_upmd"))
+        .current_dir(tmp.path())
+        .args(["docs/run.md", "--ci", "-b", "1", "-d", ":auto"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    assert!(
+        stdout.lines().any(|line| line == "markdown-directory"),
+        "{stdout}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn missing_block_fails_before_either_frontend_starts() {
     let tmp = tempfile::tempdir().expect("create temp dir");
     let markdown = tmp.path().join("case.md");

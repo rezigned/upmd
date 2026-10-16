@@ -104,9 +104,12 @@ upmd --ci --all README.md
 ```
 
 > [!TIP]
-> With no path, `upmd` opens `up.md` or `UP.md` from the current directory when either is present. Otherwise, it opens the current-directory file picker. Directories are searched recursively, while piped stdin is read as Markdown. A failed task or startup error produces a non-zero exit status.
+> No path: opens `up.md`/`UP.md` or the file picker. Directory searches are recursive. Piped stdin is Markdown.
 
 Run `upmd --help` for all command-line options.
+
+> [!TIP]
+> Tasks start in the current directory by default. Use `-d DIR` to choose an initial directory, or `-d :auto` to use the Markdown file's directory. For stdin, `:auto` uses the current directory.
 
 ## Tasks and workflows
 
