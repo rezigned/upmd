@@ -2933,6 +2933,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "unicode-segmentation",
  "unicode-width",
  "upmd-parser",
  "upmd-pty",

@@ -208,25 +208,33 @@ impl FilePicker {
     }
 
     /// Builds styled list rows for the visible match window.
-    fn visible_match_items(&self, height: u16) -> Vec<ratatui::widgets::ListItem<'static>> {
+    fn visible_match_lines(&self, height: u16) -> Vec<Line<'static>> {
         let range = self.visible_match_range(height);
-        self.state.matches[range.clone()]
-            .iter()
-            .enumerate()
-            .filter_map(|(offset, file_idx)| {
-                let abs = range.start + offset;
+        let path_color = self.theme.foreground;
+        let match_color = self.theme.accent;
+
+        range
+            .clone()
+            .zip(self.state.matches[range].iter())
+            .map(|(abs, file_idx)| {
                 let is_selected = abs == self.state.selected;
-                let file = self.state.files.get(*file_idx)?;
                 let prefix = if is_selected { "▸ " } else { "  " };
-                let fg = if is_selected {
+                let prefix_color = if is_selected {
                     self.theme.active
                 } else {
-                    self.theme.foreground
+                    path_color
                 };
-                Some(ratatui::widgets::ListItem::new(Line::from(Span::styled(
-                    format!("{prefix}{}", file.display),
-                    Style::default().fg(fg),
-                ))))
+
+                let mut spans = vec![Span::styled(prefix, Style::default().fg(prefix_color))];
+
+                spans.extend(self.state.highlight_parts(*file_idx).into_iter().map(
+                    |(text, matched)| {
+                        let color = if matched { match_color } else { path_color };
+                        Span::styled(text.to_string(), Style::default().fg(color))
+                    },
+                ));
+
+                Line::from(spans)
             })
             .collect()
     }
@@ -361,7 +369,7 @@ impl Output for FilePicker {
         };
 
         frame.render_widget(
-            List::new(self.visible_match_items(list_area.height)),
+            List::new(self.visible_match_lines(list_area.height)),
             list_area,
         );
 
@@ -396,17 +404,43 @@ mod tests {
     }
 
     #[test]
-    fn filters_by_display_path() {
+    fn filters_paths_correctly() {
         let mut picker = picker();
         let _ = picker.update(Action::Input('d'));
         assert_eq!(picker.state.matches, vec![1, 0]);
+
         for ch in "inst".chars() {
             let _ = picker.update(Action::Input(ch));
         }
+
         assert_eq!(picker.state.matches.len(), 1);
         assert_eq!(
             picker.selected_path().unwrap(),
             Path::new("/repo/docs/install.md")
+        );
+    }
+
+    #[test]
+    fn highlights_graphemes_and_clears() {
+        let mut picker = picker();
+        picker.state.files[0].display = "ca\tfe\u{301}.md".into();
+        picker.state.query = "ce".into();
+        picker.state.rebuild();
+        assert_eq!(
+            picker.state.highlight_parts(0),
+            [
+                ("c", true),
+                ("a\tf", false),
+                ("e\u{301}", true),
+                (".md", false)
+            ]
+        );
+
+        let _ = picker.update(Action::Delete);
+        let _ = picker.update(Action::Delete);
+        assert_eq!(
+            picker.state.highlight_parts(0),
+            [("ca\tfe\u{301}.md", false)]
         );
     }
 
