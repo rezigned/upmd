@@ -61,6 +61,7 @@ vt100 = "0.16.2"
 arboard = "3.6.1"
 ignore = "0.4"
 tempfile = "3.27"
+nucleo-matcher = "0.3.1"
 
 [dev-dependencies]
 insta = "1.47.2"

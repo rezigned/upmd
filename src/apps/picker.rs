@@ -1,4 +1,6 @@
 use keymap::KeyMap;
+use nucleo_matcher::pattern::{Atom, AtomKind, CaseMatching, Normalization};
+use nucleo_matcher::{Config, Matcher, Utf32Str};
 
 /// Actions shared by the TUI and CLI file pickers.
 ///
@@ -27,7 +29,7 @@ pub enum PickerAction {
     Input(char),
 }
 
-/// Shared state for file pickers: the file list, filter query, filtered
+/// Shared state for file pickers: the file list, filter query, ranked
 /// matches, and current selection index.
 ///
 /// Both the TUI [`FilePicker`](crate::apps::tui::file_picker::FilePicker) and
@@ -39,6 +41,9 @@ pub struct PickerState {
     pub matches: Vec<usize>,
     pub query: String,
     pub selected: usize,
+    matcher: Matcher,
+    /// Reused UTF-32 buffer for non-ASCII display paths.
+    scratch: Vec<char>,
 }
 
 impl PickerState {
@@ -48,29 +53,48 @@ impl PickerState {
             matches: Vec::new(),
             query: String::new(),
             selected: 0,
+            matcher: Matcher::new(Config::DEFAULT.match_paths()),
+            scratch: Vec::new(),
         };
         state.rebuild();
         state
     }
 
-    /// Recomputes `matches` from `query` and clamps `selected`.
+    /// Recomputes `matches` from `query` and selects the best match.
     pub fn rebuild(&mut self) {
         self.matches = self.build_matches();
-        self.selected = self.selected.min(self.matches.len().saturating_sub(1));
+        self.selected = 0;
     }
 
-    /// Returns indices into `files` whose display path contains `query`
-    /// (case-insensitive).  An empty query matches everything.
-    pub fn build_matches(&self) -> Vec<usize> {
-        let query = self.query.to_lowercase();
-        self.files
-            .iter()
-            .enumerate()
-            .filter(|(_, file)| {
-                self.query.is_empty() || file.display.to_lowercase().contains(&query)
-            })
-            .map(|(idx, _)| idx)
-            .collect()
+    /// Returns indices into `files` whose display path fuzzy-matches `query`,
+    /// best score first. Equal scores fall back to display order, then file index.
+    fn build_matches(&mut self) -> Vec<usize> {
+        if self.query.is_empty() {
+            return (0..self.files.len()).collect();
+        }
+
+        let atom = Atom::new(
+            &self.query,
+            CaseMatching::Ignore,
+            Normalization::Smart,
+            AtomKind::Fuzzy,
+            false,
+        );
+        let mut scored = Vec::new();
+        for (idx, file) in self.files.iter().enumerate() {
+            let haystack = Utf32Str::new(&file.display, &mut self.scratch);
+            if let Some(score) = atom.score(haystack, &mut self.matcher) {
+                scored.push((idx, score));
+            }
+        }
+
+        scored.sort_by(|&(a_idx, a_score), &(b_idx, b_score)| {
+            b_score
+                .cmp(&a_score)
+                .then_with(|| self.files[a_idx].display.cmp(&self.files[b_idx].display))
+                .then_with(|| a_idx.cmp(&b_idx))
+        });
+        scored.into_iter().map(|(idx, _)| idx).collect()
     }
 
     /// Returns the index into `files` of the currently selected match, or
@@ -93,8 +117,9 @@ impl PickerState {
                 true
             }
             PickerAction::Delete => {
-                self.query.pop();
-                self.rebuild();
+                if self.query.pop().is_some() {
+                    self.rebuild();
+                }
                 true
             }
             PickerAction::Next => {

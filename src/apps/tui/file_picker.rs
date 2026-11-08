@@ -398,8 +398,11 @@ mod tests {
     #[test]
     fn filters_by_display_path() {
         let mut picker = picker();
-        let _ = picker.update(Action::Input('i'));
-        let _ = picker.update(Action::Input('n'));
+        let _ = picker.update(Action::Input('d'));
+        assert_eq!(picker.state.matches, vec![1, 0]);
+        for ch in "inst".chars() {
+            let _ = picker.update(Action::Input(ch));
+        }
         assert_eq!(picker.state.matches.len(), 1);
         assert_eq!(
             picker.selected_path().unwrap(),
@@ -447,6 +450,7 @@ mod tests {
         let _ = picker.update(Action::Input('z'));
         assert!(picker.state.matches.is_empty());
         assert_eq!(picker.selected_path(), None);
+        assert!(picker.update(Action::Select).is_none());
 
         let _ = picker.update(Action::Delete);
         assert_eq!(picker.state.matches.len(), 2);
@@ -461,6 +465,11 @@ mod tests {
         let mut picker = picker();
         let _ = picker.update(Action::Next);
         let _ = picker.update(Action::Next);
+        assert_eq!(
+            picker.selected_path().unwrap(),
+            Path::new("/repo/docs/install.md")
+        );
+        let _ = picker.update(Action::Delete);
         assert_eq!(
             picker.selected_path().unwrap(),
             Path::new("/repo/docs/install.md")
