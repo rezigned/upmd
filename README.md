@@ -34,10 +34,10 @@
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/rezigned/upmd/releases/latest/download/upmd-installer.sh | sh
 ```
 
-**Homebrew (macOS)**
+**Homebrew (macOS and Linux)**
 
 ```bash
-brew install rezigned/tap/upmd
+brew install upmd
 ```
 
 **Windows and archives:** Download a prebuilt archive and checksum from the [latest release](https://github.com/rezigned/upmd/releases/latest). Builds are available for macOS, Linux, and Windows on supported x86_64 and ARM64 platforms.
