@@ -662,6 +662,7 @@ impl App {
         let reset = "\x1b[0m";
         let muted = ansi_fg(self.theme.muted);
         let active = ansi_fg(self.theme.active);
+        let match_color = ansi_fg(self.theme.accent);
         let inactive = ansi_fg(self.theme.info_background);
         let foreground = ansi_fg(self.theme.foreground);
         let mut lines: u16 = 0;
@@ -689,17 +690,14 @@ impl App {
         } else {
             for (i, &file_idx) in picker.matches.iter().enumerate() {
                 let is_sel = i == picker.selected;
-                let file = &picker.files[file_idx];
-                if is_sel {
-                    write!(
-                        out,
-                        "{active}\u{25b8} {}  {}{reset}\r\n",
-                        i + 1,
-                        file.display
-                    )?;
-                } else {
-                    write!(out, "{foreground}  {}  {}{reset}\r\n", i + 1, file.display)?;
+                let prefix_color = if is_sel { &active } else { &foreground };
+                let prefix = if is_sel { "\u{25b8} " } else { "  " };
+                write!(out, "{prefix_color}{prefix}{}  ", i + 1)?;
+                for (text, matched) in picker.highlight_parts(file_idx) {
+                    let color = if matched { &match_color } else { &foreground };
+                    write!(out, "{color}{text}")?;
                 }
+                write!(out, "{reset}\r\n")?;
                 lines += 1;
             }
         }

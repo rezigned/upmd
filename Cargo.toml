@@ -55,12 +55,14 @@ ratatui-image = { version = "11.0.6", default-features = false, features = ["cro
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 syntect = "5.3.0"
 unicode-width = { version = "0.2.2", features = ["cjk"] }
+unicode-segmentation = "1.13.2"
 vt100 = "0.16.2"
 
 # Platform and utilities
 arboard = "3.6.1"
 ignore = "0.4"
 tempfile = "3.27"
+nucleo-matcher = "0.3.1"
 
 [dev-dependencies]
 insta = "1.47.2"

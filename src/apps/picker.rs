@@ -1,4 +1,7 @@
 use keymap::KeyMap;
+use nucleo_matcher::pattern::{Atom, AtomKind, CaseMatching, Normalization};
+use nucleo_matcher::{Config, Matcher, Utf32Str};
+use unicode_segmentation::UnicodeSegmentation;
 
 /// Actions shared by the TUI and CLI file pickers.
 ///
@@ -27,18 +30,20 @@ pub enum PickerAction {
     Input(char),
 }
 
-/// Shared state for file pickers: the file list, filter query, filtered
-/// matches, and current selection index.
-///
-/// Both the TUI [`FilePicker`](crate::apps::tui::file_picker::FilePicker) and
-/// CLI [`CliPicker`](crate::apps::cli::picker::CliPicker) embed this struct and
-/// delegate navigation logic to [`PickerState::handle_navigation`], ensuring
-/// consistent filter and selection behavior across frontends.
+/// Shared file-picker state: files, query, ranked matches, highlight ranges,
+/// and selection.
 pub struct PickerState {
     pub files: Vec<crate::markdown_files::MarkdownFile>,
     pub matches: Vec<usize>,
     pub query: String,
     pub selected: usize,
+    matcher: Matcher,
+    /// Reused UTF-32 buffer for matching display paths.
+    scratch: Vec<char>,
+    /// Reused match index buffer, cleared per file.
+    indices: Vec<u32>,
+    /// Matched byte ranges in each file's display path, keyed by file index.
+    highlights: Vec<Vec<(usize, usize)>>,
 }
 
 impl PickerState {
@@ -48,29 +53,80 @@ impl PickerState {
             matches: Vec::new(),
             query: String::new(),
             selected: 0,
+            matcher: Matcher::new(Config::DEFAULT.match_paths()),
+            scratch: Vec::new(),
+            indices: Vec::new(),
+            highlights: Vec::new(),
         };
         state.rebuild();
         state
     }
 
-    /// Recomputes `matches` from `query` and clamps `selected`.
+    /// Rebuilds ranked matches and highlight ranges from `query`, resetting the
+    /// selection. An empty query keeps discovery order; no matches leave nothing
+    /// selected.
     pub fn rebuild(&mut self) {
-        self.matches = self.build_matches();
-        self.selected = self.selected.min(self.matches.len().saturating_sub(1));
+        self.selected = 0;
+        self.highlights.clear();
+        self.highlights.resize(self.files.len(), Vec::new());
+
+        if self.query.is_empty() {
+            self.matches = (0..self.files.len()).collect();
+            return;
+        }
+
+        let atom = Atom::new(
+            &self.query,
+            CaseMatching::Ignore,
+            Normalization::Smart,
+            AtomKind::Fuzzy,
+            false,
+        );
+        let mut scored = Vec::new();
+        for (idx, file) in self.files.iter().enumerate() {
+            self.scratch.clear();
+            self.scratch
+                .extend(nucleo_matcher::chars::graphemes(&file.display));
+            let haystack = Utf32Str::Unicode(&self.scratch);
+
+            self.indices.clear();
+            if let Some(score) = atom.indices(haystack, &mut self.matcher, &mut self.indices) {
+                self.highlights[idx] = matched_ranges(&file.display, &self.indices);
+                scored.push((idx, score));
+            }
+        }
+
+        scored.sort_by(|&(a_idx, a_score), &(b_idx, b_score)| {
+            b_score
+                .cmp(&a_score)
+                .then_with(|| self.files[a_idx].display.cmp(&self.files[b_idx].display))
+                .then_with(|| a_idx.cmp(&b_idx))
+        });
+        self.matches = scored.into_iter().map(|(idx, _)| idx).collect();
     }
 
-    /// Returns indices into `files` whose display path contains `query`
-    /// (case-insensitive).  An empty query matches everything.
-    pub fn build_matches(&self) -> Vec<usize> {
-        let query = self.query.to_lowercase();
-        self.files
-            .iter()
-            .enumerate()
-            .filter(|(_, file)| {
-                self.query.is_empty() || file.display.to_lowercase().contains(&query)
-            })
-            .map(|(idx, _)| idx)
-            .collect()
+    /// Splits a file's display path into unmatched and matcher-selected parts.
+    pub fn highlight_parts(&self, file_idx: usize) -> Vec<(&str, bool)> {
+        let file = &self.files[file_idx];
+        let ranges = &self.highlights[file_idx];
+
+        // Pre-allocate capacity: up to 2 parts per range + 1 for trailing text
+        let mut parts = Vec::with_capacity(ranges.len() * 2 + 1);
+        let mut start = 0;
+
+        for &(range_start, range_end) in ranges {
+            if start < range_start {
+                parts.push((&file.display[start..range_start], false));
+            }
+            parts.push((&file.display[range_start..range_end], true));
+            start = range_end;
+        }
+
+        if start < file.display.len() {
+            parts.push((&file.display[start..], false));
+        }
+
+        parts
     }
 
     /// Returns the index into `files` of the currently selected match, or
@@ -93,8 +149,9 @@ impl PickerState {
                 true
             }
             PickerAction::Delete => {
-                self.query.pop();
-                self.rebuild();
+                if self.query.pop().is_some() {
+                    self.rebuild();
+                }
                 true
             }
             PickerAction::Next => {
@@ -110,4 +167,23 @@ impl PickerState {
             _ => false,
         }
     }
+}
+
+/// Converts increasing matcher grapheme indices to byte ranges in `display`,
+/// merging adjacent matches.
+fn matched_ranges(display: &str, indices: &[u32]) -> Vec<(usize, usize)> {
+    let graphemes: Vec<(usize, usize)> = display
+        .grapheme_indices(true)
+        .map(|(start, grapheme)| (start, start + grapheme.len()))
+        .collect();
+
+    let mut matched: Vec<(usize, usize)> = Vec::with_capacity(indices.len());
+    for &idx in indices {
+        let range = graphemes[idx as usize];
+        match matched.last_mut() {
+            Some(last) if last.1 == range.0 => last.1 = range.1, // Merge contiguous ranges
+            _ => matched.push(range),
+        }
+    }
+    matched
 }
