@@ -38,16 +38,9 @@ impl Tasks {
         let task = self
             .outputs
             .entry(code.id)
-            .or_insert_with(|| Task::new(size.width, size.height, 500));
-        task.reset();
+            .or_insert_with(|| Task::new(code.id, size.width, size.height, 500));
 
-        match exec::run_code(code, size, envs, capture_state, binaries, task, working_dir) {
-            Some(rx) => {
-                task.dirty = true;
-                Some(rx)
-            }
-            None => None,
-        }
+        exec::run_code(code, size, envs, capture_state, binaries, task, working_dir)
     }
 
     /// Handles a stream message from a running task.

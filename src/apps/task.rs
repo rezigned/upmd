@@ -2,11 +2,13 @@
 //!
 //! [`Task`] combines the low-level process handle and PTY parser with the
 //! viewport state (scroll positions, dirty flag) that the TUI and CLI need
-//! for rendering.  A `Task` is created when a code block is executed and
-//! persists until the document is reloaded.
+//! for rendering. It also reports its process lifecycle to the outer terminal.
+//! A `Task` is created when a code block is executed and persists until the
+//! document is reloaded.
 
-use crate::apps::config::Envs;
+use crate::apps::{config::Envs, program_status};
 use crate::runner;
+use upmd_parser::CodeId;
 use upmd_pty::parser::Parser as PtyParser;
 
 /// Lifecycle status of a code block execution.
@@ -23,7 +25,9 @@ pub enum TaskStatus {
 
 /// Full state of one code-block execution: PTY output, scroll, and flags.
 pub struct Task {
+    pub id: CodeId,
     pub parser: PtyParser,
+    child_status: program_status::ChildStatus,
     pub execution: Option<runner::Execution>,
     pub done: bool,
     pub exit_code: Option<i32>,
@@ -38,9 +42,11 @@ pub struct Task {
 }
 
 impl Task {
-    pub fn new(cols: u16, rows: u16, scrollback: usize) -> Self {
+    pub fn new(id: CodeId, cols: u16, rows: u16, scrollback: usize) -> Self {
         Self {
+            id,
             parser: PtyParser::new(rows, cols, scrollback),
+            child_status: Default::default(),
             execution: None,
             done: false,
             exit_code: None,
@@ -74,8 +80,49 @@ impl Task {
         }
     }
 
+    /// Reports this task's current process status to the outer terminal.
+    pub(crate) fn report_status(&mut self) {
+        if self.done {
+            self.child_status.clear();
+        }
+        self.emit_status(self.status());
+    }
+
+    fn emit_status(&self, status: TaskStatus) {
+        let state = match status {
+            TaskStatus::Idle => "idle",
+            TaskStatus::Running => "working",
+            TaskStatus::Success => "done",
+            TaskStatus::Error => "error",
+        };
+        program_status::write(format_args!(
+            "\x1b]7501;state={state}:app=upmd:id=upmd/block-{}\x1b\\",
+            self.id
+        ));
+    }
+
+    /// Parses PTY output, relays child OSC 7501 status/queries, and optionally
+    /// forwards filtered alternate-screen output to the host terminal (CLI mode).
+    pub(crate) fn process_output(&mut self, text: &str, forward_alt_screen: bool) {
+        let was_alt = self.is_alternate_screen();
+        self.parser.parse(text);
+        let forward_to_stdout = forward_alt_screen && (was_alt || self.is_alternate_screen());
+        self.child_status.feed(
+            self.id,
+            text.as_bytes(),
+            !self.done,
+            forward_to_stdout,
+            |reply| {
+                if let Some(execution) = self.execution.as_mut() {
+                    let _ = execution.process_mut().write(reply);
+                }
+            },
+        );
+    }
+
     /// Resets execution state while preserving PTY parser dimensions.
     pub fn reset(&mut self) {
+        self.child_status.reset();
         self.execution = None;
         self.done = false;
         self.exit_code = None;
@@ -122,5 +169,14 @@ impl Task {
         self.inline_scroll = self.inline_scroll.min(max_scroll);
         let n = self.inline_scroll.min(max_scrollback);
         self.parser.scroll(n);
+    }
+}
+
+impl Drop for Task {
+    fn drop(&mut self) {
+        self.child_status.clear();
+        if self.running() {
+            self.emit_status(TaskStatus::Idle);
+        }
     }
 }

@@ -36,6 +36,7 @@ pub fn run_code(
                     .parser
                     .parse(&format!("Failed to determine current directory: {e}"));
                 output.done = true;
+                output.report_status();
                 return None;
             }
         },
@@ -44,11 +45,13 @@ pub fn run_code(
         Ok(exec) => {
             let rx = exec.receiver();
             output.execution = Some(exec);
+            output.report_status();
             Some(rx)
         }
         Err(err) => {
             output.parser.parse(&err.to_string());
             output.done = true;
+            output.report_status();
             None
         }
     }
@@ -60,9 +63,7 @@ pub fn run_code(
 pub fn handle_stream(output: &mut Task, stream: &Stream) -> bool {
     let mut force_rebuild = false;
     match stream {
-        Stream::Out(s) => {
-            output.parser.parse(s);
-        }
+        Stream::Out(s) => output.process_output(s, false),
         Stream::Env(envs) => {
             output.captured_envs = Some(envs.clone());
         }
@@ -77,6 +78,7 @@ pub fn handle_stream(output: &mut Task, stream: &Stream) -> bool {
         Stream::End => {
             force_rebuild = !output.done;
             output.done = true;
+            output.report_status();
         }
     }
     force_rebuild

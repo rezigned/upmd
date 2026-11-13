@@ -1822,7 +1822,7 @@ mod tests {
         let doc = upmd_parser::new().parse("```bash\necho hello\n```");
         let theme = Theme::new("base16-ocean.dark", false);
         let mut outputs = HashMap::new();
-        let mut output = Task::new(80, 24, 500);
+        let mut output = Task::new(1, 80, 24, 500);
         output.done = true;
         output.exit_code = Some(0);
         outputs.insert(1, output);
