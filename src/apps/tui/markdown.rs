@@ -1400,7 +1400,7 @@ impl<'a> MarkdownRenderer<'a> {
             // The parser scrollback has been synced to `inline_scroll` in
             // `scroll_inline_up`. Compute the visible window within the current
             // `rows`-tall screen.
-            let rows_usize = buffer.parser.screen().size().0 as usize;
+            let rows_usize = buffer.parser.size().0 as usize;
             let scrollback = buffer.parser.screen().scrollback();
             // `inline_scroll` may exceed scrollback when we've reached the oldest page
             // and are scrolling further to show the very first lines.
