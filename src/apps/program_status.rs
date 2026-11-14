@@ -9,11 +9,18 @@
 use std::{
     fmt::{Arguments, Write as _},
     io::{self, IsTerminal, Write},
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 use upmd_parser::CodeId;
 
 use crate::apps::task::TaskStatus;
+
+static ENABLED: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn set_enabled(enabled: bool) {
+    ENABLED.store(enabled, Ordering::Relaxed);
+}
 
 const MAX_SEQUENCE: usize = 4096;
 const MAX_ID: usize = 128;
@@ -51,7 +58,7 @@ enum ParseState {
 /// Frames `body` as an `OSC 7501` sequence and writes it to `stdout` when attached to a TTY.
 fn write_osc(body: Arguments<'_>) -> bool {
     let stdout = io::stdout();
-    if !stdout.is_terminal() {
+    if !ENABLED.load(Ordering::Relaxed) || !stdout.is_terminal() {
         return false;
     }
     let mut stdout = stdout.lock();
@@ -88,23 +95,30 @@ impl ProgramStatus {
         ));
     }
 
-    /// Consumes OSC 7501 sequences from a PTY chunk and optionally forwards
-    /// the remaining bytes to `stdout`.
+    /// Consumes OSC 7501 sequences from a PTY chunk and, when `passthrough` is
+    /// true (CLI fullscreen/alternate-screen mode), writes the remaining bytes to `stdout`.
     ///
     /// While `active`, valid status reports are scoped under `upmd/block-{id}` (or
     /// `upmd/block-{id}/{child}` when the report sets an ID) and written to the outer
     /// terminal, and capability queries (`?`) invoke `reply`.
-    pub(crate) fn feed(
+    pub(crate) fn process(
         &mut self,
         bytes: &[u8],
         active: bool,
-        forward_to_stdout: bool,
+        passthrough: bool,
         mut reply: impl FnMut(&[u8]),
     ) {
         let mut stdout = io::stdout();
+        if !ENABLED.load(Ordering::Relaxed) {
+            if passthrough {
+                let _ = stdout.write_all(bytes);
+                let _ = stdout.flush();
+            }
+            return;
+        }
         let mut reported = false;
         self.parse(bytes, active, |event| match event {
-            ChildEvent::Output(bytes) if forward_to_stdout => {
+            ChildEvent::Output(bytes) if passthrough => {
                 let _ = stdout.write_all(bytes);
             }
             ChildEvent::Output(_) => {}
@@ -113,7 +127,7 @@ impl ProgramStatus {
                 reported |= write_osc(format_args!("{body}"));
             }
         });
-        if forward_to_stdout {
+        if passthrough {
             let _ = stdout.flush();
         }
         self.reported |= reported;

@@ -83,14 +83,11 @@ impl Task {
         self.program_status.report_task(self.status());
     }
 
-    /// Parses PTY output, relays child OSC 7501 status/queries, and optionally
-    /// forwards filtered alternate-screen output to the host terminal (CLI mode).
-    pub(crate) fn process_output(&mut self, text: &str, forward_alt_screen: bool) {
-        let was_alt = self.is_alternate_screen();
-        self.parser.parse(text);
-        let forward_to_stdout = forward_alt_screen && (was_alt || self.is_alternate_screen());
+    /// Relays child OSC 7501 status/queries from `text` and, when `passthrough`
+    /// is true, writes the remaining non-OSC-7501 bytes to `stdout`.
+    pub(crate) fn handle_program_status(&mut self, text: &str, passthrough: bool) {
         self.program_status
-            .feed(text.as_bytes(), !self.done, forward_to_stdout, |reply| {
+            .process(text.as_bytes(), !self.done, passthrough, |reply| {
                 if let Some(execution) = self.execution.as_mut() {
                     let _ = execution.process_mut().write(reply);
                 }

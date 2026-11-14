@@ -63,7 +63,10 @@ pub fn run_code(
 pub fn handle_stream(output: &mut Task, stream: &Stream) -> bool {
     let mut force_rebuild = false;
     match stream {
-        Stream::Out(s) => output.process_output(s, false),
+        Stream::Out(s) => {
+            output.parser.parse(s);
+            output.handle_program_status(s, false);
+        }
         Stream::Env(envs) => {
             output.captured_envs = Some(envs.clone());
         }

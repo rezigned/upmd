@@ -395,13 +395,15 @@ impl App {
         };
 
         let was_alt = state.is_alternate_screen();
-        match stream {
-            Stream::Out(text) => {
-                state.process_output(text, self.batch_output.is_terminal() && focused);
-            }
-            _ => {
-                exec::handle_stream(state, stream);
-            }
+        if let Stream::Out(text) = stream {
+            state.parser.parse(text);
+            let now_alt = state.is_alternate_screen();
+            // In `--cli` mode, fullscreen apps (vim, btop) bypass card rendering
+            // and stream directly to stdout while in the alternate screen.
+            let passthrough = self.batch_output.is_terminal() && focused && (was_alt || now_alt);
+            state.handle_program_status(text, passthrough);
+        } else {
+            exec::handle_stream(state, stream);
         }
         let now_alt = state.is_alternate_screen();
 
