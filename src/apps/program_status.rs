@@ -1,8 +1,10 @@
-//! Child-process OSC 7501 status framing and ID scoping.
+//! OSC 7501 program status reporting, child framing, and ID scoping.
 //!
-//! Frames OSC 7501 sequences across PTY chunks, scopes child IDs under the
-//! owning block, and replies to capability queries. Status sequences are
-//! consumed while all other bytes pass through unchanged.
+//! Reports block lifecycle status (`upmd/block-N`), frames child OSC 7501
+//! sequences across PTY chunks (scoped to `upmd/block-N/<child-id>`, or
+//! `upmd/block-N` when the child sets no ID), and replies to child capability
+//! queries. Status sequences are consumed while all other bytes pass through
+//! unchanged.
 
 use std::{
     fmt::{Arguments, Write as _},
@@ -10,6 +12,8 @@ use std::{
 };
 
 use upmd_parser::CodeId;
+
+use crate::apps::task::TaskStatus;
 
 const MAX_SEQUENCE: usize = 4096;
 const MAX_ID: usize = 128;
@@ -19,18 +23,18 @@ const MAX_BODY: usize = MAX_SEQUENCE - OSC_PREFIX.len() - 1;
 const QUERY_REPLY: &[u8] =
     b"\x1b]7501;?:states=idle,working,done,blocked,error:kinds=permission,question,auth\x1b\\";
 
-/// Per-execution child status framing, forwarding, and record cleanup.
-#[derive(Default)]
-pub(crate) struct ChildStatus {
+/// Per-task OSC 7501 status reporting, child framing, and record cleanup.
+pub(crate) struct ProgramStatus {
+    id: CodeId,
     state: ParseState,
     input: Vec<u8>,
-    reported_id: Option<CodeId>,
+    reported: bool,
 }
 
 enum ChildEvent<'a> {
     Output(&'a [u8]),
     Query,
-    /// An OSC sequence with a block-scoped ID; other fields are passed through.
+    /// An OSC 7501 body with a block-scoped ID; other fields are passed through.
     Report(String),
 }
 
@@ -44,27 +48,54 @@ enum ParseState {
     Status { escaped: bool, discard: bool },
 }
 
-/// Returns whether a terminal write was attempted. Reporting is best-effort.
-pub(crate) fn write(text: Arguments<'_>) -> bool {
+/// Frames `body` as an `OSC 7501` sequence and writes it to `stdout` when attached to a TTY.
+fn write_osc(body: Arguments<'_>) -> bool {
     let stdout = io::stdout();
     if !stdout.is_terminal() {
         return false;
     }
     let mut stdout = stdout.lock();
-    let _ = stdout.write_fmt(text);
+    let _ = write!(stdout, "\x1b]7501;{body}\x1b\\");
     let _ = stdout.flush();
     true
 }
 
-impl ChildStatus {
+impl ProgramStatus {
+    pub(crate) fn new(id: CodeId) -> Self {
+        Self {
+            id,
+            state: ParseState::Ground,
+            input: Vec::new(),
+            reported: false,
+        }
+    }
+
+    /// Reports a block's lifecycle status to the outer terminal, clearing any
+    /// active child record when the block is no longer running.
+    pub(crate) fn report_task(&mut self, status: TaskStatus) {
+        if status != TaskStatus::Running {
+            self.clear();
+        }
+        let state = match status {
+            TaskStatus::Idle => "idle",
+            TaskStatus::Running => "working",
+            TaskStatus::Success => "done",
+            TaskStatus::Error => "error",
+        };
+        write_osc(format_args!(
+            "state={state}:app=upmd:id=upmd/block-{}",
+            self.id
+        ));
+    }
+
     /// Consumes OSC 7501 sequences from a PTY chunk and optionally forwards
     /// the remaining bytes to `stdout`.
     ///
-    /// While `active`, valid status reports are scoped under `upmd/block-{id}/child` and
-    /// written to the outer terminal, and capability queries (`?`) invoke `reply`.
+    /// While `active`, valid status reports are scoped under `upmd/block-{id}` (or
+    /// `upmd/block-{id}/{child}` when the report sets an ID) and written to the outer
+    /// terminal, and capability queries (`?`) invoke `reply`.
     pub(crate) fn feed(
         &mut self,
-        id: CodeId,
         bytes: &[u8],
         active: bool,
         forward_to_stdout: bool,
@@ -72,22 +103,20 @@ impl ChildStatus {
     ) {
         let mut stdout = io::stdout();
         let mut reported = false;
-        self.parse(id, bytes, active, |event| match event {
+        self.parse(bytes, active, |event| match event {
             ChildEvent::Output(bytes) if forward_to_stdout => {
                 let _ = stdout.write_all(bytes);
             }
             ChildEvent::Output(_) => {}
             ChildEvent::Query => reply(QUERY_REPLY),
-            ChildEvent::Report(sequence) => {
-                reported |= write(format_args!("{sequence}"));
+            ChildEvent::Report(body) => {
+                reported |= write_osc(format_args!("{body}"));
             }
         });
         if forward_to_stdout {
             let _ = stdout.flush();
         }
-        if reported {
-            self.reported_id = Some(id);
-        }
+        self.reported |= reported;
     }
 
     pub(crate) fn reset(&mut self) {
@@ -98,20 +127,12 @@ impl ChildStatus {
 
     /// Clears records without losing framing for output queued after process exit.
     pub(crate) fn clear(&mut self) {
-        if let Some(id) = self.reported_id.take() {
-            write(format_args!(
-                "\x1b]7501;state=clear:id=upmd/block-{id}/child\x1b\\"
-            ));
+        if std::mem::take(&mut self.reported) {
+            write_osc(format_args!("state=clear:id=upmd/block-{}", self.id));
         }
     }
 
-    fn parse(
-        &mut self,
-        id: CodeId,
-        bytes: &[u8],
-        active: bool,
-        mut emit: impl FnMut(ChildEvent<'_>),
-    ) {
+    fn parse(&mut self, bytes: &[u8], active: bool, mut emit: impl FnMut(ChildEvent<'_>)) {
         let mut raw_start = 0;
         let mut index = 0;
         while index < bytes.len() {
@@ -166,7 +187,7 @@ impl ChildStatus {
                         if !discard {
                             if self.input.trim_ascii() == b"?" {
                                 emit(ChildEvent::Query);
-                            } else if let Some(report) = scope_id(id, &self.input) {
+                            } else if let Some(report) = scope_id(self.id, &self.input) {
                                 emit(ChildEvent::Report(report));
                             }
                         }
@@ -201,7 +222,7 @@ fn scope_id(block: CodeId, input: &[u8]) -> Option<String> {
     if body.chars().any(char::is_control) {
         return None;
     }
-    let mut output = String::from("\x1b]7501;");
+    let mut output = String::with_capacity(body.len() + 32);
     let mut has_id = false;
     for (i, pair) in body.split(':').enumerate() {
         if i > 0 {
@@ -210,7 +231,7 @@ fn scope_id(block: CodeId, input: &[u8]) -> Option<String> {
         match pair.split_once('=') {
             Some((key, value)) if key.trim() == "id" => {
                 let id = value.trim();
-                let scoped = format!("upmd/block-{block}/child/{id}");
+                let scoped = format!("upmd/block-{block}/{id}");
                 if !valid_id(id) || scoped.len() > MAX_ID {
                     return None;
                 }
@@ -222,10 +243,9 @@ fn scope_id(block: CodeId, input: &[u8]) -> Option<String> {
     }
     if !has_id {
         let separator = if body.is_empty() { "" } else { ":" };
-        let _ = write!(output, "{separator}id=upmd/block-{block}/child");
+        let _ = write!(output, "{separator}id=upmd/block-{block}");
     }
-    output.push_str("\x1b\\");
-    (output.len() <= MAX_SEQUENCE).then_some(output)
+    (output.len() + OSC_PREFIX.len() + 2 <= MAX_SEQUENCE).then_some(output)
 }
 
 fn valid_id(id: &str) -> bool {
@@ -233,7 +253,7 @@ fn valid_id(id: &str) -> bool {
         && id.split('/').all(|s| {
             (1..=32).contains(&s.len())
                 && s.bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'+' | b'-'))
+                    .all(|b| b.is_ascii_alphanumeric() || b"_.+-".contains(&b))
         })
 }
 
@@ -241,10 +261,10 @@ fn valid_id(id: &str) -> bool {
 mod tests {
     use super::*;
 
-    fn collect(decoder: &mut ChildStatus, bytes: &[u8]) -> (Vec<u8>, Vec<String>) {
+    fn collect(decoder: &mut ProgramStatus, bytes: &[u8]) -> (Vec<u8>, Vec<String>) {
         let mut output = Vec::new();
         let mut events = Vec::new();
-        decoder.parse(1, bytes, true, |event| match event {
+        decoder.parse(bytes, true, |event| match event {
             ChildEvent::Output(bytes) => output.extend_from_slice(bytes),
             ChildEvent::Query => events.push("query".to_owned()),
             ChildEvent::Report(report) => events.push(report),
@@ -255,14 +275,14 @@ mod tests {
     #[test]
     fn scopes_ids_and_rejects_invalid_reports() {
         let cases = [
-            ("state=clear", Some("state=clear:id=upmd/block-1/child")),
+            ("state=clear", Some("state=clear:id=upmd/block-1")),
             (
                 "id=old:state=done: id = worker/sub ",
-                Some("id=upmd/block-1/child/old:state=done: id =upmd/block-1/child/worker/sub"),
+                Some("id=upmd/block-1/old:state=done: id =upmd/block-1/worker/sub"),
             ),
             (
                 "state=done:future=literal id=untouched:id=worker:msg=SGk=::",
-                Some("state=done:future=literal id=untouched:id=upmd/block-1/child/worker:msg=SGk=::"),
+                Some("state=done:future=literal id=untouched:id=upmd/block-1/worker:msg=SGk=::"),
             ),
             ("state=clear:id=", None),
             ("state=clear:id=bad%2Fid", None),
@@ -271,8 +291,7 @@ mod tests {
             ("state=clear\x18outside", None),
         ];
         for (body, expected) in cases {
-            let expected = expected.map(|b| format!("\x1b]7501;{b}\x1b\\"));
-            assert_eq!(scope_id(1, body.as_bytes()), expected, "{body}");
+            assert_eq!(scope_id(1, body.as_bytes()).as_deref(), expected, "{body}");
         }
     }
 
@@ -280,13 +299,10 @@ mod tests {
     fn frames_status_and_filters_passthrough_across_chunks() {
         let input = b"before\x1b]7501;?\x07\x1b]0;title\x07\x1b]75\x07\x1b\x1b[0m\x1b]7501;state=blocked:id=worker\x1b\\after";
         let expected_out = b"before\x1b]0;title\x07\x1b]75\x07\x1b\x1b[0mafter";
-        let expected_events = [
-            "query",
-            "\x1b]7501;state=blocked:id=upmd/block-1/child/worker\x1b\\",
-        ];
+        let expected_events = ["query", "state=blocked:id=upmd/block-1/worker"];
 
         for split in 0..=input.len() {
-            let mut decoder = ChildStatus::default();
+            let mut decoder = ProgramStatus::new(1);
             let (mut out, mut events) = collect(&mut decoder, &input[..split]);
             let (out2, events2) = collect(&mut decoder, &input[split..]);
             out.extend(out2);
@@ -300,9 +316,9 @@ mod tests {
             "\x1b]7501;msg={}\x07\x1b]7501;?\x07tail",
             "a".repeat(MAX_SEQUENCE)
         );
-        let mut decoder = ChildStatus::default();
+        let mut decoder = ProgramStatus::new(1);
         let mut out = Vec::new();
-        decoder.parse(1, oversized.as_bytes(), false, |event| match event {
+        decoder.parse(oversized.as_bytes(), false, |event| match event {
             ChildEvent::Output(b) => out.extend_from_slice(b),
             _ => panic!("inactive event"),
         });
