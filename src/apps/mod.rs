@@ -6,6 +6,7 @@ pub mod config;
 pub mod exec;
 pub mod navigation;
 pub mod picker;
+pub(crate) mod program_status;
 pub mod task;
 mod theme;
 pub mod tui;

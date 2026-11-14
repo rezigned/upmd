@@ -439,6 +439,9 @@ pub struct UserConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tick_rate: Option<u64>,
 
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub report_program_status: Option<bool>,
+
     /// TUI-specific display preferences.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tui: Option<TuiConfig>,
@@ -569,6 +572,7 @@ impl UserConfig {
             theme: Some(DEFAULT_THEME.to_string()),
             transparent: Some(false),
             tick_rate: Some(TICK_RATE_MS),
+            report_program_status: Some(false),
             tui: Some(TuiConfig {
                 inline_max_lines: Some(INLINE_MAX_LINES_MAX),
             }),
@@ -727,6 +731,7 @@ preview_lines = 6
             theme: Some("catppuccin-mocha".into()),
             transparent: Some(true),
             tick_rate: Some(50),
+            report_program_status: None,
             tui: Some(TuiConfig {
                 inline_max_lines: Some(12),
             }),

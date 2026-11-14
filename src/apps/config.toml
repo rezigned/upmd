@@ -1,6 +1,7 @@
 theme = "catppuccin-mocha"
 transparent = false
 tick_rate = 66
+report_program_status = false
 
 [tui]
 inline_max_lines = 20

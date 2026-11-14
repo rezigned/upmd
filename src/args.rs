@@ -37,6 +37,10 @@ pub struct Args {
     #[arg(long, default_value_t = false)]
     pub capture_state: bool,
 
+    /// Report task and child-program OSC 7501 status to the terminal (default: false).
+    #[arg(long, default_value_t = false)]
+    pub report_program_status: bool,
+
     /// Run a specific code block by name or numeric ID.
     ///
     /// Matches the `name` attribute on code blocks (e.g. ```bash [name:setup]).
@@ -88,6 +92,9 @@ impl From<Args> for Config {
 /// Merges CLI arguments with loaded user config.
 /// CLI flags explicitly set by the user take precedence over the config file.
 pub fn build_config(args: Args, user_cfg: UserConfig) -> Config {
+    crate::apps::program_status::set_enabled(
+        args.report_program_status || user_cfg.report_program_status.unwrap_or(false),
+    );
     let theme = args.theme.unwrap_or_else(|| user_cfg.theme().to_string());
     let working_dir = args.working_dir.map(|dir| match dir.as_str() {
         ":auto" => WorkingDir::Auto,

@@ -261,7 +261,7 @@ impl App {
         let mut outputs = self.outputs.borrow_mut();
         let state = outputs
             .entry(id)
-            .or_insert_with(|| task::Task::new(pty_cols, pty_rows, 1024));
+            .or_insert_with(|| task::Task::new(id, pty_cols, pty_rows, 1024));
         let command = exec::run_code(
             code,
             size,
@@ -395,19 +395,17 @@ impl App {
         };
 
         let was_alt = state.is_alternate_screen();
-        exec::handle_stream(state, stream);
-        let now_alt = state.is_alternate_screen();
-
-        // When a full-screen TUI app (vim, less, htop) is active in the
-        // alternate screen buffer, write its PTY output directly to the
-        // real terminal so escape sequences (cursor positioning, alt
-        // screen entry/exit) are processed natively.
-        if let Stream::Out(s) = stream {
-            if self.batch_output.is_terminal() && focused && (was_alt || now_alt) {
-                let _ = io::stdout().write_all(s.as_bytes());
-                let _ = io::stdout().flush();
-            }
+        if let Stream::Out(text) = stream {
+            state.parser.parse(text);
+            let now_alt = state.is_alternate_screen();
+            // In `--cli` mode, fullscreen apps (vim, btop) bypass card rendering
+            // and stream directly to stdout while in the alternate screen.
+            let passthrough = self.batch_output.is_terminal() && focused && (was_alt || now_alt);
+            state.handle_program_status(text, passthrough);
+        } else {
+            exec::handle_stream(state, stream);
         }
+        let now_alt = state.is_alternate_screen();
 
         // Resize PTY when entering/exiting alternate screen so TUI apps
         // get the full terminal dimensions and line-oriented programs get
@@ -1170,7 +1168,7 @@ echo world
     }
 
     fn insert_completed_output(app: &App, id: CodeId, text: &str, exit_code: i32) {
-        let mut output = task::Task::new(80, 24, 1024);
+        let mut output = task::Task::new(id, 80, 24, 1024);
         exec::handle_stream(&mut output, &Stream::Out(text.to_string()));
         exec::handle_stream(&mut output, &Stream::Exit(exit_code));
         exec::handle_stream(&mut output, &Stream::End);

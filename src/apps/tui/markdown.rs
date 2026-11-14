@@ -1832,7 +1832,7 @@ mod tests {
     #[test]
     fn test_failed_start_code_info_renders_error_status_and_gutter() {
         let mut outputs = HashMap::new();
-        let mut output = Task::new(80, 24, 500);
+        let mut output = Task::new(1, 80, 24, 500);
         output.done = true;
         output.exit_code = None;
         outputs.insert(1, output);
@@ -1873,7 +1873,7 @@ mod tests {
     /// Creates a [`Task`] pre-loaded with 50 lines of output for use in
     /// inline-scroll snapshot tests.
     fn output_task() -> Task {
-        let mut buf = Task::new(40, 24, 500);
+        let mut buf = Task::new(1, 40, 24, 500);
         for i in 0..50 {
             buf.parser
                 .parse(&format!("This is output line number {i}\n"));
@@ -1957,7 +1957,7 @@ mod tests {
     #[test]
     fn test_inline_scroll_short_output() {
         // Output shorter than inline_max_lines. All lines visible at any scroll.
-        let mut buf = Task::new(40, 24, 500);
+        let mut buf = Task::new(1, 40, 24, 500);
         for i in 0..5 {
             buf.parser.parse(&format!("short line {i}\n"));
         }
