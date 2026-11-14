@@ -115,7 +115,7 @@ impl Tasks {
     }
 
     fn resize_task_buffer(task: &mut Task, cols: u16, rows: u16) {
-        if task.parser.screen().size() == (rows, cols) {
+        if task.parser.size() == (rows, cols) {
             return;
         }
         task.parser.resize(rows, cols);

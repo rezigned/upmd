@@ -13,7 +13,7 @@ crossterm = "0.29"
 libc = "0.2"
 portable-pty = "0.9"
 ratatui = { version = "0.30", optional = true }
-vt100 = "0.16"
+vt100 = "0.18"
 
 [features]
 default = []

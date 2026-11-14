@@ -528,7 +528,7 @@ impl App {
 
         // Forward only clicks on the selected code block. Coordinate math
         // accounts for scroll offset and blockquote prefix overhead.
-        let (pty_rows, pty_cols) = buf.parser.screen().size();
+        let (pty_rows, pty_cols) = buf.parser.size();
         let Some((col, row)) = self
             .content
             .mouse_to_pty_coords(id, mouse, pty_cols, pty_rows)
@@ -1025,7 +1025,10 @@ impl App {
                     let (pty_cols, pty_rows) = self
                         .tasks
                         .get(id)
-                        .map(|buf| buf.parser.screen().size())
+                        .map(|buf| {
+                            let (rows, cols) = buf.parser.size();
+                            (cols, rows)
+                        })
                         .unwrap_or((0, 0));
                     let (col, row) = self.output.mouse_to_pty_coords(mouse, pty_cols, pty_rows);
                     if let Some(seq) = upmd_pty::mouse::encode_sgr_mouse(mouse, col, row) {
@@ -1805,7 +1808,7 @@ mod tests {
         }
 
         assert!(entered_alternate_screen);
-        assert_eq!(app.tasks.get(1).unwrap().parser.screen().size().0, 35);
+        assert_eq!(app.tasks.get(1).unwrap().parser.size().0, 35);
         app.tasks.send_input(1, b"\x03");
     }
 

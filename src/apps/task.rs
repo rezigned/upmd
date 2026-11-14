@@ -114,7 +114,7 @@ impl Task {
     pub fn sync_inline_scrollback(&mut self, inline_max_lines: usize) {
         self.parser.scroll(usize::MAX);
         let max_scrollback = self.parser.screen().scrollback();
-        let rows = self.parser.screen().size().0 as usize;
+        let rows = self.parser.size().0 as usize;
         let total_lines = max_scrollback + rows;
         // Clamp inline_scroll so we never scroll past the point where the
         // window would be at the very first line of output.

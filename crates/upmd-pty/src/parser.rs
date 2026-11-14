@@ -14,9 +14,17 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
 };
-use std::cell::{Ref, RefCell};
+use std::{
+    cell::{Ref, RefCell},
+    num::NonZeroU16,
+};
 #[cfg(feature = "ratatui")]
 use vt100::{Cell, Screen};
+
+/// Clamps a dimension to the non-zero range required by `vt100`.
+fn dim(value: u16) -> NonZeroU16 {
+    NonZeroU16::new(value).unwrap_or(NonZeroU16::MIN)
+}
 
 /// VT100 parser with optional `ratatui` conversion helpers.
 #[derive(Default)]
@@ -39,7 +47,7 @@ impl Parser {
     /// Creates a parser with the given viewport and scrollback size.
     pub fn new(rows: u16, cols: u16, scrollback_len: usize) -> Self {
         Self {
-            parser: RefCell::new(vt100::Parser::new(rows, cols, scrollback_len)),
+            parser: RefCell::new(vt100::Parser::new(dim(rows), dim(cols), scrollback_len)),
             scrollback_len,
             mouse_reporting: false,
             sgr_mouse: false,
@@ -83,7 +91,10 @@ impl Parser {
 
     /// Resizes the emulated terminal screen.
     pub fn resize(&mut self, rows: u16, cols: u16) -> &mut Self {
-        self.parser.borrow_mut().screen_mut().set_size(rows, cols);
+        self.parser
+            .borrow_mut()
+            .screen_mut()
+            .set_size(dim(rows), dim(cols));
         #[cfg(feature = "ratatui")]
         {
             *self.dirty.borrow_mut() = true;
@@ -117,6 +128,12 @@ impl Parser {
     /// Borrows the underlying VT100 screen.
     pub fn screen(&self) -> impl std::ops::Deref<Target = vt100::Screen> + '_ {
         Ref::map(self.parser.borrow(), |p: &vt100::Parser| p.screen())
+    }
+
+    /// Returns the emulated viewport size as `(rows, cols)`.
+    pub fn size(&self) -> (u16, u16) {
+        let (rows, cols) = self.screen().size();
+        (rows.get(), cols.get())
     }
 
     /// Returns whether the alternate screen buffer is active.
@@ -292,6 +309,7 @@ fn trim_trailing_empty_lines(text: &mut Text<'static>, cursor_y: Option<usize>) 
 #[cfg(feature = "ratatui")]
 fn last_content_col(screen: &Screen, row: u16, cursor: Option<(u16, u16)>) -> u16 {
     let (_, cols) = screen.size();
+    let cols = cols.get();
     let mut last = 0;
     for x in (0..cols).rev() {
         let Some(cell) = screen.cell(row, x) else {
@@ -376,6 +394,7 @@ fn row_to_line(
 #[cfg(feature = "ratatui")]
 pub fn ansi_to_text(screen: &Screen, show_cursor: bool) -> Text<'static> {
     let (rows, _) = screen.size();
+    let rows = rows.get();
     let cursor = cursor_position(screen, show_cursor);
 
     let mut lines = Vec::with_capacity(rows as usize);
