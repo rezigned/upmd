@@ -3,6 +3,8 @@
   lib ? pkgs.lib,
   rustPlatform ? pkgs.rustPlatform,
   python3 ? pkgs.python3,
+  pkg-config ? pkgs.pkg-config,
+  oniguruma ? pkgs.oniguruma,
 }: let
   manifest = lib.importTOML ./Cargo.toml;
 in
@@ -16,12 +18,17 @@ in
       python3
     ];
 
+    nativeBuildInputs = [
+      pkg-config
+    ];
+
+    buildInputs = [
+      oniguruma
+      # oniguruma.dev
+    ];
     src = lib.cleanSource ./.;
 
     cargoLock.lockFile = ./Cargo.lock;
-    cargoLock.outputHashes = {
-      "vt100-0.16.2" = "sha256-18opt/6FxwTx1CfWUEUm3QajujJvddBdvFDkRpopTtE=";
-    };
 
     # Uncomment when debugging
     # buildType = "debug";
