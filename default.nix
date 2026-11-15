@@ -19,9 +19,6 @@ in
     src = lib.cleanSource ./.;
 
     cargoLock.lockFile = ./Cargo.lock;
-    cargoLock.outputHashes = {
-      "vt100-0.16.2" = "sha256-18opt/6FxwTx1CfWUEUm3QajujJvddBdvFDkRpopTtE=";
-    };
 
     # Uncomment when debugging
     # buildType = "debug";
