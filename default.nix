@@ -3,6 +3,8 @@
   lib ? pkgs.lib,
   rustPlatform ? pkgs.rustPlatform,
   python3 ? pkgs.python3,
+  pkg-config ? pkgs.pkg-config,
+  oniguruma ? pkgs.oniguruma,
 }: let
   manifest = lib.importTOML ./Cargo.toml;
 in
@@ -16,6 +18,14 @@ in
       python3
     ];
 
+    nativeBuildInputs = [
+      pkg-config
+    ];
+
+    buildInputs = [
+      oniguruma
+      # oniguruma.dev
+    ];
     src = lib.cleanSource ./.;
 
     cargoLock.lockFile = ./Cargo.lock;
