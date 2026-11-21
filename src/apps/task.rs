@@ -6,10 +6,13 @@
 //! A `Task` is created when a code block is executed and persists until the
 //! document is reloaded.
 
-use crate::apps::{config::Envs, program_status};
+use crate::apps::{
+    config::Envs,
+    program_status::{ProgramStatus, ProgramStatusMode},
+};
 use crate::runner;
 use upmd_parser::CodeId;
-use upmd_pty::parser::Parser as PtyParser;
+use upmd_pty::{parser::Parser as PtyParser, Size};
 
 /// Lifecycle status of a code block execution.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -26,7 +29,7 @@ pub enum TaskStatus {
 /// Full state of one code-block execution: PTY output, scroll, and flags.
 pub struct Task {
     pub parser: PtyParser,
-    program_status: program_status::ProgramStatus,
+    program_status: ProgramStatus,
     pub execution: Option<runner::Execution>,
     pub done: bool,
     pub exit_code: Option<i32>,
@@ -41,10 +44,10 @@ pub struct Task {
 }
 
 impl Task {
-    pub fn new(id: CodeId, cols: u16, rows: u16, scrollback: usize) -> Self {
+    pub fn new(id: CodeId, size: &Size, scrollback: usize, mode: ProgramStatusMode) -> Self {
         Self {
-            parser: PtyParser::new(rows, cols, scrollback),
-            program_status: program_status::ProgramStatus::new(id),
+            parser: PtyParser::new(size.height, size.width, scrollback),
+            program_status: ProgramStatus::new(id, mode),
             execution: None,
             done: false,
             exit_code: None,
@@ -83,8 +86,8 @@ impl Task {
         self.program_status.report_task(self.status());
     }
 
-    /// Relays child OSC 7501 status/queries from `text` and, when `passthrough`
-    /// is true, writes the remaining non-OSC-7501 bytes to `stdout`.
+    /// Handles child OSC 7501 when enabled. Passthrough writes unconsumed
+    /// output to stdout.
     pub(crate) fn handle_program_status(&mut self, text: &str, passthrough: bool) {
         self.program_status
             .process(text.as_bytes(), !self.done, passthrough, |reply| {

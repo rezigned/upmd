@@ -177,14 +177,7 @@ impl App {
         let envs = self.envs.data();
         let command = self
             .tasks
-            .run(
-                code,
-                size,
-                envs,
-                self.config.capture_state,
-                &self.config.binaries,
-                self.cwd.clone(),
-            )
+            .run(code, size, envs, &self.config, self.cwd.clone())
             .map(|receiver| exec::stream_rx(id, receiver, Msg::StreamUpdate));
 
         if command.is_none() {
@@ -1781,14 +1774,7 @@ mod tests {
         let size = app.pty_size_for_code(1);
         let rx = app
             .tasks
-            .run(
-                &code,
-                size,
-                app.envs.data(),
-                false,
-                &app.config.binaries,
-                None,
-            )
+            .run(&code, size, app.envs.data(), &app.config, None)
             .expect("bash task should start");
 
         let mut entered_alternate_screen = false;

@@ -210,6 +210,10 @@ Runner binaries and key bindings can also be overridden. Print every available s
 upmd --dump-default-config
 ```
 
+upmd reports code block status via OSC 7501 on a terminal by default (`block`).
+Use `--report-program-status all` to also relay child status or `--report-program-status none` to disable reporting.
+The same modes are available through `report_program_status` in `config.toml`.
+
 Set `RUST_LOG` to write tracing output to the platform cache directory:
 
 ```bash

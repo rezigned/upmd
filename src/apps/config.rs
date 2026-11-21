@@ -1,3 +1,4 @@
+use crate::apps::program_status::ProgramStatusMode;
 use crate::apps::theme::Theme;
 use keymap::{DerivedConfig, KeyMapConfig};
 use serde::{Deserialize, Serialize};
@@ -440,7 +441,7 @@ pub struct UserConfig {
     pub tick_rate: Option<u64>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub report_program_status: Option<bool>,
+    pub report_program_status: Option<ProgramStatusMode>,
 
     /// TUI-specific display preferences.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -560,6 +561,10 @@ impl UserConfig {
         self.tick_rate.unwrap_or(TICK_RATE_MS)
     }
 
+    pub fn report_program_status(&self) -> ProgramStatusMode {
+        self.report_program_status.unwrap_or_default()
+    }
+
     /// Returns a `UserConfig` with every field populated to its runtime default.
     ///
     /// This is the inverse of the normal `Default` (all-`None`): it produces a
@@ -572,7 +577,7 @@ impl UserConfig {
             theme: Some(DEFAULT_THEME.to_string()),
             transparent: Some(false),
             tick_rate: Some(TICK_RATE_MS),
-            report_program_status: Some(false),
+            report_program_status: Some(ProgramStatusMode::default()),
             tui: Some(TuiConfig {
                 inline_max_lines: Some(INLINE_MAX_LINES_MAX),
             }),
@@ -599,6 +604,7 @@ pub struct Config {
     pub transparent: bool,
     pub file: Option<String>,
     pub capture_state: bool,
+    pub report_program_status: ProgramStatusMode,
     pub block: Option<String>,
     pub yes: bool,
     pub all: bool,
@@ -625,6 +631,7 @@ pub struct ConfigArgs {
     pub file: Option<String>,
     pub theme: String,
     pub capture_state: bool,
+    pub report_program_status: ProgramStatusMode,
     pub block: Option<String>,
     pub yes: bool,
     pub all: bool,
@@ -657,6 +664,7 @@ impl Config {
             theme: Theme::new(&args.theme, args.transparent),
             file: args.file,
             capture_state: args.capture_state,
+            report_program_status: args.report_program_status,
             block: args.block,
             yes: args.yes,
             all: args.all,
@@ -681,6 +689,10 @@ mod tests {
         assert_eq!(cfg.theme(), "catppuccin-mocha");
         assert!(!cfg.transparent());
         assert_eq!(cfg.tick_rate(), 66);
+        assert!(matches!(
+            cfg.report_program_status(),
+            ProgramStatusMode::Block
+        ));
         assert_eq!(cfg.tui.as_ref().map(|t| t.inline_max_lines()), None);
         assert!(cfg.cli.is_none());
     }
@@ -731,7 +743,7 @@ preview_lines = 6
             theme: Some("catppuccin-mocha".into()),
             transparent: Some(true),
             tick_rate: Some(50),
-            report_program_status: None,
+            report_program_status: Some(ProgramStatusMode::Block),
             tui: Some(TuiConfig {
                 inline_max_lines: Some(12),
             }),
@@ -803,6 +815,7 @@ preview_lines = 6
             file: None,
             theme: "base16-ocean.dark".into(),
             capture_state: false,
+            report_program_status: Default::default(),
             block: None,
             yes: false,
             all: false,
@@ -825,6 +838,7 @@ preview_lines = 6
             file: None,
             theme: "base16-ocean.dark".into(),
             capture_state: false,
+            report_program_status: Default::default(),
             block: None,
             yes: false,
             all: false,
@@ -847,6 +861,7 @@ preview_lines = 6
             file: None,
             theme: "base16-ocean.dark".into(),
             capture_state: false,
+            report_program_status: Default::default(),
             block: None,
             yes: false,
             all: false,
@@ -862,6 +877,7 @@ preview_lines = 6
             file: None,
             theme: "base16-ocean.dark".into(),
             capture_state: false,
+            report_program_status: Default::default(),
             block: None,
             yes: false,
             all: false,

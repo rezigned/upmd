@@ -3,11 +3,11 @@
 //! Owns the per-code-block output state and provides shared functions
 //! for running code, processing PTY output streams, and reloading documents.
 
-use std::{collections::HashMap, path::PathBuf};
+use std::path::PathBuf;
 
 use crossbeam_channel::Receiver;
 
-use crate::apps::config::Envs;
+use crate::apps::config::{Config, Envs};
 use crate::apps::task::Task;
 use crate::{pty::process::Size as PtySize, pty::stream::Stream, runner};
 use upmd_parser::{nodes, CodeId};
@@ -21,8 +21,7 @@ pub fn run_code(
     code: &nodes::Code,
     size: PtySize,
     envs: Envs,
-    capture_state: bool,
-    binaries: &HashMap<String, upmd_runner::RunnerOptions>,
+    config: &Config,
     output: &mut Task,
     working_dir: Option<PathBuf>,
 ) -> Option<Receiver<Stream>> {
@@ -41,7 +40,14 @@ pub fn run_code(
             }
         },
     };
-    match runner::execute(code, envs, cwd, size, capture_state, binaries) {
+    match runner::execute(
+        code,
+        envs,
+        cwd,
+        size,
+        config.capture_state,
+        &config.binaries,
+    ) {
         Ok(exec) => {
             let rx = exec.receiver();
             output.execution = Some(exec);
