@@ -38,6 +38,10 @@ cargo clippy -- -D warnings
 cargo fmt -- --check
 ```
 
+```sh [name:lint, deps:"clippy | fmt-check"]
+echo all lint checks passed
+```
+
 ```sh [name:fmt]
 cargo fmt
 ```
@@ -73,10 +77,10 @@ cargo instruments -t cpu --no-open --time-limit 2000 -- DEMO.md
 ## Verification
 
 ```sh [name:check-config, deps:build]
-cargo run --quiet -- --dump-default-config | diff - src/apps/config.toml
+cargo run --quiet -- --dump-default-config | diff -u src/apps/config.toml -
 ```
 
-```sh [name:verify-all, deps:"clippy | fmt-check, test"]
+```sh [name:verify-all, deps:"lint, test, check-config"]
 echo all checks passed
 ```
 
