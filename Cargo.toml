@@ -94,5 +94,8 @@ tap = "rezigned/homebrew-tap"
 publish-jobs = ["homebrew"]
 install-updater = false
 
+[workspace.metadata.dist.github-custom-runners]
+aarch64-apple-darwin = "macos-15"
+
 # [profile.release]
 # debug = true
