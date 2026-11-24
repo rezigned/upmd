@@ -1,25 +1,33 @@
-//! OSC 7501 program status reporting, child framing, and ID scoping.
+//! OSC 7501 code block status and child status relay.
 //!
-//! Reports block lifecycle status (`upmd/block-N`), frames child OSC 7501
-//! sequences across PTY chunks (scoped to `upmd/block-N/<child-id>`, or
-//! `upmd/block-N` when the child sets no ID), and replies to child capability
-//! queries. Status sequences are consumed while all other bytes pass through
-//! unchanged.
+//! Reports block lifecycle status as `upmd/block-N` when stdout is a terminal
+//! (configurable via `ProgramStatusMode`, default: `block`).
+//! In `all` mode, it reassembles OSC 7501 sequences split across PTY chunks,
+//! scopes child IDs under the block ID, and answers capability queries.
+//! Reports without a child ID use the block ID.
 
 use std::{
     fmt::{Arguments, Write as _},
     io::{self, IsTerminal, Write},
-    sync::atomic::{AtomicBool, Ordering},
 };
 
+use clap::ValueEnum;
+use serde::{Deserialize, Serialize};
 use upmd_parser::CodeId;
 
 use crate::apps::task::TaskStatus;
 
-static ENABLED: AtomicBool = AtomicBool::new(false);
-
-pub(crate) fn set_enabled(enabled: bool) {
-    ENABLED.store(enabled, Ordering::Relaxed);
+/// Mode for OSC 7501 program status reporting.
+#[derive(Debug, Clone, Copy, Default, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProgramStatusMode {
+    /// Report code block lifecycle status (upmd/block-N) [default].
+    #[default]
+    Block,
+    /// Report code block lifecycle status and relay child process OSC 7501 status.
+    All,
+    /// Disable all OSC 7501 status reporting.
+    None,
 }
 
 const MAX_SEQUENCE: usize = 4096;
@@ -33,6 +41,7 @@ const QUERY_REPLY: &[u8] =
 /// Per-task OSC 7501 status reporting, child framing, and record cleanup.
 pub(crate) struct ProgramStatus {
     id: CodeId,
+    mode: ProgramStatusMode,
     state: ParseState,
     input: Vec<u8>,
     reported: bool,
@@ -58,7 +67,7 @@ enum ParseState {
 /// Frames `body` as an `OSC 7501` sequence and writes it to `stdout` when attached to a TTY.
 fn write_osc(body: Arguments<'_>) -> bool {
     let stdout = io::stdout();
-    if !ENABLED.load(Ordering::Relaxed) || !stdout.is_terminal() {
+    if !stdout.is_terminal() {
         return false;
     }
     let mut stdout = stdout.lock();
@@ -68,9 +77,10 @@ fn write_osc(body: Arguments<'_>) -> bool {
 }
 
 impl ProgramStatus {
-    pub(crate) fn new(id: CodeId) -> Self {
+    pub(crate) fn new(id: CodeId, mode: ProgramStatusMode) -> Self {
         Self {
             id,
+            mode,
             state: ParseState::Ground,
             input: Vec::new(),
             reported: false,
@@ -80,6 +90,9 @@ impl ProgramStatus {
     /// Reports a block's lifecycle status to the outer terminal, clearing any
     /// active child record when the block is no longer running.
     pub(crate) fn report_task(&mut self, status: TaskStatus) {
+        if !matches!(self.mode, ProgramStatusMode::Block | ProgramStatusMode::All) {
+            return;
+        }
         if status != TaskStatus::Running {
             self.clear();
         }
@@ -95,12 +108,8 @@ impl ProgramStatus {
         ));
     }
 
-    /// Consumes OSC 7501 sequences from a PTY chunk and, when `passthrough` is
-    /// true (CLI fullscreen/alternate-screen mode), writes the remaining bytes to `stdout`.
-    ///
-    /// While `active`, valid status reports are scoped under `upmd/block-{id}` (or
-    /// `upmd/block-{id}/{child}` when the report sets an ID) and written to the outer
-    /// terminal, and capability queries (`?`) invoke `reply`.
+    /// Relays child status under `upmd/block-{id}` and answers capability queries
+    /// for active tasks when enabled. Passthrough writes unconsumed bytes to stdout.
     pub(crate) fn process(
         &mut self,
         bytes: &[u8],
@@ -109,7 +118,7 @@ impl ProgramStatus {
         mut reply: impl FnMut(&[u8]),
     ) {
         let mut stdout = io::stdout();
-        if !ENABLED.load(Ordering::Relaxed) {
+        if !matches!(self.mode, ProgramStatusMode::All) {
             if passthrough {
                 let _ = stdout.write_all(bytes);
                 let _ = stdout.flush();
@@ -316,7 +325,7 @@ mod tests {
         let expected_events = ["query", "state=blocked:id=upmd/block-1/worker"];
 
         for split in 0..=input.len() {
-            let mut decoder = ProgramStatus::new(1);
+            let mut decoder = ProgramStatus::new(1, ProgramStatusMode::All);
             let (mut out, mut events) = collect(&mut decoder, &input[..split]);
             let (out2, events2) = collect(&mut decoder, &input[split..]);
             out.extend(out2);
@@ -330,7 +339,7 @@ mod tests {
             "\x1b]7501;msg={}\x07\x1b]7501;?\x07tail",
             "a".repeat(MAX_SEQUENCE)
         );
-        let mut decoder = ProgramStatus::new(1);
+        let mut decoder = ProgramStatus::new(1, ProgramStatusMode::All);
         let mut out = Vec::new();
         decoder.parse(oversized.as_bytes(), false, |event| match event {
             ChildEvent::Output(b) => out.extend_from_slice(b),

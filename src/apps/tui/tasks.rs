@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use crossbeam_channel::Receiver;
 
-use crate::apps::config::Envs;
+use crate::apps::config::{Config, Envs};
 use crate::apps::task::TaskStatus;
 use crate::{apps::exec, apps::task::Task, pty::process::Size as PtySize, pty::stream::Stream};
 use upmd_parser::{nodes, CodeId};
@@ -31,16 +31,15 @@ impl Tasks {
         code: &nodes::Code,
         size: PtySize,
         envs: Envs,
-        capture_state: bool,
-        binaries: &HashMap<String, upmd_runner::RunnerOptions>,
+        config: &Config,
         working_dir: Option<PathBuf>,
     ) -> Option<Receiver<Stream>> {
         let task = self
             .outputs
             .entry(code.id)
-            .or_insert_with(|| Task::new(code.id, size.width, size.height, 500));
+            .or_insert_with(|| Task::new(code.id, &size, 500, config.report_program_status));
 
-        exec::run_code(code, size, envs, capture_state, binaries, task, working_dir)
+        exec::run_code(code, size, envs, config, task, working_dir)
     }
 
     /// Handles a stream message from a running task.

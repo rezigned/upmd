@@ -261,13 +261,12 @@ impl App {
         let mut outputs = self.outputs.borrow_mut();
         let state = outputs
             .entry(id)
-            .or_insert_with(|| task::Task::new(id, pty_cols, pty_rows, 1024));
+            .or_insert_with(|| task::Task::new(id, &size, 1024, self.config.report_program_status));
         let command = exec::run_code(
             code,
             size,
             self.envs.clone(),
-            self.config.capture_state,
-            &self.config.binaries,
+            &self.config,
             state,
             Some(self.cwd.clone()),
         )
@@ -1129,6 +1128,7 @@ mod tests {
             file: None,
             theme: "base16-ocean.dark".into(),
             capture_state: false,
+            report_program_status: Default::default(),
             block: None,
             yes: false,
             all: false,
@@ -1168,7 +1168,8 @@ echo world
     }
 
     fn insert_completed_output(app: &App, id: CodeId, text: &str, exit_code: i32) {
-        let mut output = task::Task::new(id, 80, 24, 1024);
+        let mut output =
+            task::Task::new(id, &(80, 24).into(), 1024, app.config.report_program_status);
         exec::handle_stream(&mut output, &Stream::Out(text.to_string()));
         exec::handle_stream(&mut output, &Stream::Exit(exit_code));
         exec::handle_stream(&mut output, &Stream::End);

@@ -1,6 +1,9 @@
 use clap::{ArgAction, Parser};
 
-use crate::apps::config::{Config, ConfigArgs, UserConfig, WorkingDir};
+use crate::apps::{
+    config::{Config, ConfigArgs, UserConfig, WorkingDir},
+    program_status::ProgramStatusMode,
+};
 
 /// Run code blocks from Markdown in the terminal.
 #[derive(Parser, Debug)]
@@ -37,9 +40,9 @@ pub struct Args {
     #[arg(long, default_value_t = false)]
     pub capture_state: bool,
 
-    /// Report task and child-program OSC 7501 status to the terminal (default: false).
-    #[arg(long, default_value_t = false)]
-    pub report_program_status: bool,
+    /// Specify the OSC 7501 program status reporting mode (default: block).
+    #[arg(long, value_enum)]
+    pub report_program_status: Option<ProgramStatusMode>,
 
     /// Run a specific code block by name or numeric ID.
     ///
@@ -92,9 +95,6 @@ impl From<Args> for Config {
 /// Merges CLI arguments with loaded user config.
 /// CLI flags explicitly set by the user take precedence over the config file.
 pub fn build_config(args: Args, user_cfg: UserConfig) -> Config {
-    crate::apps::program_status::set_enabled(
-        args.report_program_status || user_cfg.report_program_status.unwrap_or(false),
-    );
     let theme = args.theme.unwrap_or_else(|| user_cfg.theme().to_string());
     let working_dir = args.working_dir.map(|dir| match dir.as_str() {
         ":auto" => WorkingDir::Auto,
@@ -114,6 +114,9 @@ pub fn build_config(args: Args, user_cfg: UserConfig) -> Config {
         file: args.file,
         theme,
         capture_state: args.capture_state,
+        report_program_status: args
+            .report_program_status
+            .unwrap_or_else(|| user_cfg.report_program_status()),
         block: args.block,
         yes: args.yes,
         all: args.all,
