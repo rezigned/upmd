@@ -55,7 +55,7 @@ unicode-width = { version = "0.2.2", features = ["cjk"] }
 unicode-segmentation = "1.13.2"
 
 # Platform and utilities
-arboard = "3.6.1"
+arboard = { version = "3.6.1", features = ["wayland-data-control"] }
 ignore = "0.4"
 tempfile = "3.27"
 nucleo-matcher = "0.3.1"
