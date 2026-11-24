@@ -1,9 +1,30 @@
+## [v0.2.8]
+
+### 🚀 Features
+
+- *(nix)* Package for nix (#47)
+- *(exec)* Support automatic Markdown working directories (#53)
+- *(picker)* Fuzzy-match file paths with nucleo-matcher (#60)
+- Report task and child-program OSC 7501 status (#63)
+- Report code block status by default (#66)
+
+### 🐛 Bug Fixes
+
+- *(nix)* Improve Nix development environment (#49)
+- Enable native Wayland clipboard support (#68)
+
+### 📚 Documentation
+
+- Update instructions for installing with Homebrew (#61)
 ## [v0.2.7]
 
 ### 🐛 Bug Fixes
 
 - *(exec)* Preserve PTY output under backpressure (#39)
-- *(changelog)* Pass v-prefixed tag to pre-release hook
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* Bump version to 0.2.7 (#40)
 ## [v0.2.6]
 
 ### 🐛 Bug Fixes
