@@ -173,16 +173,15 @@ impl<T: WorkspaceAdapter> WorkspaceExecutionExt for T {
             .map(|(idx, arg)| {
                 let s = arg.trim();
 
-                if plan.resolve_paths && idx > 0 && s.starts_with("./") {
-                    return root.join(&s[2..]).display().to_string();
-                }
-
-                let resolved = plan
-                    .files
-                    .iter()
-                    .find(|(path, _)| path.to_string_lossy() == s)
-                    .map(|(path, _)| root.join(path).display().to_string())
-                    .unwrap_or_else(|| s.to_string());
+                let resolved = if plan.resolve_paths && idx > 0 && s.starts_with("./") {
+                    root.join(&s[2..]).display().to_string()
+                } else {
+                    plan.files
+                        .iter()
+                        .find(|(path, _)| path.to_string_lossy() == s)
+                        .map(|(path, _)| root.join(path).display().to_string())
+                        .unwrap_or_else(|| s.to_string())
+                };
 
                 quote_if_needed(&resolved, plan.quote_style)
             })

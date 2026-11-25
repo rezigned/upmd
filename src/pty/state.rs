@@ -111,34 +111,14 @@ fn accept_fifo(path: &Path, child_exit: &ExitSignal) -> Option<String> {
 
     #[cfg(windows)]
     {
-        use std::time::{Duration, Instant};
-
-        const STATE_TIMEOUT: Duration = Duration::from_secs(5);
-
-        let start = Instant::now();
-        loop {
-            // Read before checking child_exit to avoid a race where the child
-            // writes and exits between the flag check and the file read.
-            let mut content = String::new();
-            if let Ok(mut f) = File::open(path) {
-                if f.read_to_string(&mut content).is_ok() && !content.is_empty() {
-                    return Some(content);
-                }
-            }
-            if child_exit.is_done() {
-                // Final read attempt in case data was written just before exit.
-                let mut content = String::new();
-                if let Ok(mut f) = File::open(path) {
-                    if f.read_to_string(&mut content).is_ok() && !content.is_empty() {
-                        return Some(content);
-                    }
-                }
-                return None;
-            }
-            if start.elapsed() > STATE_TIMEOUT {
-                return None;
-            }
-            std::thread::sleep(Duration::from_millis(50));
+        // Wait for the child so we never read a partially written state file.
+        child_exit.wait();
+        let mut content = String::new();
+        let mut f = File::open(path).ok()?;
+        if f.read_to_string(&mut content).is_err() || content.is_empty() {
+            None
+        } else {
+            Some(content)
         }
     }
 }

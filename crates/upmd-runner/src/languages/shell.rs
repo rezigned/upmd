@@ -1,15 +1,16 @@
 //! Shell language runners (bash, fish, sh, zsh).
-//!
-//! # Platform notes
-//!
-//! These runners are Unix-only. On Windows, `bash`/`sh`/`zsh`/`fish` are not
-//! available by default. To support Windows, add `Cmd` and `PowerShell`
-//! runners using the same `impl_shell_runner!` macro with `cmd /c` and
-//! `powershell -File` as the source commands.
 
 use super::{Bash, Fish, Shell, Zsh};
 use crate::{CodeInput, ExecutionPlan, LanguageRunner, RunnerOptions};
 use anyhow::Result;
+
+// Capture Git Bash's PATH and working directory in Windows format so upmd
+// can launch the next block with the captured state.
+const CAPTURE_PATHS: &str = if cfg!(windows) {
+    r#"if [ -x /usr/bin/cygpath ]; then printf 'PATH=%s\n' "$(/usr/bin/cygpath -amp -- "$PATH")"; /usr/bin/cygpath -am .; else pwd; fi"#
+} else {
+    "pwd"
+};
 
 macro_rules! impl_shell_runner {
     ($type:ty, $source_cmd:expr, $env_cmd:expr) => {
@@ -32,8 +33,7 @@ macro_rules! impl_shell_runner {
                         .cleanup(&filename);
                 }
 
-                // State capture: wrap the assembled commands so that export
-                // and pwd run in the same shell context as the user code.
+                // Preserve environment and directory changes for later blocks.
                 if code.state_capture.enabled {
                     if let Some(fifos) = &code.state_capture.fifos {
                         let state_fifo =
@@ -41,7 +41,7 @@ macro_rules! impl_shell_runner {
                         let env_cmd = $env_cmd;
                         plan.wrap(move |cmds| {
                             format!(
-                                "{cmds}\nRET=$?\n{{ {env_cmd}; pwd; }} > {state_fifo}\nexit $RET"
+                                "{cmds}\nRET=$?\n{{ {env_cmd}; {CAPTURE_PATHS}; }} > {state_fifo}\nexit $RET"
                             )
                         });
                     }
@@ -213,11 +213,13 @@ mod tests {
         let plan = Bash::new().plan(&input).unwrap();
         let script = assemble(&plan, "/tmp/ws");
 
-        let expected = "\
+        let expected = format!(
+            "\
 . /tmp/ws/script_1.sh\n\
 RET=$?\n\
-{ export -p; pwd; } > '/tmp/state/state.fifo'\n\
-exit $RET";
+{{ export -p; {CAPTURE_PATHS}; }} > '/tmp/state/state.fifo'\n\
+exit $RET"
+        );
 
         assert_eq!(script, expected);
     }
@@ -317,11 +319,13 @@ exit $RET";
         let plan = Bash::new().plan(&input).unwrap();
         let script = assemble(&plan, "/tmp/ws");
 
-        let expected = "\
+        let expected = format!(
+            "\
 echo hello world\n\
 RET=$?\n\
-{ export -p; pwd; } > '/tmp/state/state.fifo'\n\
-exit $RET";
+{{ export -p; {CAPTURE_PATHS}; }} > '/tmp/state/state.fifo'\n\
+exit $RET"
+        );
         assert_eq!(script, expected);
     }
 
@@ -339,7 +343,7 @@ exit $RET";
         let plan = Bash::new().plan(&input).unwrap();
         let script = assemble(&plan, "/tmp/ws");
 
-        assert!(script.contains("{ export -p; pwd; } > '/tmp/state/state'\\'';$HOME`.fifo'"));
+        assert!(script.contains("} > '/tmp/state/state'\\'';$HOME`.fifo'"));
     }
 
     #[test]
@@ -358,8 +362,12 @@ exit $RET";
         let plan = Bash::new().plan(&input).unwrap();
         assert!(plan.requires_file, "multi-line should use a file");
 
-        let script = assemble(&plan, "/tmp/ws");
-        // Source command + resolved absolute path, no spurious quoting.
-        assert_eq!(script, ". /tmp/ws/script_3.sh");
+        let root = if cfg!(windows) {
+            r"C:\work space"
+        } else {
+            "/tmp/work space"
+        };
+        let path = PathBuf::from(root).join("script_3.sh");
+        assert_eq!(assemble(&plan, root), format!(". '{}'", path.display()));
     }
 }
